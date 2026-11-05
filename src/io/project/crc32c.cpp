@@ -11,6 +11,10 @@
 #include <nmmintrin.h>
 #endif
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 namespace lfs::io::project {
 
     namespace {

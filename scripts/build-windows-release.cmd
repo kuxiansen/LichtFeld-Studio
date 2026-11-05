@@ -24,19 +24,45 @@ call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 exit /b 1
 :have_msvc
 
+rem --------------------------------------------------------------------------
+rem Toolchain / vcpkg setup for this machine.
+rem vcpkg manifest mode requires:
+rem   * cmake >= 4.4.4 (toolchain requirement)
+rem   * PowerShell 7 (for the overlay ports' meson build system)
+rem   * 7-Zip (for source archive extraction)
+rem   * CUDA Toolkit + MSVC environment (already loaded by vcvars64 above)
+rem --------------------------------------------------------------------------
+set "VCPKG_ROOT=D:\kmf_soft\vcpkg"
+set "VCPKG_FORCE_SYSTEM_BINARIES=1"
+
+rem Put vcpkg downloads on the proxy (vcpkg auto-detects IE proxy, but the
+rem GitHub cert error from earlier runs suggests HTTPS_PROXY was set with an
+rem https:// prefix; forcing http:// makes curl happy).
+if not defined HTTP_PROXY  set "HTTP_PROXY=http://127.0.0.1:7897"
+if not defined HTTPS_PROXY set "HTTPS_PROXY=http://127.0.0.1:7897"
+
+rem Prepend our pinned toolchain directories to PATH (checked one by one so
+rem the script still works on machines without this exact layout).
+set "PATH=%PATH%;D:\kmf_soft\poweshell\7;D:\kmf_soft\tools\ninja;D:\kmf_soft\tools\cmake4\bin"
+if exist "C:\Program Files\7-Zip\7z.exe"  set "PATH=C:\Program Files\7-Zip;%PATH%"
+
+rem Pick cmake.exe: pinned 4.4.x first, fall back to whatever is on PATH.
+set "CMAKE=cmake"
+if exist "D:\kmf_soft\tools\cmake4\bin\cmake.exe" set "CMAKE=D:\kmf_soft\tools\cmake4\bin\cmake.exe"
+
 rem Clean before configuring: clean also deletes the version .rc files that configure generates.
 if /i not "%~1"=="clean" goto :configure
-cmake --build "%BUILD%" --target clean
+"%CMAKE%" --build "%BUILD%" --target clean
 if errorlevel 1 exit /b 1
 
 :configure
 pushd "%ROOT%"
-cmake --preset windows-release -DENABLE_COMPILER_CACHE=OFF >nul
+"%CMAKE%" --preset windows-release -DENABLE_COMPILER_CACHE=OFF
 set "RC=%ERRORLEVEL%"
 popd
 if not "%RC%"=="0" exit /b %RC%
 
-cmake --build "%BUILD%" --target LichtFeld-Studio
+"%CMAKE%" --build "%BUILD%" --target LichtFeld-Studio
 if errorlevel 1 exit /b 1
 
 echo.

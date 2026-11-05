@@ -412,6 +412,13 @@ namespace lfs::core {
             int init_num_pts = 100'000; // Number of random points to initialize
             float init_extent = 3.0f;   // Extent of random point cloud
 
+            // When init_path points at a plain point-cloud PLY (no splat/mesh),
+            // voxel-downsample it and keep only points whose voxel cell contains
+            // no COLMAP sparse point, then merge with the sparse cloud.  This
+            // fills holes in the SfM point cloud while preserving its density.
+            bool init_mix_with_sparse = false;
+            float init_mix_voxel_size = 0.02f;  // metres
+
             // Mesh2Splat raster resolution when the init file is a mesh
             int init_mesh_resolution = Mesh2SplatOptions{}.resolution_target;
 
