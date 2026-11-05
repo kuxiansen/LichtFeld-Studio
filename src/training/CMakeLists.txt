@@ -127,7 +127,7 @@ set(TRAINING_NEW_SOURCES
         training_snapshot_service.cpp
         progress.cpp
         splat_mesh.cpp
-        splat_mesh.cpp
+        splat_mesh_gof.cpp
         training_cropbox_mask.cpp
         trainer.cpp
         trainer_popspa.cpp

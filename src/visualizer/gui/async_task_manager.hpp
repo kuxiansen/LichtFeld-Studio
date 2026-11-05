@@ -45,6 +45,10 @@ namespace lfs::core {
     struct MeshData;
 } // namespace lfs::core
 
+namespace lfs::training {
+    struct GofMeshSettings;
+} // namespace lfs::training
+
 namespace lfs::vis {
     class VisualizerImpl;
     class VisualizerImplResetTest_ImportWorkerFailureSettlesFailed_Test;
@@ -67,6 +71,8 @@ namespace lfs::vis {
             void startCollisionExport(core::Uuid uuid, const std::filesystem::path& path);
             // Meshes the selected splat from the scene's cameras, on the collision job: a new undoable mesh node.
             void startSplatMesh(core::SplatMeshSettings settings, const std::filesystem::path& path);
+            // Extracts the selected splat's Gaussian opacity field mesh from the scene's cameras, on the same job.
+            void startSplatMeshGof(training::GofMeshSettings settings, const std::filesystem::path& path);
             void cancelCollision();
             [[nodiscard]] bool collisionWorkerActive() const;
             void dropSceneReplacement();

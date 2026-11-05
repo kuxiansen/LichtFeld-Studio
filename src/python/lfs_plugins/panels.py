@@ -98,6 +98,11 @@ PANEL_SPECS = {
         "lfs_plugins.mesh_panel", "MeshPanel", "lfs.mesh", "mesh.title",
         "FLOATING", 15, "rmlui/mesh.rml", "CONTENT", (420, 0),
     ),
+    "mesh_gof": _PanelSpec(
+        "lfs_plugins.mesh_gof_panel", "MeshGofPanel", "lfs.mesh_gof", "mesh_gof.title",
+        "FLOATING", 16, "rmlui/mesh_gof.rml", "CONTENT", (420, 0),
+        update_policy="interval", update_interval_ms=250,
+    ),
     "splat_simplify": _PanelSpec(
         "lfs_plugins.splat_simplify_panel", "SplatSimplifyPanel", "lfs.splat_simplify",
         "rendering_panel.section_simplify", "FLOATING", 13, "rmlui/splat_simplify.rml", "CONTENT", (420, 0),
@@ -277,6 +282,7 @@ def _build_builtin_panel_steps(lf):
         _register_lazy_panel(lf, "splat_simplify")
         _register_lazy_panel(lf, "collision")
         _register_lazy_panel(lf, "mesh")
+        _register_lazy_panel(lf, "mesh_gof")
 
     def menus():
         from . import file_menu, edit_menu, tools_menu, view_menu, help_menu

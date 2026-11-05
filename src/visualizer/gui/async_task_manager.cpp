@@ -52,6 +52,7 @@
 #include "shaders/shader_service.hpp"
 #include "training/rasterization/gsplat_rasterizer.hpp"
 #include "training/splat_mesh.hpp"
+#include "training/splat_mesh_gof.hpp"
 #include "training/training_manager.hpp"
 #include "training/training_setup.hpp"
 #include "visualizer/app_store.hpp"
@@ -4075,6 +4076,48 @@ namespace lfs::vis::gui {
             for (const auto& camera : cameras)
                 views.push_back(camera.get());
             const auto mesh = training::extract_splat_mesh(*model, views, settings, stop, progress);
+            training::write_splat_mesh_ply(mesh, path);
+            mesh_result_ = std::make_shared<core::MeshData>(training::splat_mesh_to_mesh_data(mesh));
+            (void)training::release_gsplat_rasterizer_thread_local_caches();
+            return false;
+        });
+    }
+
+    void AsyncTaskManager::startSplatMeshGof(training::GofMeshSettings settings, const std::filesystem::path& path) {
+        if (!viewer_->isOnViewerThread())
+            throw core::collisionError("selection.operation_failed_generic", "Mesh capture requires the viewer thread");
+        pollCollision();
+        if (const auto state = collisionJob(); state && state->running())
+            throw core::collisionError("projects.gallery.eligibility.busy", "A collision or mesh job is already running");
+        auto* manager = viewer_->getSceneManager();
+        if (!manager)
+            throw core::collisionError("runtime.no_scene_manager", "No scene manager");
+        if (const auto* trainer = manager->getTrainerManager(); trainer && trainer->isTrainingActive())
+            throw core::collisionError("mesh.training_active", "Stop training before extracting a mesh");
+        const auto selected = manager->getSelectedNodeIds();
+        auto& scene = manager->getScene();
+        const auto* node = selected.size() == 1 ? scene.getNodeById(selected.front()) : nullptr;
+        if (!node || node->type != core::NodeType::SPLAT || !node->model)
+            throw core::collisionError("collision.source_unavailable", "Select exactly one loaded splat node");
+        if (node->model->lod_tree && node->model->lod_tree->has_tree())
+            throw core::collisionError("collision.source_unavailable", "Meshing needs the complete model, not a level-of-detail tree");
+        std::vector<std::shared_ptr<core::Camera>> cameras;
+        for (auto& camera : scene.getAllCameras())
+            if (camera && camera->split() != core::CameraSplit::Eval)
+                cameras.push_back(std::move(camera));
+        if (cameras.empty())
+            throw core::collisionError("mesh.no_cameras", "The mesh needs the cameras of the dataset; load the project or dataset the model was trained on");
+        auto model = std::make_shared<core::SplatData>(node->model->clone());
+        if (model->has_deleted_mask())
+            (void)model->apply_deleted();
+        mesh_name_ = node->name + "_gof_mesh";
+        mesh_transform_ = scene.getWorldTransform(node->id);
+        launchCollision([this, settings, path, model = std::move(model), cameras = std::move(cameras)](std::stop_token stop, const core::ProgressCallback& progress) {
+            std::vector<core::Camera*> views;
+            views.reserve(cameras.size());
+            for (const auto& camera : cameras)
+                views.push_back(camera.get());
+            const auto mesh = training::extract_splat_mesh_gof(*model, views, settings, stop, progress);
             training::write_splat_mesh_ply(mesh, path);
             mesh_result_ = std::make_shared<core::MeshData>(training::splat_mesh_to_mesh_data(mesh));
             (void)training::release_gsplat_rasterizer_thread_local_caches();

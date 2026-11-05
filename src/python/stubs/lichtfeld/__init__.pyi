@@ -33,6 +33,7 @@ from .scene import (
     export_collision as export_collision,
     generate_collision as generate_collision,
     generate_mesh as generate_mesh,
+    generate_mesh_gof as generate_mesh_gof,
     get_collision_state as get_collision_state,
     set_walk_settings as set_walk_settings
 )

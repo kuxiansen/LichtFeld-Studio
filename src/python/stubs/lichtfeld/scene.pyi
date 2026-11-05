@@ -121,6 +121,11 @@ def generate_mesh(path: str, voxel_size: float = 0.019999999552965164, view_stri
     Mesh the selected splat from the scene's cameras into a PLY and a new mesh node; progress is in get_collision_state, cancel with cancel_collision
     """
 
+def generate_mesh_gof(path: str, voxel_size: float = 0.019999999552965164, view_stride: int = 2, min_component_faces: int = 100) -> None:
+    """
+    Mesh the selected splat from its opacity field, into a PLY and a new mesh node; progress is in get_collision_state, cancel with cancel_collision
+    """
+
 def cancel_collision() -> None: ...
 
 def get_collision_state() -> dict: ...

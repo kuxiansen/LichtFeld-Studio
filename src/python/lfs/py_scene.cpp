@@ -11,6 +11,7 @@
 #include "io/loader.hpp"
 #include "py_error.hpp"
 #include "python/python_runtime.hpp"
+#include "training/splat_mesh_gof.hpp"
 #include "rendering/selection_ops.hpp"
 #include "visualizer/gui/gui_manager.hpp"
 #include "visualizer/gui_capabilities.hpp"
@@ -1492,6 +1493,13 @@ namespace lfs::python {
             settings.min_views = min_views;
             collision_access([&](auto& tasks, auto*) { tasks.startSplatMesh(settings, core::utf8_to_path(path)); }); }, nb::arg("path"), nb::arg("voxel_size") = .02f, nb::arg("view_stride") = 2, nb::arg("full_weight_range") = 1.f, nb::arg("min_views") = 3,
               "Mesh the selected splat from the scene's cameras into a PLY and a new mesh node; progress is in get_collision_state, cancel with cancel_collision");
+        m.def("generate_mesh_gof", [collision_access](const std::string& path, float voxel_size, int view_stride, int min_component_faces) {
+            training::GofMeshSettings settings;
+            settings.voxel_size = voxel_size;
+            settings.view_stride = view_stride;
+            settings.min_component_faces = min_component_faces;
+            collision_access([&](auto& tasks, auto*) { tasks.startSplatMeshGof(settings, core::utf8_to_path(path)); }); }, nb::arg("path"), nb::arg("voxel_size") = .02f, nb::arg("view_stride") = 2, nb::arg("min_component_faces") = 100,
+              "Mesh the selected splat from its opacity field, into a PLY and a new mesh node; progress is in get_collision_state, cancel with cancel_collision");
         m.def("export_collision", [collision_access](const std::string& uuid, const std::string& path) {
             const auto parsed = core::Uuid::from_string(uuid);
             if (!parsed)
