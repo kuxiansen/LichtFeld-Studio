@@ -18,6 +18,7 @@ namespace lfs::core {
 } // namespace lfs::core
 
 namespace lfs::training {
+    class PPISP;
 
     struct SplatMesh {
         std::vector<std::array<float, 3>> vertices;
@@ -30,23 +31,30 @@ namespace lfs::training {
         size_t blocks = 0;
         uint64_t band_voxels = 0;
         size_t raw_faces = 0;
+        size_t holes_filled = 0;
+        size_t faces_before_simplify = 0;
+        float simplify_result_error = 0.f;
         size_t components_kept = 0;
         size_t components_total = 0;
         double area = 0.;
         float colored_vertex_share = 0.f;
+        size_t views_color_corrected = 0;
         double seconds_render = 0.;
         double seconds_fusion = 0.;
         double seconds_extract = 0.;
         double seconds_color = 0.;
+        double seconds_simplify = 0.;
     };
 
     // Renders transmittance median depth from the cameras, fuses it into a sparse TSDF, extracts
-    // the surface with naive surface nets and colors it from the photos. Mesh is in model space.
+    // the surface with naive surface nets and colors it from the photos, taken back through the
+    // model's trained appearance when there is one. Mesh is in model space.
     // Camera image sizes are changed while it runs and restored afterwards.
     [[nodiscard]] SplatMesh extract_splat_mesh(core::SplatData& model,
                                                std::span<core::Camera* const> cameras,
                                                const core::SplatMeshSettings& settings,
-                                               std::stop_token stop = {}, const core::ProgressCallback& progress = {});
+                                               std::stop_token stop = {}, const core::ProgressCallback& progress = {},
+                                               const PPISP* appearance = nullptr);
 
     // Sorted sparse voxel keys (21 bits per axis, gsplat_lfs::kTsdfKeyOffset) and their TSDF
     // values. Fills vertices and faces with outward-facing triangles.
@@ -54,8 +62,17 @@ namespace lfs::training {
                       float max_step = 1.5f);
     // Removes connected components with fewer faces and the vertices they leave unused.
     void remove_small_mesh_components(SplatMesh& mesh, int min_faces);
+    // Closes open boundaries with a rim shorter than max_perimeter scene units, by a fan around a
+    // new center vertex. Runs before normals and colors exist. Returns how many it closed.
+    size_t fill_small_mesh_holes(SplatMesh& mesh, float max_perimeter);
     // Area-weighted vertex normals and the mesh area.
     void compute_splat_mesh_normals(SplatMesh& mesh);
+    // Reduces faces while the surface stays within about max_error scene units, moving the kept
+    // vertices to fit and blending their colors. Larger color_weight keeps more faces where the
+    // color changes; it is not a distance, and 0 ignores color and leaves kept vertices with their
+    // own colors. Refreshes normals and area. Works in pieces of at most piece_faces and of a size
+    // the simplifier's precision can resolve max_error in, keeping the vertices that pieces share.
+    void simplify_splat_mesh(SplatMesh& mesh, float max_error, float color_weight, size_t piece_faces = 3'000'000);
 
     void write_splat_mesh_ply(const SplatMesh& mesh, const std::filesystem::path& path);
     [[nodiscard]] core::MeshData splat_mesh_to_mesh_data(const SplatMesh& mesh);

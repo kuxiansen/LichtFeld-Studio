@@ -38,10 +38,11 @@ namespace gsplat_lfs {
         uint32_t block = 0;      // voxels per block side
         float trunc = 0.f;       // scene units
         float full_weight_range = 0.f; // views beyond this range count less, by 1/r^2; 0 = equal weights
+        float max_range = 0.f;   // depth beyond this touches no blocks; 0 = no limit
     };
 
     // Block keys around the surface of a depth map, sampled at every 2nd pixel at
-    // depth and depth +- trunc. keys holds 3 * ceil(W / 2) * ceil(H / 2); kTsdfNoKey fills the rest.
+    // depth and depth +- trunc, up to grid.max_range. keys holds 3 * ceil(W / 2) * ceil(H / 2); kTsdfNoKey fills the rest.
     void tsdf_touch_keys(const float* depth, const float* rays, const TsdfView& view, const TsdfGrid& grid,
                          uint64_t* keys, cudaStream_t stream);
 
@@ -70,15 +71,20 @@ namespace gsplat_lfs {
                         const TsdfView& view, const TsdfGrid& grid, const float* depth,
                         float* sum, float* weight, uint16_t* views, cudaStream_t stream);
 
-    // Voxels seen by at least min_views views with |tsdf| < 1. With null keys it only counts them.
-    [[nodiscard]] uint64_t tsdf_collect_voxels(const uint64_t* block_keys, uint32_t block_count, const TsdfGrid& grid,
+    // Voxels of blocks [first_block, last_block) with a face neighbor of the opposite sign, all
+    // that surface extraction reads. A voxel counts when at least min_views views saw it and
+    // |tsdf| < 1. Neighbors may lie in any block of block_keys, which is sorted. With null keys
+    // it only counts them.
+    [[nodiscard]] uint64_t tsdf_collect_voxels(const uint64_t* block_keys, uint32_t block_count, uint32_t first_block,
+                                               uint32_t last_block, const TsdfGrid& grid,
                                                const float* sum, const float* weight, const uint16_t* views,
                                                const float* carve, uint32_t min_views,
                                                uint64_t* keys, float* tsdf, uint64_t* counter, cudaStream_t stream);
 
-    // Adds the photo [3, H, W] to the vertices this view sees as its surface.
-    void mesh_color_accumulate(const float* vertices, uint32_t vertex_count, const TsdfView& view,
-                               const float* depth, const float* photo, float tolerance,
-                               float* color_sum, uint32_t* color_count, cudaStream_t stream);
+    // Adds the photo [3, H, W] to the vertices this view sees as its surface, weighted by 1 / distance.
+    // No weight by angle: on a flat floor seen at a low angle, the noise in the normals makes such a
+    // weight vary from vertex to vertex, and the colors mottle.
+    void mesh_color_accumulate(const float* vertices, uint32_t vertex_count, const TsdfView& view, const float* depth, const float* photo,
+                               float tolerance, float* color_sum, float* color_weight, cudaStream_t stream);
 
 } // namespace gsplat_lfs

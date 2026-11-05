@@ -337,7 +337,7 @@ namespace lfs::training {
         DeviceArray<float> vertices_device(size_t(vertex_count) * 3, stream);
         LFS_CUDA_CHECK(cudaMemcpyAsync(vertices_device.data(), mesh.vertices.data(), size_t(vertex_count) * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
         DeviceArray<float> color_sum(size_t(vertex_count) * 3, stream, true);
-        DeviceArray<uint32_t> color_count(vertex_count, stream, true);
+        DeviceArray<float> color_weight(vertex_count, stream, true);
         const float tolerance = 2.5f * settings.voxel_size;
         for (size_t i = 0; i < views.size(); i += settings.color_stride) {
             core::reportProgress(stop, progress, .8f + .2f * float(i) / views.size(), stage("mesh.stage_color", "Coloring"));
@@ -354,20 +354,20 @@ namespace lfs::training {
             photo = photo.to(Device::CUDA, stream).to(core::DataType::Float32).contiguous();
             auto depth = render_median_depth(camera, model, settings.max_width, stream);
             gsplat_lfs::mesh_color_accumulate(vertices_device.data(), vertex_count, view, depth.ptr<float>(),
-                                              photo.ptr<float>(), tolerance, color_sum.data(), color_count.data(), stream);
+                                              photo.ptr<float>(), tolerance, color_sum.data(), color_weight.data(), stream);
             LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "GOF mesh color");
         }
         std::vector<float> sums(size_t(vertex_count) * 3);
-        std::vector<uint32_t> counts_host(vertex_count);
+        std::vector<float> weights(vertex_count);
         LFS_CUDA_CHECK(cudaMemcpyAsync(sums.data(), color_sum.data(), sums.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-        LFS_CUDA_CHECK(cudaMemcpyAsync(counts_host.data(), color_count.data(), counts_host.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+        LFS_CUDA_CHECK(cudaMemcpyAsync(weights.data(), color_weight.data(), weights.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
         LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "GOF mesh color download");
         mesh.colors.resize(vertex_count);
         size_t colored = 0;
         for (size_t v = 0; v < vertex_count; ++v) {
-            colored += counts_host[v] > 0;
+            colored += weights[v] > 0.f;
             for (int c = 0; c < 3; ++c) {
-                const float value = counts_host[v] > 0 ? 255.f * sums[3 * v + c] / float(counts_host[v]) : 128.f;
+                const float value = weights[v] > 0.f ? 255.f * sums[3 * v + c] / weights[v] : 128.f;
                 mesh.colors[v][c] = static_cast<uint8_t>(std::clamp(std::lround(value), 0l, 255l));
             }
         }

@@ -1306,18 +1306,25 @@ namespace lfs::app {
                     cameras.push_back(dataset->get_camera(i));
                 HeadlessRunCoordinator run;
                 TerminalProgressBar bar("Mesh");
+                // For a splat file the trainer sets up an untrained correction, seeded from the photos' metadata.
+                const bool trained = params->resume_project || params->resume_checkpoint;
                 const auto mesh = training::extract_splat_mesh(trainer->get_strategy_mutable().get_model(), cameras, *params->mesh_settings,
-                                                               run.stop_token(), std::bind_front(&TerminalProgressBar::report, &bar));
+                                                               run.stop_token(), std::bind_front(&TerminalProgressBar::report, &bar),
+                                                               trained && trainer->hasPPISP() ? trainer->getPPISP() : nullptr);
                 core::native_fs::create_directories(params->mesh_output.parent_path());
                 training::write_splat_mesh_ply(mesh, params->mesh_output);
                 bar.complete();
                 const auto& settings = *params->mesh_settings;
-                const nlohmann::json report{{"voxel_size", settings.voxel_size}, {"trunc_voxels", settings.trunc_voxels},
+                const nlohmann::json report{{"voxel_size", settings.voxel_size}, {"truncation", settings.band()},
+                                            {"fill_hole_perimeter", settings.fill_hole_perimeter}, {"holes_filled", mesh.holes_filled},
                                             {"full_weight_range", settings.full_weight_range}, {"views", mesh.views}, {"blocks", mesh.blocks},
                                             {"band_voxels", mesh.band_voxels}, {"raw_faces", mesh.raw_faces}, {"vertices", mesh.vertices.size()},
-                                            {"faces", mesh.faces.size()}, {"components_kept", mesh.components_kept},
+                                            {"faces", mesh.faces.size()}, {"simplify_error", settings.simplify_error}, {"max_range", settings.max_range},
+                                            {"faces_before_simplify", mesh.faces_before_simplify},
+                                            {"simplify_result_error", mesh.simplify_result_error},
+                                            {"seconds_simplify", mesh.seconds_simplify}, {"components_kept", mesh.components_kept},
                                             {"components_total", mesh.components_total}, {"area", mesh.area},
-                                            {"colored_vertex_share", mesh.colored_vertex_share}, {"seconds_render", mesh.seconds_render},
+                                            {"colored_vertex_share", mesh.colored_vertex_share}, {"views_color_corrected", mesh.views_color_corrected}, {"seconds_render", mesh.seconds_render},
                                             {"seconds_fusion", mesh.seconds_fusion}, {"seconds_extract", mesh.seconds_extract},
                                             {"seconds_color", mesh.seconds_color}};
                 auto report_path = params->mesh_output;

@@ -1,6 +1,8 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
+#include "components/ppisp.hpp"
 #include "core/native_fs.hpp"
+#include "core/tensor.hpp"
 #include "rasterization/gsplat/TsdfFusion.h"
 #include "splat_mesh.hpp"
 #include <algorithm>
@@ -82,6 +84,149 @@ TEST(SplatMesh, SmallComponentsGoAndLargeOnesStay) {
     EXPECT_EQ(mesh.faces.size(), 3u);
     EXPECT_EQ(mesh.components_kept, 1u);
     EXPECT_EQ(mesh.components_total, 2u);
+}
+
+namespace {
+    // A flat grid of 2 cm cells facing +z, with the listed cells left out.
+    SplatMesh grid_without(const std::vector<std::pair<int, int>>& missing) {
+        constexpr int n = 41;
+        SplatMesh mesh;
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x)
+                mesh.vertices.push_back({x * .02f, y * .02f, 0.f});
+        for (int y = 0; y + 1 < n; ++y)
+            for (int x = 0; x + 1 < n; ++x) {
+                if (std::ranges::find(missing, std::pair{x, y}) != missing.end())
+                    continue;
+                const int a = y * n + x;
+                mesh.faces.push_back({a, a + 1, a + n + 1});
+                mesh.faces.push_back({a, a + n + 1, a + n});
+            }
+        return mesh;
+    }
+
+    size_t rim_edges(const SplatMesh& mesh) {
+        std::vector<std::pair<int32_t, int32_t>> edges;
+        for (const auto& f : mesh.faces)
+            for (int i = 0; i < 3; ++i)
+                edges.emplace_back(f[i], f[(i + 1) % 3]);
+        std::ranges::sort(edges);
+        return std::ranges::count_if(edges, [&](const auto& e) { return !std::ranges::binary_search(edges, std::pair{e.second, e.first}); });
+    }
+} // namespace
+
+TEST(SplatMesh, FillClosesSmallHolesFacingTheSameWay) {
+    auto mesh = grid_without({{10, 10}, {11, 10}, {30, 30}});
+    const auto outer_rim = rim_edges(grid_without({}));
+    const auto before = mesh.faces.size();
+    EXPECT_EQ(lfs::training::fill_small_mesh_holes(mesh, .3f), 2u);
+    EXPECT_GT(mesh.faces.size(), before);
+    EXPECT_EQ(rim_edges(mesh), outer_rim);
+    lfs::training::compute_splat_mesh_normals(mesh);
+    EXPECT_NEAR(mesh.area, .8 * .8, 1e-4);
+    for (const auto& n : mesh.normals)
+        EXPECT_GT(n[2], .99f);
+}
+
+TEST(SplatMesh, FillLeavesLargeHolesAndTheOuterRimOpen) {
+    std::vector<std::pair<int, int>> missing;
+    for (int y = 10; y < 20; ++y)
+        for (int x = 10; x < 20; ++x)
+            missing.emplace_back(x, y);
+    auto mesh = grid_without(missing);
+    const auto faces = mesh.faces.size();
+    EXPECT_EQ(lfs::training::fill_small_mesh_holes(mesh, .3f), 0u);
+    EXPECT_EQ(mesh.faces.size(), faces);
+    EXPECT_EQ(lfs::training::fill_small_mesh_holes(mesh, 0.f), 0u);
+}
+
+TEST(SplatMesh, SimplifyStaysOnTheSurfaceWithFewerFaces) {
+    constexpr float voxel = .04f, tolerance = .01f;
+    auto mesh = sphere_mesh(voxel);
+    mesh.colors.assign(mesh.vertices.size(), {10, 20, 30});
+    const size_t before = mesh.faces.size();
+    lfs::training::simplify_splat_mesh(mesh, tolerance, 1.f);
+    EXPECT_LT(mesh.faces.size(), before / 2);
+    EXPECT_EQ(mesh.faces_before_simplify, before);
+    ASSERT_EQ(mesh.normals.size(), mesh.vertices.size());
+    ASSERT_EQ(mesh.colors.size(), mesh.vertices.size());
+    EXPECT_NEAR(mesh.area / (4. * std::numbers::pi), 1., .1);
+    std::vector<char> used(mesh.vertices.size(), 0);
+    for (const auto& face : mesh.faces)
+        for (const auto vertex : face) {
+            ASSERT_GE(vertex, 0);
+            ASSERT_LT(size_t(vertex), mesh.vertices.size());
+            used[vertex] = 1;
+        }
+    EXPECT_EQ(std::ranges::count(used, char{0}), 0);
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        const auto& p = mesh.vertices[i];
+        EXPECT_NEAR(std::hypot(p[0], p[1], p[2]), 1.f, voxel / 2 + 2 * tolerance);
+        EXPECT_EQ(mesh.colors[i], (std::array<uint8_t, 3>{10, 20, 30}));
+    }
+}
+
+TEST(SplatMesh, SimplifyWithoutToleranceKeepsEveryFace) {
+    auto mesh = sphere_mesh(.04f);
+    const auto faces = mesh.faces;
+    const auto vertices = mesh.vertices;
+    lfs::training::simplify_splat_mesh(mesh, 0.f, 1.f);
+    EXPECT_EQ(mesh.faces, faces);
+    EXPECT_EQ(mesh.vertices, vertices);
+}
+
+TEST(SplatMesh, SimplifyInPiecesLeavesNoCracksAndStaysOnTheSurface) {
+    constexpr float voxel = .04f, tolerance = .01f;
+    auto mesh = sphere_mesh(voxel);
+    mesh.colors.assign(mesh.vertices.size(), {10, 20, 30});
+    ASSERT_EQ(rim_edges(mesh), 0u);
+    const size_t before = mesh.faces.size();
+    lfs::training::simplify_splat_mesh(mesh, tolerance, 1.f, before / 16);
+    EXPECT_LT(mesh.faces.size(), before * 3 / 4);
+    EXPECT_EQ(rim_edges(mesh), 0u);
+    ASSERT_EQ(mesh.normals.size(), mesh.vertices.size());
+    ASSERT_EQ(mesh.colors.size(), mesh.vertices.size());
+    EXPECT_NEAR(mesh.area / (4. * std::numbers::pi), 1., .1);
+    for (const auto& p : mesh.vertices)
+        EXPECT_NEAR(std::hypot(p[0], p[1], p[2]), 1.f, 2.f * tolerance + voxel);
+    for (const auto& c : mesh.colors)
+        EXPECT_EQ(c, (std::array<uint8_t, 3>{10, 20, 30}));
+}
+
+TEST(SplatMesh, SimplifySplitsMeshesTooLargeForItsToleranceWithoutCracks) {
+    // At this tolerance the sphere is wider than one piece may be, whatever its face count.
+    constexpr float voxel = .04f, tolerance = .0002f;
+    auto mesh = sphere_mesh(voxel);
+    mesh.colors.assign(mesh.vertices.size(), {10, 20, 30});
+    lfs::training::simplify_splat_mesh(mesh, tolerance, 1.f);
+    EXPECT_EQ(rim_edges(mesh), 0u);
+    for (const auto& p : mesh.vertices)
+        EXPECT_NEAR(std::hypot(p[0], p[1], p[2]), 1.f, voxel);
+}
+
+TEST(SplatMesh, SimplifyKeepsMoreFacesWhereTheColorChanges) {
+    // A flat grid has no shape to keep, so only the color stripes can hold faces back.
+    const auto stripes = [] {
+        constexpr int n = 101;
+        SplatMesh mesh;
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x) {
+                mesh.vertices.push_back({x * .02f, y * .02f, 0.f});
+                const auto level = static_cast<uint8_t>((x / 5) % 2 ? 255 : 0);
+                mesh.colors.push_back({level, level, level});
+            }
+        for (int y = 0; y + 1 < n; ++y)
+            for (int x = 0; x + 1 < n; ++x) {
+                const int a = y * n + x;
+                mesh.faces.push_back({a, a + 1, a + n + 1});
+                mesh.faces.push_back({a, a + n + 1, a + n});
+            }
+        return mesh;
+    };
+    auto plain = stripes(), colored = stripes();
+    lfs::training::simplify_splat_mesh(plain, .01f, 0.f);
+    lfs::training::simplify_splat_mesh(colored, .01f, 20.f);
+    EXPECT_LT(plain.faces.size() * 4, colored.faces.size());
 }
 
 TEST(SplatMesh, PlyHasTheHeaderCountsAndRecordSizes) {
@@ -183,12 +328,12 @@ namespace {
             gsplat_lfs::tsdf_integrate(keys.data, near_blocks.data, near_found, view, grid, depth_d.data, sum.data, weight.data, views.data, nullptr);
             ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         }
-        const uint64_t count = gsplat_lfs::tsdf_collect_voxels(keys.data, uint32_t(blocks), grid, sum.data, weight.data, views.data, carve.data,
+        const uint64_t count = gsplat_lfs::tsdf_collect_voxels(keys.data, uint32_t(blocks), 0, uint32_t(blocks), grid, sum.data, weight.data, views.data, carve.data,
                                                                min_views, nullptr, nullptr, counter.data, nullptr);
         ASSERT_GT(count, 0u);
         Device<uint64_t> found_keys(count);
         Device<float> found_tsdf(count);
-        (void)gsplat_lfs::tsdf_collect_voxels(keys.data, uint32_t(blocks), grid, sum.data, weight.data, views.data, carve.data,
+        (void)gsplat_lfs::tsdf_collect_voxels(keys.data, uint32_t(blocks), 0, uint32_t(blocks), grid, sum.data, weight.data, views.data, carve.data,
                                               min_views, found_keys.data, found_tsdf.data, counter.data, nullptr);
         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         std::vector<uint64_t> host_keys(count);
@@ -219,6 +364,45 @@ namespace {
         return z[z.size() / 2];
     }
 } // namespace
+
+TEST_F(SplatMeshGpu, ColorsLeanOnCloseViews) {
+    const std::vector<float> vertex{0.f, 0.f, 0.f};
+    Device<float> vertices(3), depth(size_t(kSize) * kSize), photo(size_t(kSize) * kSize * 3), sum(3), weight(1);
+    ASSERT_EQ(cudaMemcpy(vertices.data, vertex.data(), 12, cudaMemcpyHostToDevice), cudaSuccess);
+    const auto add = [&](const float camera_z, const float level) {
+        std::vector<float> d(size_t(kSize) * kSize, -camera_z), c(size_t(kSize) * kSize * 3, level);
+        ASSERT_EQ(cudaMemcpy(depth.data, d.data(), d.size() * 4, cudaMemcpyHostToDevice), cudaSuccess);
+        ASSERT_EQ(cudaMemcpy(photo.data, c.data(), c.size() * 4, cudaMemcpyHostToDevice), cudaSuccess);
+        gsplat_lfs::mesh_color_accumulate(vertices.data, 1, pinhole_at(camera_z), depth.data, photo.data, .1f, sum.data, weight.data, nullptr);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    };
+    add(-1.f, 1.f);
+    add(-4.f, 0.f);
+    float s = 0.f, w = 0.f;
+    ASSERT_EQ(cudaMemcpy(&s, sum.data, 4, cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&w, weight.data, 4, cudaMemcpyDeviceToHost), cudaSuccess);
+    // Weights 1 and 1/4.
+    EXPECT_NEAR(s / w, .8f, .001f);
+}
+
+TEST_F(SplatMeshGpu, TrainedAppearanceInvertsBackToTheRender) {
+    lfs::training::PPISP ppisp(1);
+    ppisp.register_frame(7, 3);
+    ppisp.finalize();
+    const std::vector<float> exposure{.4f}, color{3.f, -2.f, 1.f, 2.f, -1.f, 2.f, 4.f, -3.f};
+    ASSERT_EQ(cudaMemcpy(ppisp.exposure_params().ptr<float>(), exposure.data(), 4, cudaMemcpyHostToDevice), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(ppisp.color_params().ptr<float>(), color.data(), 32, cudaMemcpyHostToDevice), cudaSuccess);
+    constexpr size_t side = 16;
+    std::vector<float> render(3 * side * side);
+    for (size_t i = 0; i < render.size(); ++i)
+        render[i] = .1f + .4f * float(i % 7) / 6.f;
+    auto rgb = lfs::core::Tensor::from_vector(render, {3, side, side}, lfs::core::Device::CUDA);
+    const auto photo = ppisp.apply(rgb, 3, 7);
+    auto back = ppisp.invert(photo, 3, 7).cpu().contiguous();
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    for (size_t i = 0; i < render.size(); ++i)
+        EXPECT_NEAR(back.ptr<float>()[i], render[i], .002f);
+}
 
 TEST_F(SplatMeshGpu, ASingleViewPutsTheSurfaceOnTheWall) {
     std::vector<uint64_t> keys;

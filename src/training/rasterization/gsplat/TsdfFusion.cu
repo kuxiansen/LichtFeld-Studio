@@ -15,6 +15,10 @@ namespace gsplat_lfs {
         // Rolling shutter iterates from the poses of the frame's two ends; a point just outside
         // the frame at either end can still land inside it.
         constexpr float kReadoutMargin = 0.1f;
+        constexpr uint32_t kNoBlock = ~uint32_t{0};
+        // Keep a view that sees a vertex at all from dropping to nothing, and depth noise on a
+        // very close view from taking over.
+        constexpr float kColorMinDistance = 0.5f;
 
         // Calls body once with this view's camera model.
         template <class Body>
@@ -134,7 +138,7 @@ namespace gsplat_lfs {
             const float block_size = grid.voxel * static_cast<float>(grid.block);
             for (int k = 0; k < 3; ++k) {
                 uint64_t key = kTsdfNoKey;
-                if (d > 0.f) {
+                if (d > 0.f && (grid.max_range <= 0.f || d <= grid.max_range)) {
                     const float along = d + static_cast<float>(k - 1) * grid.trunc;
                     const float px = rays[3 * pixel] * along - m[3];
                     const float py = rays[3 * pixel + 1] * along - m[7];
@@ -251,50 +255,100 @@ namespace gsplat_lfs {
             });
         }
 
-        __global__ void collect_kernel(const uint64_t* block_keys, const uint32_t block_count, const TsdfGrid grid,
-                                       const float* sum, const float* weight, const uint16_t* views, const float* carve,
+        __device__ __forceinline__ uint32_t find_block(const uint64_t* block_keys, const uint32_t block_count, const uint64_t key) {
+            uint32_t low = 0, high = block_count;
+            while (low < high) {
+                const uint32_t middle = low + (high - low) / 2;
+                if (block_keys[middle] < key)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+            return low < block_count && block_keys[low] == key ? low : kNoBlock;
+        }
+
+        __global__ void collect_kernel(const uint64_t* block_keys, const uint32_t block_count, const uint32_t first_block, const uint32_t last_block,
+                                       const TsdfGrid grid, const float* sum, const float* weight, const uint16_t* views, const float* carve,
                                        const uint32_t min_views, uint64_t* keys, float* tsdf, uint64_t* counter) {
-            const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
-            if (b >= block_count)
+            const uint32_t b = first_block + blockIdx.x * blockDim.x + threadIdx.x;
+            if (b >= last_block)
                 return;
             const glm::ivec3 ijk = decode_key(block_keys[b]);
             const uint32_t side = grid.block;
-            const uint64_t first = static_cast<uint64_t>(b) * side * side * side;
-            for (uint32_t i = 0; i < side * side * side; ++i) {
-                if (views[first + i] < min_views)
+            const uint32_t voxels = side * side * side;
+            const auto read = [&](const uint32_t block, const uint32_t i, float& value) {
+                const uint64_t at = static_cast<uint64_t>(block) * voxels + i;
+                if (views[at] < min_views)
+                    return false;
+                value = (sum[at] + carve[block]) / fmaxf(weight[at] + carve[block], 1e-6f);
+                return fabsf(value) < 1.f;
+            };
+            // Found on first use: most blocks' voxels never look across a face.
+            uint32_t faces[6] = {kNoBlock, kNoBlock, kNoBlock, kNoBlock, kNoBlock, kNoBlock};
+            bool looked[6] = {};
+            const uint32_t stride[3] = {1, side, side * side};
+            const auto opposite = [&](const uint32_t i, const uint32_t local, const int axis, const bool up, const float value) {
+                uint32_t block = b, neighbor;
+                if (up ? local + 1 < side : local > 0) {
+                    neighbor = up ? i + stride[axis] : i - stride[axis];
+                } else {
+                    const int face = 2 * axis + (up ? 1 : 0);
+                    if (!looked[face]) {
+                        looked[face] = true;
+                        glm::ivec3 next = ijk;
+                        next[axis] += up ? 1 : -1;
+                        faces[face] = find_block(block_keys, block_count, encode_key(next.x, next.y, next.z));
+                    }
+                    block = faces[face];
+                    if (block == kNoBlock)
+                        return false;
+                    neighbor = up ? i - (side - 1) * stride[axis] : i + (side - 1) * stride[axis];
+                }
+                float other = 0.f;
+                return read(block, neighbor, other) && (other < 0.f) != (value < 0.f);
+            };
+            for (uint32_t i = 0; i < voxels; ++i) {
+                float value = 0.f;
+                if (!read(b, i, value))
                     continue;
-                const float value = (sum[first + i] + carve[b]) / fmaxf(weight[first + i] + carve[b], 1e-6f);
-                if (!(fabsf(value) < 1.f))
+                const uint32_t lx = i % side, ly = (i / side) % side, lz = i / (side * side);
+                if (!opposite(i, lx, 0, true, value) && !opposite(i, lx, 0, false, value) && !opposite(i, ly, 1, true, value) &&
+                    !opposite(i, ly, 1, false, value) && !opposite(i, lz, 2, true, value) && !opposite(i, lz, 2, false, value))
                     continue;
                 const uint64_t slot = atomicAdd(reinterpret_cast<unsigned long long*>(counter), 1ull);
                 if (keys != nullptr) {
                     const int side_i = static_cast<int>(side);
-                    keys[slot] = encode_key(ijk.x * side_i + static_cast<int>(i % side), ijk.y * side_i + static_cast<int>((i / side) % side),
-                                            ijk.z * side_i + static_cast<int>(i / (side * side)));
+                    keys[slot] = encode_key(ijk.x * side_i + static_cast<int>(lx), ijk.y * side_i + static_cast<int>(ly), ijk.z * side_i + static_cast<int>(lz));
                     tsdf[slot] = value;
                 }
             }
         }
 
         __global__ void color_kernel(const float* vertices, const uint32_t vertex_count, const TsdfView view, const float* depth,
-                                     const float* photo, const float tolerance, float* color_sum, uint32_t* color_count) {
+                                     const float* photo, const float tolerance, float* color_sum, float* color_weight) {
             const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) * kVerticesPerThread;
             if (first >= vertex_count)
                 return;
             const uint32_t pixels = view.width * view.height;
             const RollingShutterParameters readout = readout_of(view);
+            const float* m = view.viewmat;
+            // Center = -R^T t. The middle of the readout is close enough for a weight.
+            const glm::fvec3 center(-(m[0] * m[3] + m[4] * m[7] + m[8] * m[11]), -(m[1] * m[3] + m[5] * m[7] + m[9] * m[11]),
+                                    -(m[2] * m[3] + m[6] * m[7] + m[10] * m[11]));
             with_model(view, [&](const auto& model) {
                 for (uint32_t v = first; v < min(first + kVerticesPerThread, vertex_count); ++v) {
-                    const Pixel pixel = project(model, view, readout, glm::fvec3(vertices[3 * v], vertices[3 * v + 1], vertices[3 * v + 2]));
+                    const glm::fvec3 point(vertices[3 * v], vertices[3 * v + 1], vertices[3 * v + 2]);
+                    const Pixel pixel = project(model, view, readout, point);
                     if (!pixel.valid)
                         continue;
                     const uint32_t at = pixel.y * view.width + pixel.x;
                     const float measured = depth[at];
                     if (!(measured > 0.f) || !(fabsf(measured - pixel.range) < tolerance))
                         continue;
+                    const float w = 1.f / fmaxf(glm::length(center - point), kColorMinDistance);
                     for (uint32_t c = 0; c < 3; ++c)
-                        color_sum[3 * v + c] += photo[c * pixels + at];
-                    color_count[v] += 1;
+                        color_sum[3 * v + c] += w * photo[c * pixels + at];
+                    color_weight[v] += w;
                 }
             });
         }
@@ -360,11 +414,13 @@ namespace gsplat_lfs {
         LFS_CUDA_LAUNCH_CHECK(stream, "tsdf.integrate");
     }
 
-    uint64_t tsdf_collect_voxels(const uint64_t* block_keys, const uint32_t block_count, const TsdfGrid& grid,
+    uint64_t tsdf_collect_voxels(const uint64_t* block_keys, const uint32_t block_count, const uint32_t first_block,
+                                 const uint32_t last_block, const TsdfGrid& grid,
                                  const float* sum, const float* weight, const uint16_t* views, const float* carve,
                                  const uint32_t min_views, uint64_t* keys, float* tsdf, uint64_t* counter, cudaStream_t stream) {
         LFS_CUDA_CHECK_MSG(cudaMemsetAsync(counter, 0, sizeof(uint64_t), stream), "tsdf.collect clear");
-        collect_kernel<<<launch_blocks(block_count), kThreads, 0, stream>>>(block_keys, block_count, grid, sum, weight, views, carve, min_views, keys, tsdf, counter);
+        collect_kernel<<<launch_blocks(last_block - first_block), kThreads, 0, stream>>>(block_keys, block_count, first_block, last_block, grid, sum, weight, views, carve,
+                                                                                         min_views, keys, tsdf, counter);
         LFS_CUDA_LAUNCH_CHECK(stream, "tsdf.collect");
         uint64_t count = 0;
         LFS_CUDA_CHECK_MSG(cudaMemcpyAsync(&count, counter, sizeof(uint64_t), cudaMemcpyDeviceToHost, stream), "tsdf.collect count");
@@ -372,11 +428,10 @@ namespace gsplat_lfs {
         return count;
     }
 
-    void mesh_color_accumulate(const float* vertices, const uint32_t vertex_count, const TsdfView& view,
-                               const float* depth, const float* photo, const float tolerance,
-                               float* color_sum, uint32_t* color_count, cudaStream_t stream) {
+    void mesh_color_accumulate(const float* vertices, const uint32_t vertex_count, const TsdfView& view, const float* depth, const float* photo,
+                               const float tolerance, float* color_sum, float* color_weight, cudaStream_t stream) {
         const uint64_t threads = (static_cast<uint64_t>(vertex_count) + kVerticesPerThread - 1) / kVerticesPerThread;
-        color_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(vertices, vertex_count, view, depth, photo, tolerance, color_sum, color_count);
+        color_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(vertices, vertex_count, view, depth, photo, tolerance, color_sum, color_weight);
         LFS_CUDA_LAUNCH_CHECK(stream, "mesh.color");
     }
 
