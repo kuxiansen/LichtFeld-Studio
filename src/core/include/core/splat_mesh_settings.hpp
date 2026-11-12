@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <string>
 
 namespace lfs::core {
 
@@ -17,7 +18,7 @@ namespace lfs::core {
         float trunc_cap = 0.f;         // 0 derives the cap as 5x the truncation, so it scales with the voxel
         float full_weight_range = 1.f; // views beyond this range count less, by 1/r^2; 0 = equal weights
         int view_stride = 2;           // fuse every Nth view
-        int color_stride = 2;          // color from every Nth fused view
+        int color_stride = 2;          // vertex colors from every Nth fused view; a texture uses every photo
         int min_views = 2;             // views a voxel needs to count as observed
         // Closes holes whose rim is shorter than this, in scene units. 0 derives it as 20x the
         // voxel, so the threshold follows the scene's detail instead of one hand-tuned number.
@@ -51,6 +52,10 @@ namespace lfs::core {
         float isolated_component_neighbor_radius = 10.f;
         float max_range = 0.f;         // surfaces no view saw from closer are not meshed; 0 = no limit
         int max_width = 1600;          // render and photo width limit
+        float texel_size = 0.f;        // size of a texel on the surface, for an OSGB model beside the PLY; 0 = vertex colors only
+        int texture_size = 4096;       // side of a texture page
+        int texture_width = 0;         // render and photo width limit when baking; 0 = the photos' own
+        std::string from_mesh;         // a PLY to bake instead of extracting the surface, UTF-8
         bool invert_mask = false;
         float mask_threshold = .5f;
 

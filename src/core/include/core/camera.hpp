@@ -85,8 +85,10 @@ namespace lfs::core {
                                  bool apply_undistortion = true);
 
         // Same processing as load_and_get_mask for an explicit mask file, without caching.
+        // keep_cached leaves the decoded file in the loader's cache, which grows until RAM runs short.
         Tensor load_mask_file(const std::filesystem::path& path, int resize_factor, int max_width,
-                              bool invert_mask, float mask_threshold, bool binarize, bool apply_undistortion) const;
+                              bool invert_mask, float mask_threshold, bool binarize, bool apply_undistortion,
+                              bool keep_cached = true) const;
 
         // Load depth map from disk, convert to [H,W] float32 [0,1], and return it (cached)
         Tensor load_and_get_depth(int resize_factor = -1, int max_width = 0);
@@ -188,7 +190,11 @@ namespace lfs::core {
         const std::filesystem::path& normal_path() const noexcept { return _normal_path; }
         void set_depth_path(std::filesystem::path path);
         void set_normal_path(std::filesystem::path path);
-        void set_mask_path(std::filesystem::path path);
+        // A project mask retains its cache-file lease independently of the document.
+        void set_mask_path(std::filesystem::path path, std::optional<Uuid> asset_uuid = std::nullopt,
+                           std::shared_ptr<const void> asset_owner = {});
+        const std::optional<Uuid>& mask_asset_uuid() const noexcept { return _mask_asset_uuid; }
+        const std::shared_ptr<const void>& mask_asset_owner() const noexcept { return _mask_asset_owner; }
 
         // Sparse SfM observations for this image (COLMAP 2D points with a 3D id).
         // Pixel coordinates are in the camera's native width/height at load
@@ -297,6 +303,7 @@ namespace lfs::core {
         // IDs
         float _FoVx = 0.f;
         float _FoVy = 0.f;
+        friend class Scene;
         int _uid = -1;
         int _camera_id = 0;
         float _focal_x = 0.f;
@@ -315,7 +322,7 @@ namespace lfs::core {
         // Image info
         std::string _image_name;
         std::filesystem::path _image_path;
-        Tensor read_mask_image(const std::filesystem::path& path, int resize_factor, int max_width,
+        Tensor read_mask_image(const std::filesystem::path& path, bool keep_cached, int resize_factor, int max_width,
                                bool apply_undistortion) const;
         Tensor finish_mask(Tensor mask, int resize_factor, int max_width, bool invert_mask, float mask_threshold,
                            bool binarize, bool apply_undistortion) const;
@@ -352,6 +359,8 @@ namespace lfs::core {
         // takes precedence over _mask_path when set. Processed on first use.
         Tensor _in_memory_mask_raw;
         std::uint64_t _mask_revision = 0;
+        std::optional<Uuid> _mask_asset_uuid;
+        std::shared_ptr<const void> _mask_asset_owner;
 
         // Depth caching (processed depth stored on GPU)
         Tensor _cached_depth;

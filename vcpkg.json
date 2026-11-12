@@ -32,6 +32,7 @@
     "tiff",
     "openexr",
     "xxhash",
+    "zlib",
     "zstd"
   ],
   "default-features": [

@@ -10,6 +10,7 @@
 #include "control/command_api.hpp"
 #include "core/abi.hpp"
 #include "core/argument_parser.hpp"
+#include "core/checkpoint_format.hpp"
 #include "core/crash_handler.hpp"
 #include "core/cuda_error.hpp"
 #include "core/cuda_version.hpp"
@@ -23,7 +24,10 @@
 #include "core/tensor.hpp"
 #include "git_version.h"
 #include "io/cache_image_loader.hpp"
+#include "io/project_document.hpp"
 #include "lfs_core_abi_stamp.h"
+#include "product_identity.hpp"
+#include "training/splat_mesh.hpp"
 #include "training/trainer.hpp"
 #include "training/training_setup.hpp"
 
@@ -63,7 +67,7 @@ namespace {
         } else {
             LOG_INFO("CUDA driver version: {}.{}", info.major, info.minor);
             if (!info.supported) {
-                LOG_ERROR("CUDA {}.{} is too old; lfs_train requires CUDA 12.8 or newer "
+                LOG_ERROR("CUDA {}.{} is too old; the trainer requires CUDA 12.8 or newer "
                           "(NVIDIA driver 570 or newer)",
                           info.major, info.minor);
                 return false;
@@ -100,10 +104,14 @@ namespace {
     }
 
     std::optional<std::filesystem::path> lpipsWeightsFromEnvironment() {
+#if GEOSUN_TRAINER_BUILD
+        if (const auto path = lfs::core::environment::value("GEOSUN_LPIPS_WEIGHTS"))
+            return lfs::core::utf8_to_path(*path);
+#endif
         if (const auto path = lfs::core::environment::value("LFS_LPIPS_WEIGHTS"))
             return lfs::core::utf8_to_path(*path);
-        LOG_WARN("LPIPS unavailable: set LFS_LPIPS_WEIGHTS to the weights file "
-                 "(lfs_train does not download it)");
+        LOG_WARN("LPIPS unavailable: set {} to the weights file",
+                 GEOSUN_TRAINER_BUILD ? "GEOSUN_LPIPS_WEIGHTS" : "LFS_LPIPS_WEIGHTS");
         return std::nullopt;
     }
 
@@ -130,11 +138,11 @@ namespace {
 
     int train(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
         if (const auto option = unsupportedOption(*params)) {
-            LOG_ERROR("{} is not supported by lfs_train; use the LichtFeld-Studio application", *option);
+            LOG_ERROR("{} is not supported by this trainer", *option);
             return 1;
         }
         if (params->dataset.data_path.empty()) {
-            LOG_ERROR("lfs_train requires --data-path");
+            LOG_ERROR("Training requires --data-path");
             return 1;
         }
         params->optimization.headless = true;
@@ -160,7 +168,16 @@ namespace {
             return 1;
         }
         if (params->optimization.enable_eval)
-            trainer->set_lpips_weights_path(lpipsWeightsFromEnvironment());
+            trainer->set_lpips_weights_preparer([]() -> std::optional<lfs::core::nn::WeightFile> {
+                const auto path = lpipsWeightsFromEnvironment();
+                if (!path)
+                    return std::nullopt;
+                auto weights = lfs::core::nn::WeightFile::open(*path);
+                if (weights)
+                    return std::move(*weights);
+                LOG_WARN("LPIPS unavailable: {}", weights.error().detail());
+                return std::nullopt;
+            });
         lfs::training::grant_headless_project_saves(*trainer, *params);
 
         lfs::core::Tensor::trim_memory_pool();
@@ -183,6 +200,90 @@ namespace {
         lfs::core::flush_and_exit(coordinator.interrupted() ? coordinator.interrupted_exit_code() : 0);
     }
 
+    int exportProjectMesh(const lfs::core::param::TrainingParameters& cli) {
+        namespace core = lfs::core;
+        namespace training = lfs::training;
+        if (!cli.resume_project) {
+            LOG_ERROR("Pass a trained .licht project to mesh");
+            return 1;
+        }
+
+        auto document = lfs::io::project::ProjectDocument::open(*cli.resume_project);
+        if (!document) {
+            LOG_ERROR("Could not open project: {}", lfs::format_for_developer(document.error()));
+            return 1;
+        }
+        core::Scene scene;
+        auto hydrated = document->hydrate(scene);
+        if (!hydrated || !hydrated->checkpoint_uuid || !hydrated->checkpoint_header) {
+            LOG_ERROR("Could not load the trained project checkpoint");
+            return 1;
+        }
+        const auto uuid = *hydrated->checkpoint_uuid;
+        const auto* checkpoint = document->find_checkpoint(uuid);
+        if (!checkpoint) {
+            LOG_ERROR("Project checkpoint is missing");
+            return 1;
+        }
+        std::optional<core::CheckpointParametersLoadResult> saved;
+        auto visited = checkpoint->visit_stream([&](std::istream& stream, std::uint64_t bytes) -> lfs::Result<void> {
+            saved = core::load_checkpoint_params(stream, bytes);
+            return {};
+        });
+        if (!visited || !saved || !*saved) {
+            LOG_ERROR("Could not read project checkpoint parameters");
+            return 1;
+        }
+        auto params = std::move(**saved);
+        if (!cli.dataset.data_path.empty() && cli.dataset.data_path != params.dataset.data_path) {
+            scene.rebaseCameraAssetPaths(params.dataset.data_path, cli.dataset.data_path);
+            params.dataset.data_path = cli.dataset.data_path;
+        }
+        params.dataset.output_path = cli.mesh_output.parent_path();
+        params.optimization.headless = true;
+        params.resume_project = cli.resume_project;
+        installImageLoader(params.dataset.loading_params.use_cpu_memory);
+        lfs::event::CommandCenterBridge::instance().set(&training::CommandCenter::instance());
+        auto installed = training::installTrainerFromProjectCheckpoint(
+            scene, *document, uuid, params, core::path_to_utf8(*cli.resume_project), hydrated->checkpoint_header->iteration);
+        if (!installed) {
+            LOG_ERROR("Could not restore project: {}", installed.error());
+            return 1;
+        }
+        auto& trainer = *installed->trainer;
+        params.export_formats = cli.export_formats;
+        params.dataset.output_name = cli.dataset.output_name;
+        if (const auto exported = training::export_final_splats(trainer, params); !exported) {
+            LOG_ERROR("{}", lfs::format_for_developer(exported.error()));
+            return 1;
+        }
+        const auto& dataset = trainer.train_dataset();
+        std::vector<core::Camera*> cameras;
+        cameras.reserve(dataset->size());
+        for (std::size_t i = 0; i < dataset->size(); ++i)
+            cameras.push_back(dataset->get_camera(i));
+        auto settings = *cli.mesh_settings;
+        settings.invert_mask = params.optimization.invert_masks;
+        settings.mask_threshold = params.optimization.mask_threshold;
+        core::Tensor::trim_memory_pool();
+        lfs::app::HeadlessRunCoordinator coordinator;
+        const auto mesh = training::extract_splat_mesh(
+            trainer.get_strategy_mutable().get_model(), cameras, settings, coordinator.stop_token(), {},
+            trainer.hasPPISP() ? trainer.getPPISP() : nullptr);
+        training::write_splat_mesh_ply(mesh, cli.mesh_output);
+        if (mesh.tiled) {
+            auto folder = cli.mesh_output;
+            folder.replace_extension();
+            folder += "_osgb";
+            training::write_splat_mesh_osgb(*mesh.tiled, folder);
+        }
+        trainer.shutdown();
+        static_cast<void>(installed->trainer.release());
+        core::teardown_gpu_before_exit();
+        core::mark_clean_exit();
+        core::flush_and_exit(0);
+    }
+
     int runMode(lfs::core::args::ParsedArgs args) {
         return std::visit([](auto&& mode) -> int {
             using T = std::decay_t<decltype(mode)>;
@@ -190,7 +291,7 @@ namespace {
             if constexpr (std::is_same_v<T, lfs::core::args::HelpMode>) {
                 return 0;
             } else if constexpr (std::is_same_v<T, lfs::core::args::VersionMode>) {
-                std::println("lfs_train (LichtFeld Studio {} {})", GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
+                std::println("{} {} ({})", LFS_PRODUCT_NAME, GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
                 return 0;
             } else if constexpr (std::is_same_v<T, lfs::core::args::TrainingMode>) {
 #ifdef __GLIBC__
@@ -198,16 +299,17 @@ namespace {
                 if (std::getenv("MALLOC_ARENA_MAX") == nullptr)
                     (void)mallopt(M_ARENA_MAX, 4);
 #endif
-                LOG_INFO("lfs_train {} ({})", GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
+                LOG_INFO("{} {} ({})", LFS_PRODUCT_NAME, GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
                 applyCudaContextTuning();
                 if (!preflightGpu()) {
                     lfs::core::teardown_gpu_before_exit();
                     lfs::core::flush_and_exit(1);
                 }
+                if (mode.params->mesh_settings)
+                    return exportProjectMesh(*mode.params);
                 return train(std::move(mode.params));
             } else {
-                std::println(stderr, "Error: lfs_train only trains; this subcommand needs the "
-                                     "LichtFeld-Studio application");
+                std::println(stderr, "Error: this build supports dataset training only");
                 return 1;
             }
         },
@@ -236,7 +338,7 @@ int main(int argc, char* argv[]) {
     const char* const loaded_core_stamp = lfs_core_abi_stamp();
     if (loaded_core_stamp == nullptr || !lfs_core_abi_matches(LFS_CORE_ABI_STAMP)) {
         std::println(stderr,
-                     "Fatal: lfs_core ABI mismatch. lfs_train expects '{}' but loaded '{}'. "
+                     "Fatal: trainer runtime ABI mismatch. Expected '{}' but loaded '{}'. "
                      "Remove stale binaries and rebuild.",
                      LFS_CORE_ABI_STAMP,
                      loaded_core_stamp != nullptr ? loaded_core_stamp : "<null>");

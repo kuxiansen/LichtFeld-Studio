@@ -127,9 +127,14 @@ set(TRAINING_NEW_SOURCES
         training_snapshot_service.cpp
         progress.cpp
         splat_mesh.cpp
+        splat_mesh_texture.cpp
+        splat_mesh_tiles.cpp
+        splat_mesh_osgb.cpp
+        ${CMAKE_SOURCE_DIR}/external/xatlas/xatlas.cpp
         training_cropbox_mask.cpp
         trainer.cpp
         trainer_popspa.cpp
+        noise_infill.cpp
         normal_auto_generate.cpp
         las_prior_sidecar.cpp
         vram_ledger.cpp
@@ -160,6 +165,7 @@ target_include_directories(lfs_training SYSTEM PRIVATE
 )
 
 find_package(meshoptimizer CONFIG REQUIRED)
+find_package(ZLIB REQUIRED)
 
 # Link dependencies
 target_link_libraries(lfs_training
@@ -174,6 +180,7 @@ target_link_libraries(lfs_training
     PRIVATE
         lfs_depth_anchor        # Shared depth-anchor fit + sidecar cache
         meshoptimizer::meshoptimizer
+        ZLIB::ZLIB
 )
 
 if(LFS_TRAINER_ONLY)

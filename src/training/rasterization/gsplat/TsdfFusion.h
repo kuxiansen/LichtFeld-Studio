@@ -111,4 +111,31 @@ namespace gsplat_lfs {
     void mesh_color_accumulate(const float* vertices, uint32_t vertex_count, const TsdfView& view, const float* depth, const float* photo,
                                float tolerance, float* color_sum, float* color_weight, cudaStream_t stream);
 
+    // A mask of 0 and 1 as one bit per pixel, (pixels + 31) / 32 words, and depth multiplied by it again.
+    void mesh_pack_mask(const float* mask, uint32_t pixels, uint32_t* bits, cudaStream_t stream);
+    void mesh_apply_mask(float* depth, uint32_t pixels, const uint32_t* bits, cudaStream_t stream);
+
+    // Blurs the photo [3, H, W] over pixels of positive depth, for mesh_texture_accumulate.
+    // scratch holds a photo and weights two channels of H * W.
+    void mesh_photo_low_pass(const float* photo, const float* depth, uint32_t width, uint32_t height, int radius,
+                             float* scratch, float* weights, float* low, cudaStream_t stream);
+
+    // How well this view sees each face: 0 unless at least half of 7 points on it lie on the depth map's surface,
+    // else that share squared times cos(angle)^6 / distance^2. Footprint alone would use a single cosine, but a surface
+    // is never where its photo saw it: raised lettering is not in the mesh, and an oblique view lays it across the wall
+    // by that height times tan(angle), so a close oblique view slants what a farther square-on view keeps upright.
+    // Faces are triangles of vertices [3 * V], facing outward by their winding.
+    // tolerances [face_count] say how far from the depth map a point may lie and still count as on it.
+    void mesh_face_view_score(const float* vertices, const int32_t* faces, uint32_t face_count, const TsdfView& view, const float* depth,
+                              const float* tolerances, float* score, cudaStream_t stream);
+
+    // Adds this view to the texels at world positions texels [3 * count]; a texel needs all four pixels it
+    // samples to lie on its surface. low_sum / low_weight is the mean of the blurred photo over views, each
+    // counting by 1 / distance. high keeps the photo of the view that labels [count] chose for the texel, and
+    // best_weight is then infinite; where that view has no clean sample, photo - low_photo of the closest view
+    // that does, to add to the mean.
+    void mesh_texture_accumulate(const float* texels, uint32_t count, const TsdfView& view, int32_t view_label, const int32_t* labels,
+                                 const float* depth, const float* photo, const float* low_photo, const float* tolerances, float* low_sum,
+                                 float* low_weight, float* high, float* best_weight, cudaStream_t stream);
+
 } // namespace gsplat_lfs

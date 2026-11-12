@@ -220,6 +220,8 @@ namespace lfs::core {
           _cached_mask_was_undistorted(other._cached_mask_was_undistorted),
           _in_memory_mask_raw(std::move(other._in_memory_mask_raw)),
           _mask_revision(other._mask_revision),
+          _mask_asset_uuid(other._mask_asset_uuid),
+          _mask_asset_owner(std::move(other._mask_asset_owner)),
           _cached_depth(std::move(other._cached_depth)),
           _depth_loaded(other._depth_loaded),
           _depth_quantization_step(other._depth_quantization_step),
@@ -294,6 +296,8 @@ namespace lfs::core {
             _cached_mask_was_undistorted = other._cached_mask_was_undistorted;
             _in_memory_mask_raw = std::move(other._in_memory_mask_raw);
             _mask_revision = other._mask_revision;
+            _mask_asset_uuid = other._mask_asset_uuid;
+            _mask_asset_owner = std::move(other._mask_asset_owner);
             _cached_depth = std::move(other._cached_depth);
             _depth_loaded = other._depth_loaded;
             _depth_quantization_step = other._depth_quantization_step;
@@ -339,6 +343,7 @@ namespace lfs::core {
           _mask_path(other._mask_path),
           _depth_path(other._depth_path),
           _normal_path(other._normal_path),
+          _has_alpha(other._has_alpha),
           _has_image(other._has_image),
           _split(other._split),
           _camera_width(other._camera_width),
@@ -352,6 +357,8 @@ namespace lfs::core {
           _FoVx(other._FoVx),
           _FoVy(other._FoVy) {
         _world_view_transform = transform;
+        _mask_asset_uuid = other._mask_asset_uuid;
+        _mask_asset_owner = other._mask_asset_owner;
         _sfm_observations = other._sfm_observations;
         _sfm_observation_source = other._sfm_observation_source;
         _sfm_observation_node = other._sfm_observation_node;
@@ -582,7 +589,8 @@ namespace lfs::core {
     void Camera::rebase_asset_paths(const std::filesystem::path& old_root,
                                     const std::filesystem::path& new_root) {
         rebase_path_if_under(_image_path, old_root, new_root);
-        rebase_path_if_under(_mask_path, old_root, new_root);
+        if (!_mask_asset_uuid)
+            rebase_path_if_under(_mask_path, old_root, new_root);
         rebase_path_if_under(_depth_path, old_root, new_root);
         rebase_path_if_under(_normal_path, old_root, new_root);
     }
@@ -598,8 +606,14 @@ namespace lfs::core {
         release_normal_cache();
     }
 
-    void Camera::set_mask_path(std::filesystem::path path) {
+    void Camera::set_mask_path(std::filesystem::path path, std::optional<Uuid> asset_uuid,
+                               std::shared_ptr<const void> asset_owner) {
         _mask_path = std::move(path);
+        _mask_asset_uuid = asset_uuid;
+        _mask_asset_owner = std::move(asset_owner);
+        if (asset_uuid)
+            _in_memory_mask_raw = Tensor();
+        ++_mask_revision;
         _cached_mask = Tensor();
         _mask_loaded = false;
     }
@@ -612,7 +626,7 @@ namespace lfs::core {
         _mask_loaded = false;
     }
 
-    Tensor Camera::read_mask_image(const std::filesystem::path& path, const int resize_factor, const int max_width,
+    Tensor Camera::read_mask_image(const std::filesystem::path& path, const bool keep_cached, const int resize_factor, const int max_width,
                                    const bool apply_undistortion) const {
         Tensor mask;
         const bool warp_full_resolution = _undistort_prepared && apply_undistortion;
@@ -621,6 +635,7 @@ namespace lfs::core {
             .resize_factor = warp_full_resolution ? 1 : resize_factor,
             .max_width = warp_full_resolution ? 0 : max_width,
             .stream = _stream,
+            .skip_blob_cache = !keep_cached,
             .mask_grayscale = true};
 
         mask = load_image_cached(params);
@@ -687,9 +702,9 @@ namespace lfs::core {
 
     Tensor Camera::load_mask_file(const std::filesystem::path& path, const int resize_factor, const int max_width,
                                   const bool invert_mask, const float mask_threshold, const bool binarize,
-                                  const bool apply_undistortion) const {
+                                  const bool apply_undistortion, const bool keep_cached) const {
         const CUDAStreamGuard stream_guard(_stream);
-        return finish_mask(read_mask_image(path, resize_factor, max_width, apply_undistortion), resize_factor,
+        return finish_mask(read_mask_image(path, keep_cached, resize_factor, max_width, apply_undistortion), resize_factor,
                            max_width, invert_mask, mask_threshold, binarize, false);
     }
 
@@ -762,7 +777,7 @@ namespace lfs::core {
                 }
             }
         } else if (!_mask_path.empty() && lfs::core::native_fs::exists(_mask_path)) {
-            mask = read_mask_image(_mask_path, resize_factor, max_width, apply_undistortion);
+            mask = read_mask_image(_mask_path, true, resize_factor, max_width, apply_undistortion);
         } else {
             return Tensor();
         }

@@ -790,6 +790,8 @@ namespace lfs::python {
                  "Show camera frustum wireframes", false);
         add_float(&Proxy::camera_frustum_scale, "camera_frustum_scale", "Scale", "Camera frustum display scale", 0.25,
                   0.01, 10.0);
+        add_bool(&Proxy::hide_disabled_camera_frustums, "hide_disabled_camera_frustums", "Hide Disabled Cameras",
+                 "Hide disabled camera frustums", false);
 
         // Point Cloud Mode
         add_bool(&Proxy::point_cloud_mode, "point_cloud_mode", "Point Cloud Mode",
@@ -857,7 +859,7 @@ namespace lfs::python {
                      {{"Color", "palette", 0}, {"Gray", "gray", 1}}, 0);
         add_int_enum(&Proxy::gt_comparison_mode, "gt_comparison_mode", "GT Compare",
                      "Ground-truth comparison payload",
-                     {{"RGB", "rgb", 0}, {"Normal", "normal", 1}, {"Depth", "depth", 2}}, 0);
+                     {{"RGB", "rgb", 0}, {"Normal", "normal", 1}, {"Depth", "depth", 2}, {"Loss", "loss", 3}}, 0);
         add_int_enum(&Proxy::camera_metrics_mode, "camera_metrics_mode", "Camera Metrics",
                      "Compute metrics when jumping to a source camera",
                      {{"Off", "OFF", 0}, {"PSNR", "PSNR", 1}, {"PSNR + SSIM", "PSNR_SSIM", 2}}, 0);

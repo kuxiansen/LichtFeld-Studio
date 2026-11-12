@@ -127,6 +127,20 @@ if(WIN32)
 endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsVersionResource.cmake")
 
+if(WIN32 AND LFS_TRAINER_ONLY)
+    set(GEOSUN_TRAINER_BUILD ON)
+    set(LFS_PRODUCT_NAME "Geosun 3DGS Trainer")
+    set(LFS_PRODUCT_COMMAND "geosun_3dgs_train")
+    set(LFS_USER_DIRECTORY ".geosun-3dgs-trainer")
+    set(LFS_LOG_FILENAME "geosun-3dgs-trainer.log")
+else()
+    set(LFS_PRODUCT_NAME "LichtFeld Studio")
+    set(LFS_PRODUCT_COMMAND "lichtfeld-studio")
+    set(LFS_USER_DIRECTORY ".lichtfeld")
+    set(LFS_LOG_FILENAME "lichtfeld.log")
+endif()
+configure_file(cmake/product_identity.hpp.in include/product_identity.hpp @ONLY)
+
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SelectFastLinker.cmake")
 
 # On Linux, hide symbols pulled in from third-party image / compression static
@@ -386,6 +400,8 @@ endif()
 
 # Minimum SM for PTX-only (75=Turing, 80=Ampere, 86=GA102, 89=Ada, 90=Hopper)
 set(BUILD_CUDA_MIN_SM "75" CACHE STRING "Minimum SM for PTX-only builds")
+# SMs that also get precompiled SASS in PTX-only builds (e.g. "86;89"); GPUs on other SMs still JIT from the PTX
+set(BUILD_CUDA_REAL_SMS "" CACHE STRING "Extra SMs compiled to machine code in PTX-only builds")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CUDA_STANDARD 20)
@@ -408,17 +424,32 @@ endif()
 if(NVIDIA_SMI)
     execute_process(
             COMMAND ${NVIDIA_SMI} --query-gpu=compute_cap --format=csv,noheader
+            RESULT_VARIABLE NVIDIA_SMI_CAP_RESULT
             OUTPUT_VARIABLE DETECTED_COMPUTE_CAP
+            ERROR_QUIET
             OUTPUT_STRIP_TRAILING_WHITESPACE
     )
     string(REGEX REPLACE "\n.*" "" DETECTED_COMPUTE_CAP "${DETECTED_COMPUTE_CAP}")
 
     execute_process(
             COMMAND ${NVIDIA_SMI} --query-gpu=driver_version --format=csv,noheader
+            RESULT_VARIABLE NVIDIA_SMI_DRIVER_RESULT
             OUTPUT_VARIABLE NVIDIA_DRIVER_VERSION
+            ERROR_QUIET
             OUTPUT_STRIP_TRAILING_WHITESPACE
     )
     string(REGEX REPLACE "\n.*" "" NVIDIA_DRIVER_VERSION "${NVIDIA_DRIVER_VERSION}")
+    # nvidia-smi fails, printing its error to stdout, when the loaded driver and its libraries differ
+    # (a driver update before a reboot) or no GPU answers. CUDA itself may still work: fall back as if
+    # nvidia-smi were missing instead of reading the error as a version.
+    if(NOT NVIDIA_SMI_CAP_RESULT EQUAL 0 OR NOT NVIDIA_SMI_DRIVER_RESULT EQUAL 0 OR
+       NOT DETECTED_COMPUTE_CAP MATCHES "^[0-9]+\\.[0-9]+$" OR NOT NVIDIA_DRIVER_VERSION MATCHES "^[0-9]+(\\.[0-9]+)*$")
+        message(WARNING "nvidia-smi could not query the GPU (${DETECTED_COMPUTE_CAP}); "
+            "skipping the driver check. Reboot after a driver update.")
+        set(NVIDIA_SMI_FAILED TRUE)
+    endif()
+endif()
+if(NVIDIA_SMI AND NOT NVIDIA_SMI_FAILED)
     message(STATUS "Detected NVIDIA driver: ${NVIDIA_DRIVER_VERSION}")
     if(NVIDIA_DRIVER_VERSION VERSION_LESS "570")
         message(FATAL_ERROR "NVIDIA driver ${NVIDIA_DRIVER_VERSION} is too old. "
@@ -433,7 +464,7 @@ if(NVIDIA_SMI)
         set(LichtFeld-Studio_CUDA_ARCH "native")
     endif()
 else()
-    message(STATUS "nvidia-smi not found; using CUDA architecture 8.6 for this build")
+    message(STATUS "No GPU found through nvidia-smi; using CUDA architecture 8.6 for this build")
     set(DETECTED_COMPUTE_CAP 8.6)
     set(LichtFeld-Studio_CUDA_ARCH "86")
 endif()
@@ -453,6 +484,12 @@ if(BUILD_CUDA_PTX_ONLY)
     endif()
 
     set(LichtFeld-Studio_CUDA_ARCH "${BUILD_CUDA_MIN_SM}-virtual")
+    foreach(_sm IN LISTS BUILD_CUDA_REAL_SMS)
+        if(NOT _sm MATCHES "^[0-9]+$" OR _sm LESS BUILD_CUDA_MIN_SM)
+            message(FATAL_ERROR "BUILD_CUDA_REAL_SMS entries must be integers >= BUILD_CUDA_MIN_SM, got '${_sm}'")
+        endif()
+        list(APPEND LichtFeld-Studio_CUDA_ARCH "${_sm}-real")
+    endforeach()
     set(LFS_RUNTIME_MIN_SM "${BUILD_CUDA_MIN_SM}")
 
     math(EXPR _maj "${BUILD_CUDA_MIN_SM}/10")
@@ -541,9 +578,9 @@ find_package(libdeflate CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
 find_package(xxHash CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
-find_package(slang CONFIG REQUIRED)
 find_package(assimp REQUIRED)
 if(NOT LFS_TRAINER_ONLY)
+    find_package(slang CONFIG REQUIRED)
     find_package(RmlUi CONFIG REQUIRED)
 endif()
 
@@ -666,10 +703,9 @@ if(LFS_HIDDEN_SYMBOLS AND NOT WIN32 AND NOT LFS_TRAINER_ONLY)
         foreach(_lfs_export_consumer IN ITEMS lfs_logger lfs_core lfs_visualizer lfs_mcp lfs_py)
             target_link_options(${_lfs_export_consumer} PRIVATE "LINKER:--no-undefined")
         endforeach()
-        # FFmpeg assembly uses direct references to archive-local data in the shared visualizer.
-        # SPZ globals must stay local too: the Python module links another copy of its archive.
+        # SPZ globals must stay local: the Python module links another copy of its archive.
         target_link_options(lfs_visualizer PRIVATE
-            "LINKER:--exclude-libs,libavcodec.a:libavutil.a:libspz_lib.a")
+            "LINKER:--exclude-libs,libspz_lib.a")
     endif()
 endif()
 
@@ -1357,6 +1393,9 @@ endif()
 
 set(CMAKE_INSTALL_UCRT_LIBRARIES TRUE)
 set(CMAKE_INSTALL_OPENMP_LIBRARIES TRUE)
+if(LFS_TRAINER_ONLY)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT trainer-runtime)
+endif()
 
 include(GNUInstallDirs)
 include(InstallRequiredSystemLibraries)

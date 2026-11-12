@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #define NOMINMAX
 #include "splat_mesh.hpp"
+#include "splat_mesh_parallel.hpp"
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -16,6 +17,7 @@
 #include "core/cuda/memory_arena.hpp"
 #include "core/host_metrics.hpp"
 #include "core/image_io.hpp"
+#include "core/image_loader.hpp"
 #include "core/logger.hpp"
 #include "core/memory_pressure.hpp"
 #include "core/mesh_data.hpp"
@@ -31,8 +33,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <chrono>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -69,6 +71,23 @@ namespace lfs::training {
         // faces instead of 13%, and 100 m keeps 63%. Smaller pieces gain nothing and grow the seams.
         constexpr float kPieceExtentPerTolerance = 4000.f;
         constexpr double kMeshShareOfFreeMemory = 0.8;
+        constexpr double kTsdfShareOfFreeMemory = 0.8;
+        // The rest holds a depth map, a photo and its blurs at the bake width.
+        constexpr double kTextureShareOfFreeMemory = 0.7;
+        // A batch of pages holds 52 bytes per covered texel on the GPU, whatever the size of the scene, and each batch reads
+        // the photos that see it once more. This takes an indoor scene in one batch and an outdoor one in 4, against 3 at
+        // 128M: 203 s against 209 s of baking, at 9.9 GB of GPU memory against 12.0.
+        constexpr size_t kBakeBatchTexels = 80'000'000;
+        // Pages of a batch are composed this many covered texels at a time, 32 bytes each in RAM.
+        constexpr size_t kComposeChunkTexels = 16'000'000;
+        // Detail below this share of the image comes from the view chosen for the face, and only broader colors are leveled
+        // across views. Smaller lets the mean of misregistered views blur lettering, which spans about 1/100 of the image on
+        // an indoor scene; larger shows the seams between views on white walls at 1/50 and bands colored lights at 1/20.
+        constexpr int kBlendWidthPerRadius = 100;
+        // The surface of a reduced level is within about 1.4 times its allowed error, and depth maps have their own.
+        constexpr float kFaceErrorToTolerance = 2.f;
+        constexpr int kOsgbMaxLevels = 4;
+        constexpr int kOsgbMaxPage = 4096;
         // Sharper weights rest each vertex on fewer views and lost color on both test scenes.
         constexpr int kSimplifyThreads = 8;
         // What RAM use rises by from the end of fusion to its peak, as measured on an outdoor scene at
@@ -154,7 +173,8 @@ namespace lfs::training {
                             std::isfinite(s.spurious_edge_factor) && s.spurious_edge_factor >= 0 &&
                             std::isfinite(s.spurious_component_factor) && s.spurious_component_factor >= 0 &&
                             s.remove_isolated_small_components >= 0 && s.isolated_component_max_faces >= 0 &&
-                            std::isfinite(s.isolated_component_neighbor_radius) && s.isolated_component_neighbor_radius >= 0.f;
+                            std::isfinite(s.isolated_component_neighbor_radius) && s.isolated_component_neighbor_radius >= 0.f &&
+                            std::isfinite(s.texel_size) && s.texel_size >= 0 && (s.from_mesh.empty() || s.texel_size > 0) && s.texture_size >= 64 && s.texture_size <= 16384 && s.texture_width >= 0 && (s.texture_width == 0 || s.texture_width >= 16);
             if (!ok)
                 throw collisionError("mesh.settings_invalid", "Invalid mesh settings", ErrorCode::InvalidArgument,
                                      std::format("{}; {}", s.voxel_size, s.truncation));
@@ -264,6 +284,25 @@ namespace lfs::training {
             LOG_INFO("Mesh: {} voxels need about {:.1f} GB of RAM, {:.1f} GB available", voxels, needed / (1ull << 30), available / (1ull << 30));
             if (needed > available)
                 throw collisionError("mesh.ram", "Not enough RAM for the mesh; use a larger voxel size or a maximum range", ErrorCode::ResourceExhausted,
+                                     std::format("{:.1f} GB needed, {:.1f} GB available", needed / (1ull << 30), available / (1ull << 30)));
+        }
+
+        // Pages stay in RAM at 3 bytes per page texel, of which covered texels fill most. A batch of them holds 16 bytes per
+        // page texel while rasterizing and 23 per covered texel to bake. Unwrapping, choosing views and leveling add
+        // about 100 bytes per face.
+        void texture_ram_preflight(const SplatMesh& mesh, const core::SplatMeshSettings& s) {
+            const auto host = core::host_metrics::sample();
+            if (!host.ram_valid)
+                return;
+            const double page_texels = double(s.texture_size) * s.texture_size;
+            // Levels of detail add a quarter of the texels at each step, and about half the faces in all.
+            const double covered = 4. / 3. * 1.3 * mesh.area / (double(s.texel_size) * s.texel_size);
+            const double faces = 1.5 * double(mesh.faces.size());
+            const double needed = kSimplifyThreads * 16. * page_texels + 23. * std::min(covered, double(kBakeBatchTexels)) + 5. * covered + 100. * faces;
+            const double available = double(host.system_total_bytes - host.system_used_bytes);
+            LOG_INFO("Mesh: {:.0f}M texels need about {:.1f} GB of RAM, {:.1f} GB available", covered / 1e6, needed / (1ull << 30), available / (1ull << 30));
+            if (needed > available)
+                throw collisionError("mesh.texture_ram", "Not enough RAM for the mesh texture; use a larger texel size", ErrorCode::ResourceExhausted,
                                      std::format("{:.1f} GB needed, {:.1f} GB available", needed / (1ull << 30), available / (1ull << 30)));
         }
 
@@ -484,9 +523,20 @@ namespace lfs::training {
             }
         };
 
+        // Masks as one bit per pixel, for renders that come back to a view: decoding one takes about as long as
+        // rendering it, and a texture bake renders each view three times or more.
+        struct MaskCache {
+            struct Entry {
+                bool usable = false;
+                std::vector<uint32_t> bits;
+            };
+            std::unordered_map<const core::Camera*, Entry> entries;
+            DeviceArray<uint32_t> device;
+        };
+
         // Renders a view's median depth, masked. The result stays valid until the next render.
         [[nodiscard]] Tensor render_median_depth(core::Camera& camera, core::SplatData& model,
-                                                 const core::SplatMeshSettings& settings, cudaStream_t stream) {
+                                                 const core::SplatMeshSettings& settings, cudaStream_t stream, MaskCache* masks = nullptr) {
             const size_t width = camera.image_width(), height = camera.image_height();
             auto depth = Tensor::empty({height, width}, Device::CUDA);
             depth.set_stream(stream);
@@ -502,16 +552,55 @@ namespace lfs::training {
             // A worker without a current stream renders on the model's.
             LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(render_stream), "Mesh render");
             if (camera.has_mask()) {
+                const auto pixels = static_cast<uint32_t>(width * height);
+                const size_t words = (size_t(pixels) + 31) / 32;
+                if (masks) {
+                    if (const auto found = masks->entries.find(&camera); found != masks->entries.end()) {
+                        if (found->second.usable) {
+                            if (masks->device.count < words)
+                                masks->device = DeviceArray<uint32_t>(words, stream);
+                            LFS_CUDA_CHECK(cudaMemcpyAsync(masks->device.data(), found->second.bits.data(), words * sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
+                            depth = depth.contiguous();
+                            gsplat_lfs::mesh_apply_mask(depth.ptr<float>(), pixels, masks->device.data(), stream);
+                            // The host bits must outlive the copy.
+                            LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh mask");
+                        }
+                        return depth.contiguous();
+                    }
+                }
                 auto mask = camera.load_mask_file(camera.mask_path(), 1, settings.max_width, settings.invert_mask,
-                                                  settings.mask_threshold, true, false)
+                                                  settings.mask_threshold, true, false, false)
                                 .to(Device::CUDA, stream);
-                if (mask.numel() == width * height) {
-                    depth = depth.mul(mask.reshape({int(height), int(width)}).to(core::DataType::Float32));
+                const bool usable = mask.numel() == width * height;
+                if (usable) {
+                    mask = mask.reshape({int(height), int(width)}).to(core::DataType::Float32).contiguous();
+                    depth = depth.mul(mask);
                 } else {
                     LOG_WARN("Mesh: mask size of {} does not match the render; using the view unmasked", camera.image_name());
                 }
+                if (masks) {
+                    auto& entry = masks->entries[&camera];
+                    entry.usable = usable;
+                    if (usable) {
+                        if (masks->device.count < words)
+                            masks->device = DeviceArray<uint32_t>(words, stream);
+                        gsplat_lfs::mesh_pack_mask(mask.ptr<float>(), pixels, masks->device.data(), stream);
+                        entry.bits.resize(words);
+                        LFS_CUDA_CHECK(cudaMemcpyAsync(entry.bits.data(), masks->device.data(), words * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+                        LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh mask bits");
+                    }
+                }
             }
             return depth.contiguous();
+        }
+
+        // Not through the loader's cache of re-encoded JPEGs: a second load of a photo from it can return
+        // another photo's content, and every texture bake loads each photo a second time.
+        [[nodiscard]] Tensor load_photo(core::Camera& camera, const int max_width) {
+            return camera.load_and_get_image(1, max_width, false, false, [](core::ImageLoadParams params) {
+                params.skip_blob_cache = true;
+                return core::load_image_cached(params);
+            });
         }
 
         struct Tsdf {
@@ -673,7 +762,7 @@ namespace lfs::training {
             }
         };
         // The cells around a crossing, in the order that faces it outward.
-        const auto cell_offsets = [](const int axis, uint64_t (&offsets)[4]) {
+        const auto cell_offsets = [](const int axis, uint64_t(&offsets)[4]) {
             const uint64_t step_j = kAxisStep[(axis + 1) % 3], step_k = kAxisStep[(axis + 2) % 3];
             offsets[0] = 0;
             offsets[1] = step_j;
@@ -2298,6 +2387,14 @@ namespace lfs::training {
         }
     } // namespace
 
+    std::vector<std::pair<size_t, size_t>> split_mesh_into_pieces(SplatMesh& mesh, const size_t max_faces, const float max_extent, const int threads) {
+        std::vector<std::pair<size_t, size_t>> ranges;
+        std::mutex ranges_mutex;
+        split_faces(mesh, 0, mesh.faces.size(), max_faces, max_extent, std::clamp(int(std::thread::hardware_concurrency()), 1, threads), ranges, ranges_mutex);
+        std::ranges::sort(ranges);
+        return ranges;
+    }
+
     void simplify_splat_mesh(SplatMesh& mesh, const float max_error, const float color_weight, const size_t piece_faces) {
         mesh.faces_before_simplify = mesh.faces.size();
         if (max_error <= 0.f || mesh.faces.empty())
@@ -2324,11 +2421,626 @@ namespace lfs::training {
         compute_splat_mesh_normals(mesh);
     }
 
+    namespace {
+        // Takes each page's colors from the photos, through the same appearance inverse as the vertex colors. Uses every
+        // photo: a surface's best view is one or two photos out of hundreds, and a stride leaves it out by chance, which
+        // took lettering from 7 m instead of 2.5 m.
+        // Views and the leveling between them are settled over the whole mesh first, so that nothing steps where one batch
+        // meets the next. Then pages go through in batches of neighbors, each held in memory only while it bakes and
+        // read only from the photos that can see it. page_groups are runs of pages that stay in one batch.
+        void bake_texture(SplatMesh& mesh, core::SplatData& model, const std::span<core::Camera* const> views, const core::SplatMeshSettings& settings,
+                          cudaStream_t stream, const auto& report, const PPISP* appearance, const std::span<const std::pair<size_t, size_t>> page_groups) {
+            const size_t page_count = mesh.page_first_face.size() - 1;
+            mesh.pages.assign(page_count, {});
+            core::GlobalArenaManager::instance().get_arena().release_idle_for_pressure();
+            core::Tensor::trim_memory_pool();
+            constexpr size_t bytes_per_texel = 52;
+            const auto room = core::MemoryPressureCoordinator::instance().preflight({.operation = "Mesh texture"});
+            const size_t available = room.effective_free_bytes > room.required_peak_bytes ? room.effective_free_bytes - room.required_peak_bytes : 0;
+            const size_t max_texels = std::min(size_t(double(available) * kTextureShareOfFreeMemory) / bytes_per_texel, kBakeBatchTexels);
+
+            auto bake_settings = settings;
+            bake_settings.max_width = settings.texture_width;
+            // A coarse level lies as far from the surface as its faces were allowed to move.
+            const float base_tolerance = 2.5f * settings.voxel_size;
+            const auto tolerance_of = [&](const size_t face) { return mesh.face_error.empty() ? base_tolerance : std::max(base_tolerance, kFaceErrorToTolerance * mesh.face_error[face]); };
+
+            // Batches of whole groups, counted in covered texels: about a fifth of the page texels on both test scenes.
+            std::vector<size_t> covered(page_count);
+            detail::parallel_for(page_count, kSimplifyThreads, [&](const size_t p) { covered[p] = rasterize_mesh_texels(mesh, p).pixels.size(); });
+            struct Batch {
+                size_t first_page = 0, last_page = 0;
+                std::vector<uint8_t> uses_view;
+            };
+            std::vector<Batch> batches;
+            size_t held = 0;
+            for (const auto& [first, last] : page_groups) {
+                size_t texels = 0;
+                for (size_t p = first; p < last; ++p)
+                    texels += covered[p];
+                if (batches.empty() || held + texels > max_texels) {
+                    batches.push_back({.first_page = first, .last_page = last, .uses_view = std::vector<uint8_t>(views.size(), 0)});
+                    held = 0;
+                } else {
+                    batches.back().last_page = last;
+                }
+                held += texels;
+            }
+            // Choosing views takes a pass over the photos; the batches, with the seams, about one more in all.
+            const float pass_share = 1.f / 2.f;
+
+            // Which view sets the detail of each face.
+            const auto face_count = static_cast<uint32_t>(mesh.faces.size());
+            FaceViewCandidates candidates(face_count);
+            MaskCache masks;
+            {
+                DeviceArray<float> vertices(mesh.vertices.size() * 3, stream), scores(face_count, stream);
+                DeviceArray<int32_t> faces(size_t(face_count) * 3, stream);
+                DeviceArray<float> tolerances(face_count, stream);
+                {
+                    std::vector<float> host_tolerances(face_count);
+                    for (size_t f = 0; f < face_count; ++f)
+                        host_tolerances[f] = tolerance_of(f);
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(tolerances.data(), host_tolerances.data(), face_count * sizeof(float), cudaMemcpyHostToDevice, stream));
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh tolerances");
+                }
+                LFS_CUDA_CHECK(cudaMemcpyAsync(vertices.data(), mesh.vertices.data(), mesh.vertices.size() * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
+                LFS_CUDA_CHECK(cudaMemcpyAsync(faces.data(), mesh.faces.data(), size_t(face_count) * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                std::vector<float> host(face_count);
+                for (size_t i = 0; i < views.size(); ++i) {
+                    report(pass_share * float(i) / float(views.size()));
+                    auto& camera = *views[i];
+                    if (!camera.has_image())
+                        continue;
+                    camera.load_image_size(1, settings.texture_width);
+                    const auto view = make_view(camera);
+                    auto depth = render_median_depth(camera, model, bake_settings, stream, &masks);
+                    gsplat_lfs::mesh_face_view_score(vertices.data(), faces.data(), face_count, view, depth.ptr<float>(), tolerances.data(), scores.data(), stream);
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(host.data(), scores.data(), host.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh face views");
+                    candidates.add(static_cast<int32_t>(i), host);
+                }
+            }
+            LOG_INFO("Mesh: {} of {} views carry rolling shutter motion", std::ranges::count_if(views, [](const core::Camera* camera) { return camera->rolling_shutter().has_value(); }), views.size());
+            const auto face_views = choose_face_views(mesh, candidates);
+            {
+                std::vector<int32_t> used;
+                for (const auto label : face_views)
+                    if (label >= 0)
+                        used.push_back(label);
+                const size_t chosen = used.size();
+                std::ranges::sort(used);
+                used.erase(std::unique(used.begin(), used.end()), used.end());
+                LOG_INFO("Mesh: {} views set the detail of {} of {} faces", used.size(), chosen, face_views.size());
+            }
+            // A batch needs the views chosen for its faces, and those nearly as good, which fill in what a chosen view cannot
+            // see. A fisheye sees most of a room, so leaving out the rest saves most of the reads.
+            constexpr size_t kCandidates = FaceViewCandidates::kPerFace;
+            constexpr float kFillsIn = .5f;
+            size_t batch_views_total = 0;
+            for (auto& batch : batches) {
+                for (size_t f = mesh.page_first_face[batch.first_page]; f < mesh.page_first_face[batch.last_page]; ++f) {
+                    if (face_views[f] >= 0)
+                        batch.uses_view[size_t(face_views[f])] = 1;
+                    for (size_t slot = 0; slot < kCandidates; ++slot)
+                        if (const float score = candidates.scores[f * kCandidates + slot]; score > 0.f && score >= kFillsIn * candidates.scores[f * kCandidates])
+                            batch.uses_view[size_t(candidates.views[f * kCandidates + slot])] = 1;
+                }
+                batch_views_total += size_t(std::ranges::count(batch.uses_view, uint8_t{1}));
+            }
+            candidates = FaceViewCandidates(0);
+            LOG_INFO("Mesh: {} batches of at most {} M covered texels read {:.1f} times the photos in all", batches.size(), max_texels / 1000000, double(batch_views_total) / double(std::max<size_t>(views.size(), 1)));
+
+            // A photo and its blur, through the appearance inverse; false if it has no use here.
+            DeviceArray<float> scratch, weights, low;
+            const auto read_view = [&](core::Camera& camera, const gsplat_lfs::TsdfView& view, Tensor& depth, Tensor& photo) {
+                depth = render_median_depth(camera, model, bake_settings, stream, &masks);
+                photo = load_photo(camera, settings.texture_width);
+                const size_t pixels = size_t(view.width) * view.height;
+                if (photo.numel() != pixels * 3) {
+                    LOG_WARN("Mesh: photo size of {} does not match the render; skipping its colors", camera.image_name());
+                    return false;
+                }
+                photo = photo.to(Device::CUDA, stream).to(core::DataType::Float32).contiguous();
+                if (appearance && appearance->is_known_camera(camera.camera_id()) && appearance->is_known_frame(camera.uid()))
+                    photo = appearance->invert(photo, camera.camera_id(), camera.uid(), stream);
+                if (low.count != pixels * 3) {
+                    scratch = DeviceArray<float>(pixels * 3, stream);
+                    low = DeviceArray<float>(pixels * 3, stream);
+                    weights = DeviceArray<float>(pixels * 2, stream);
+                }
+                gsplat_lfs::mesh_photo_low_pass(photo.ptr<float>(), depth.ptr<float>(), view.width, view.height, std::max(int(view.width) / kBlendWidthPerRadius, 1),
+                                                scratch.data(), weights.data(), low.data(), stream);
+                return true;
+            };
+
+            // Seam samples are read in the first batch's pass over the photos, which then takes every view, and leveled
+            // before its pages are composed.
+            auto leveling = plan_color_leveling(mesh, face_views);
+            const auto sample_count = static_cast<uint32_t>(leveling.sample_labels.size());
+            struct SeamArrays {
+                DeviceArray<float> positions, sum, weight, high, best, tolerances;
+                DeviceArray<int32_t> labels;
+            } seams;
+            if (sample_count > 0) {
+                seams.positions = DeviceArray<float>(size_t(sample_count) * 3, stream);
+                seams.sum = DeviceArray<float>(size_t(sample_count) * 3, stream, true);
+                seams.weight = DeviceArray<float>(sample_count, stream, true);
+                seams.high = DeviceArray<float>(size_t(sample_count) * 3, stream, true);
+                seams.best = DeviceArray<float>(sample_count, stream, true);
+                seams.tolerances = DeviceArray<float>(sample_count, stream);
+                seams.labels = DeviceArray<int32_t>(sample_count, stream);
+                std::vector<float> host_tolerances(sample_count);
+                for (size_t s = 0; s < sample_count; ++s)
+                    host_tolerances[s] = tolerance_of(leveling.sample_faces[s]);
+                LFS_CUDA_CHECK(cudaMemcpyAsync(seams.positions.data(), leveling.sample_positions.data(), size_t(sample_count) * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
+                LFS_CUDA_CHECK(cudaMemcpyAsync(seams.labels.data(), leveling.sample_labels.data(), size_t(sample_count) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                LFS_CUDA_CHECK(cudaMemcpyAsync(seams.tolerances.data(), host_tolerances.data(), size_t(sample_count) * sizeof(float), cudaMemcpyHostToDevice, stream));
+                LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh seam samples upload");
+            }
+            const auto finish_seams = [&] {
+                std::vector<float> host_colors(size_t(sample_count) * 3, -1.f);
+                if (sample_count > 0) {
+                    std::vector<float> means(size_t(sample_count) * 3), mean_weights(sample_count), direct(size_t(sample_count) * 3), bests(sample_count);
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(means.data(), seams.sum.data(), means.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(mean_weights.data(), seams.weight.data(), mean_weights.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(direct.data(), seams.high.data(), direct.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(bests.data(), seams.best.data(), bests.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh seam samples download");
+                    seams = {};
+                    for (size_t s = 0; s < sample_count; ++s)
+                        for (size_t c = 0; c < 3; ++c) {
+                            if (std::isinf(bests[s]))
+                                host_colors[3 * s + c] = direct[3 * s + c];
+                            // Where no view sets the detail, the texels hold the mean of all views.
+                            else if (leveling.sample_labels[s] < 0 && mean_weights[s] > 0.f)
+                                host_colors[3 * s + c] = means[3 * s + c] / mean_weights[s];
+                        }
+                }
+                solve_color_leveling(leveling, mesh, host_colors);
+                leveling.release_samples();
+            };
+            if (batches.empty())
+                finish_seams();
+            if (!batches.empty() && sample_count > 0) {
+                batch_views_total -= size_t(std::ranges::count(batches.front().uses_view, uint8_t{1}));
+                batch_views_total += views.size();
+            }
+
+            size_t observed = 0, total = 0, batch_views_done = 0;
+            for (size_t b = 0; b < batches.size(); ++b) {
+                const auto& batch = batches[b];
+                const bool with_seams = b == 0 && sample_count > 0;
+                const size_t pages_here = batch.last_page - batch.first_page;
+                std::vector<MeshTexels> texels(pages_here);
+                detail::parallel_for(pages_here, kSimplifyThreads, [&](const size_t p) { texels[p] = rasterize_mesh_texels(mesh, batch.first_page + p); });
+                size_t count = 0;
+                for (const auto& page : texels)
+                    count += page.pixels.size();
+                DeviceArray<float> positions(count * 3, stream), low_sum(count * 3, stream, true), low_weight(count, stream, true);
+                DeviceArray<float> high(count * 3, stream, true), best_weight(count, stream, true);
+                DeviceArray<int32_t> labels(count, stream);
+                DeviceArray<float> tolerances(count, stream);
+                {
+                    std::vector<int32_t> host_labels;
+                    std::vector<float> host_tolerances;
+                    host_labels.reserve(count);
+                    host_tolerances.reserve(count);
+                    for (const auto& page : texels)
+                        for (const auto face : page.faces) {
+                            host_labels.push_back(face_views[face]);
+                            host_tolerances.push_back(tolerance_of(face));
+                        }
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(labels.data(), host_labels.data(), count * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(tolerances.data(), host_tolerances.data(), count * sizeof(float), cudaMemcpyHostToDevice, stream));
+                    size_t offset = 0;
+                    for (const auto& page : texels) {
+                        LFS_CUDA_CHECK(cudaMemcpyAsync(positions.data() + 3 * offset, page.positions.data(), page.positions.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+                        offset += page.pixels.size();
+                    }
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture upload");
+                }
+                // Rasterized again to compose: holding them through the photos and the leveling took 23 bytes per texel.
+                texels = std::vector<MeshTexels>(pages_here);
+                for (size_t i = 0; i < views.size(); ++i) {
+                    if (!batch.uses_view[i] && !with_seams)
+                        continue;
+                    report(pass_share * (1.f + float(batch_views_done++) / float(std::max<size_t>(batch_views_total, 1))));
+                    auto& camera = *views[i];
+                    if (!camera.has_image())
+                        continue;
+                    camera.load_image_size(1, settings.texture_width);
+                    const auto view = make_view(camera);
+                    Tensor depth, photo;
+                    if (!read_view(camera, view, depth, photo))
+                        continue;
+                    // Blurred, so that misregistration and grain do not read as a step.
+                    if (with_seams)
+                        gsplat_lfs::mesh_texture_accumulate(seams.positions.data(), sample_count, view, static_cast<int32_t>(i), seams.labels.data(), depth.ptr<float>(), low.data(), low.data(), seams.tolerances.data(),
+                                                            seams.sum.data(), seams.weight.data(), seams.high.data(), seams.best.data(), stream);
+                    if (batch.uses_view[i])
+                        gsplat_lfs::mesh_texture_accumulate(positions.data(), static_cast<uint32_t>(count), view, static_cast<int32_t>(i), labels.data(), depth.ptr<float>(), photo.ptr<float>(), low.data(), tolerances.data(),
+                                                            low_sum.data(), low_weight.data(), high.data(), best_weight.data(), stream);
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture");
+                }
+                // The batch's sums stay on the GPU while the leveling is solved, and come down a few pages at a time.
+                if (b == 0)
+                    finish_seams();
+                std::vector<size_t> page_offsets(pages_here + 1, 0);
+                for (size_t p = 0; p < pages_here; ++p)
+                    page_offsets[p + 1] = page_offsets[p] + covered[batch.first_page + p];
+                std::vector<float> sums, sum_weights, highs, bests;
+                std::atomic<size_t> seen_here{0};
+                for (size_t first = 0; first < pages_here;) {
+                    size_t last = first + 1;
+                    while (last < pages_here && page_offsets[last + 1] - page_offsets[first] <= kComposeChunkTexels)
+                        ++last;
+                    const size_t from = page_offsets[first], n = page_offsets[last] - from;
+                    sums.resize(n * 3);
+                    sum_weights.resize(n);
+                    highs.resize(n * 3);
+                    bests.resize(n);
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(sums.data(), low_sum.data() + 3 * from, n * 3 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(sum_weights.data(), low_weight.data() + from, n * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(highs.data(), high.data() + 3 * from, n * 3 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(bests.data(), best_weight.data() + from, n * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture download");
+                    detail::parallel_for(last - first, kSimplifyThreads, [&](const size_t k) {
+                        const size_t p = first + k;
+                        texels[p] = rasterize_mesh_texels(mesh, batch.first_page + p);
+                        const size_t page_texels = texels[p].pixels.size(), offset = page_offsets[p] - from;
+                        if (page_texels != covered[batch.first_page + p])
+                            throw collisionError("selection.operation_failed_generic", "A page rasterized differently the second time", ErrorCode::Internal);
+                        std::vector<float> colors(page_texels * 3);
+                        size_t seen_page = 0;
+                        for (size_t t = 0; t < page_texels; ++t) {
+                            const size_t at = offset + t;
+                            const bool seen = sum_weights[at] > 0.f;
+                            seen_page += seen;
+                            if (!seen) {
+                                colors[3 * t] = colors[3 * t + 1] = colors[3 * t + 2] = -1.f;
+                                continue;
+                            }
+                            float level[3];
+                            leveling.offset_at(mesh, texels[p].faces[t], &texels[p].positions[3 * t], level);
+                            const bool direct = std::isinf(bests[at]);
+                            for (size_t c = 0; c < 3; ++c)
+                                colors[3 * t + c] = std::max((direct ? 0.f : sums[3 * at + c] / sum_weights[at]) + highs[3 * at + c] + level[c], 0.f);
+                        }
+                        seen_here += seen_page;
+                        mesh.pages[batch.first_page + p] = compose_mesh_page(texels[p], colors, mesh.page_side(batch.first_page + p));
+                        texels[p] = {};
+                    });
+                    first = last;
+                }
+                observed += seen_here;
+                total += count;
+            }
+            mesh.texels = total;
+            mesh.observed_texel_share = total > 0 ? float(observed) / float(total) : 0.f;
+            LOG_INFO("Mesh: {} pages, {} texels, {:.1f}% seen by a view", page_count, total, 100.f * mesh.observed_texel_share);
+        }
+        // The surface from the depth of the views: fused, cleaned up, colored at its vertices and reduced.
+        void extract_surface(SplatMesh& mesh, core::SplatData& model, const std::span<core::Camera* const> views, const core::SplatMeshSettings& settings, cudaStream_t stream,
+                             const std::stop_token stop, const core::ProgressCallback& progress, const PPISP* appearance, const float geometry_share) {
+            const auto stage = [](const std::string_view key, const char* diagnostic) { return std::string(core::collisionStage(key, diagnostic)); };
+            // Widen the band to the local depth spacing where neighbouring pixels disagree, which is
+            // the one lever that reaches voxels no view ever touched. Defaults come from the settings;
+            // LFS_MESH_TRUNC_GRAD / LFS_MESH_TRUNC_CAP can still override them from the environment.
+            float trunc_gradient = settings.trunc_gradient, trunc_cap = settings.trunc_cap;
+            if (const char* text = std::getenv("LFS_MESH_TRUNC_GRAD"); text != nullptr && *text != '\0')
+                trunc_gradient = std::strtof(text, nullptr);
+            if (const char* text = std::getenv("LFS_MESH_TRUNC_CAP"); text != nullptr && *text != '\0')
+                trunc_cap = std::strtof(text, nullptr);
+            // A zero cap asks for the one that scales with the voxel grid: four bands keeps the cap above
+            // the truncation so the gradient still widens something, and keeps the block reach bounded.
+            if (!(trunc_cap > 0.f))
+                trunc_cap = kAutoTruncCapBands * settings.band();
+            Tsdf tsdf;
+            tsdf.grid = {.voxel = settings.voxel_size, .block = static_cast<uint32_t>(settings.block_voxels),
+                         .trunc = settings.band(), .trunc_gradient = trunc_gradient, .trunc_cap = trunc_cap,
+                         .full_weight_range = settings.full_weight_range, .max_range = settings.max_range};
+            mesh.voxel_size = settings.voxel_size;
+            mesh.truncation = tsdf.grid.trunc;
+            if (trunc_gradient > 0.f)
+                LOG_INFO("Mesh: band {} to {} by {} times the local depth step", tsdf.grid.trunc, tsdf.grid.trunc_cap, trunc_gradient);
+            const float block_extent = settings.voxel_size * static_cast<float>(settings.block_voxels);
+            const uint32_t touch_reach = static_cast<uint32_t>(std::max(1.f, std::ceil(gsplat_lfs::tsdf_widest_band(tsdf.grid) / block_extent)));
+
+            MeshDepthDump depth_dump;
+            if (const char* dir = std::getenv("LFS_MESH_DUMP_DIR"); dir != nullptr && *dir != '\0')
+                depth_dump.open(dir, settings, views.size(), tsdf.grid.trunc);
+
+            // Depth stays in RAM between the touch and the integrate passes, which need the block set first.
+            auto step = Clock::now();
+            std::vector<std::vector<float>> depths(views.size());
+            DeviceArray<uint64_t> block_keys;
+            Tensor rays;
+            size_t block_count = 0;
+            size_t touch_batches = 0, split_touch_views = 0;
+            double seconds_touch = 0.;
+            for (size_t i = 0; i < views.size(); ++i) {
+                core::reportProgress(stop, progress, geometry_share * .5f * float(i) / views.size(), stage("mesh.stage_render", "Rendering depth"));
+                if (i > 0 && (i % 50 == 0 || i + 1 == views.size()))
+                    log_phase_mem(std::format("render_view_{}/{}", i, views.size()).c_str());
+                auto& camera = *views[i];
+                camera.load_image_size(1, settings.max_width);
+                const auto view = make_view(camera);
+                // Once touch has needed splitting, do not let idle render caches compete with the next
+                // view and the growing key set. The normal-memory path keeps those caches for speed.
+                if (split_touch_views > 0) {
+                    core::GlobalArenaManager::instance().get_arena().release_idle_for_pressure();
+                    core::Tensor::trim_memory_pool();
+                }
+                auto depth = render_median_depth(camera, model, settings, stream);
+                const auto touch_start = Clock::now();
+                const size_t pixels = size_t(view.width) * view.height;
+                if (!rays.is_valid() || rays.numel() != pixels * 3 || i == 0 || views[i - 1]->camera_id() != camera.camera_id()) {
+                    rays = Tensor::empty({pixels * 3}, Device::CUDA);
+                    rays.set_stream(stream);
+                    camera_rays(view, rays.ptr<float>(), stream);
+                }
+                const size_t samples = size_t((view.width + 1) / 2) * ((view.height + 1) / 2);
+                const size_t touch_stride = 2 * size_t(touch_reach) + 1;
+                size_t view_batches = 0;
+                for (size_t first_sample = 0; first_sample < samples;) {
+                    // Before this batch the existing keys, depth and rays are already resident. Budget
+                    // everything that joins them: added, merged, scratch, the counter and CUB's workspace.
+                    const auto room = core::MemoryPressureCoordinator::instance().preflight({.operation = "Mesh depth touch"});
+                    const size_t available = room.effective_free_bytes > room.required_peak_bytes
+                                                 ? room.effective_free_bytes - room.required_peak_bytes
+                                                 : 0;
+                    const size_t budget = size_t(double(available) * kMeshShareOfFreeMemory);
+                    size_t batch_samples = samples - first_sample;
+                    size_t added_count = 0, required = 0;
+                    for (;;) {
+                        added_count = core::checked_product(batch_samples, touch_stride, "Mesh touch keys");
+                        const size_t total = block_count + added_count;
+                        const size_t arrays = core::saturating_add(
+                            core::saturating_multiply(added_count, sizeof(uint64_t)),
+                            core::saturating_multiply(total, 2 * sizeof(uint64_t)));
+                        required = core::saturating_add(
+                            core::saturating_add(arrays, gsplat_lfs::tsdf_sort_unique_workspace_bytes(total, stream)),
+                            sizeof(uint64_t));
+                        if (required <= budget)
+                            break;
+                        if (batch_samples == 1)
+                            throw collisionError("mesh.memory", "Not enough GPU memory to merge TSDF block keys; free memory or use a larger voxel size",
+                                                 ErrorCode::ResourceExhausted,
+                                                 std::format("{} existing blocks, {:.1f} MiB available", block_count,
+                                                             static_cast<double>(available) / (1 << 20)));
+                        batch_samples = std::max<size_t>(1, batch_samples / 2);
+                    }
+                    if (batch_samples < samples)
+                        LOG_INFO("Mesh: touch view {}: {} samples + {} existing blocks, {:.2f} GiB temporary, {:.2f} GiB available",
+                                 i, batch_samples, block_count, static_cast<double>(required) / (1 << 30),
+                                 static_cast<double>(available) / (1 << 30));
+                    DeviceArray<uint64_t> added(added_count, stream);
+                    gsplat_lfs::tsdf_touch_keys_range(depth.ptr<float>(), rays.ptr<float>(), view, tsdf.grid, touch_reach,
+                                                      first_sample, batch_samples, added.data(), stream);
+                    block_keys = merge_unique_keys(block_keys, block_count, added, block_count, stream);
+                    first_sample += batch_samples;
+                    ++view_batches;
+                }
+                touch_batches += view_batches;
+                split_touch_views += view_batches > 1;
+                seconds_touch += seconds_since(touch_start);
+                depths[i].resize(pixels);
+                LFS_CUDA_CHECK(cudaMemcpyAsync(depths[i].data(), depth.ptr<float>(), pixels * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh depth download");
+                depth_dump.write(i, camera.uid(), camera.image_name(), view.width, view.height, depths[i]);
+            }
+            rays = {};
+            mesh.seconds_render = seconds_since(step) - seconds_touch;
+            LOG_INFO("Mesh: rendering in {:.2f}s and depth touch in {:.2f}s over {} views, {} blocks",
+                     mesh.seconds_render, seconds_touch, views.size(), block_count);
+            if (split_touch_views > 0)
+                LOG_INFO("Mesh: adaptive depth touch split {} views into {} batches", split_touch_views, touch_batches);
+            log_phase_mem("after_render_and_touch");
+            if (block_count == 0)
+                throw collisionError("mesh.empty", "No surface was rendered from these cameras");
+            if (block_count > (size_t{1} << 31))
+                throw collisionError("mesh.memory", "Too many TSDF blocks; use a larger voxel size", ErrorCode::ResourceExhausted);
+
+            step = Clock::now();
+            mesh.blocks = block_count;
+            std::vector<uint64_t> host_blocks(block_count);
+            LFS_CUDA_CHECK(cudaMemcpyAsync(host_blocks.data(), block_keys.data(), block_count * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
+            LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh block download");
+            block_keys = {};
+            // What the renders left behind is the largest thing in the way of the TSDF.
+            core::GlobalArenaManager::instance().get_arena().release_idle_for_pressure();
+            core::Tensor::trim_memory_pool();
+            const auto room = core::MemoryPressureCoordinator::instance().preflight({.operation = "Mesh TSDF"});
+            const size_t available = room.effective_free_bytes > room.required_peak_bytes ? room.effective_free_bytes - room.required_peak_bytes : 0;
+            // The rest holds a depth map, the normals, the voxels on their way to RAM and whatever else runs on the GPU.
+            const size_t max_blocks = std::min(size_t(double(available) * kTsdfShareOfFreeMemory) / tsdf_block_bytes(tsdf.grid), size_t{1} << 31);
+            const auto chunks = plan_chunks(host_blocks, max_blocks);
+            LOG_INFO("Mesh: {} blocks, {:.2f} GB TSDF in {} chunks, {:.2f} GB free", block_count,
+                     static_cast<double>(block_count * tsdf_block_bytes(tsdf.grid)) / (1 << 30), chunks.size(), static_cast<double>(available) / (1 << 30));
+            SparseVoxels voxels;
+            const float view_steps = float(chunks.size()) * float(views.size());
+            for (size_t c = 0; c < chunks.size(); ++c) {
+                const auto& chunk = chunks[c];
+                {
+                    const auto grid = tsdf.grid;
+                    tsdf = {};
+                    tsdf.grid = grid;
+                }
+                core::Tensor::trim_memory_pool();
+                const size_t held = chunk.held_last - chunk.held_first;
+                DeviceArray<uint64_t> held_keys(held, stream);
+                LFS_CUDA_CHECK(cudaMemcpyAsync(held_keys.data(), host_blocks.data() + chunk.held_first, held * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+                allocate_tsdf(tsdf, std::move(held_keys), held, stream);
+                log_phase_mem(std::format("tsdf_chunk_{}/{}_allocated", c + 1, chunks.size()).c_str());
+                for (size_t i = 0; i < views.size(); ++i) {
+                    core::reportProgress(stop, progress, geometry_share * (.5f + .3f * (float(c) * float(views.size()) + float(i)) / view_steps), stage("mesh.stage_fuse", "Fusing depth"));
+                    const auto view = make_view(*views[i]);
+                    auto depth = Tensor::empty({size_t(view.height), size_t(view.width)}, Device::CUDA);
+                    depth.set_stream(stream);
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(depth.ptr<float>(), depths[i].data(), depths[i].size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+                    integrate_view(tsdf, view, depth, stream);
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh fusion");
+                }
+                collect_voxels(tsdf, static_cast<uint32_t>(chunk.first - chunk.held_first), static_cast<uint32_t>(chunk.last - chunk.held_first),
+                               static_cast<uint32_t>(settings.min_views), voxels, depth_dump, stream);
+            }
+            depth_dump.finish();
+            host_blocks = {};
+            tsdf = {};
+            core::Tensor::trim_memory_pool();
+            mesh.seconds_fusion = seconds_since(step);
+            log_phase_mem("after_fusion");
+            ram_preflight(voxels.keys.size());
+
+            step = Clock::now();
+            core::reportProgress(stop, progress, geometry_share * .8f, stage("mesh.stage_extract", "Extracting surface"));
+            mesh.band_voxels = voxels.keys.size();
+            LOG_INFO("Mesh: extracting surface from {} voxels at voxel size {:.4f}", mesh.band_voxels, settings.voxel_size);
+            surface_nets(voxels.keys, voxels.tsdf, settings.voxel_size, mesh);
+            voxels = {};
+            LOG_INFO("Mesh: surface nets in {:.2f}s, {} vertices, {} faces", seconds_since(step), mesh.vertices.size(),
+                     mesh.faces.size());
+            if (mesh.faces.empty())
+                throw collisionError("mesh.empty", "No surface survived; lower the view count or use a larger voxel size");
+            // Every topology pass waits until simplification has spent the face budget. The raw surface
+            // nets mesh is an order of magnitude denser, and deleting its faces first leaves rims the
+            // simplifier has to keep at full resolution, which is what shows up as clusters of sub-voxel
+            // triangles. OpenMVS decimates before its later Clean calls for the same reason.
+            auto sub = Clock::now();
+            compute_splat_mesh_normals(mesh);
+            LOG_INFO("Mesh: normals in {:.2f}s", seconds_since(sub));
+            mesh.seconds_extract = seconds_since(step);
+
+            step = Clock::now();
+            const auto vertex_count = static_cast<uint32_t>(mesh.vertices.size());
+            DeviceArray<float> vertices_device(size_t(vertex_count) * 3, stream);
+            LFS_CUDA_CHECK(cudaMemcpyAsync(vertices_device.data(), mesh.vertices.data(), size_t(vertex_count) * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
+            DeviceArray<float> color_sum(size_t(vertex_count) * 3, stream, true);
+            DeviceArray<float> color_weight(vertex_count, stream, true);
+            const float tolerance = 2.5f * settings.voxel_size;
+            for (size_t i = 0; i < views.size(); i += settings.color_stride) {
+                core::reportProgress(stop, progress, geometry_share * (.85f + .1f * float(i) / views.size()), stage("mesh.stage_color", "Coloring"));
+                auto& camera = *views[i];
+                if (!camera.has_image())
+                    continue;
+                const auto view = make_view(camera);
+                auto photo = load_photo(camera, settings.max_width);
+                const size_t pixels = size_t(view.width) * view.height;
+                if (photo.numel() != pixels * 3) {
+                    LOG_WARN("Mesh: photo size of {} does not match the render; skipping its colors", camera.image_name());
+                    continue;
+                }
+                photo = photo.to(Device::CUDA, stream).to(core::DataType::Float32).contiguous();
+                if (appearance && appearance->is_known_camera(camera.camera_id()) && appearance->is_known_frame(camera.uid())) {
+                    photo = appearance->invert(photo, camera.camera_id(), camera.uid(), stream);
+                    ++mesh.views_color_corrected;
+                }
+                auto depth = Tensor::empty({size_t(view.height), size_t(view.width)}, Device::CUDA);
+                depth.set_stream(stream);
+                LFS_CUDA_CHECK(cudaMemcpyAsync(depth.ptr<float>(), depths[i].data(), depths[i].size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+                gsplat_lfs::mesh_color_accumulate(vertices_device.data(), vertex_count, view, depth.ptr<float>(), photo.ptr<float>(), tolerance, color_sum.data(), color_weight.data(), stream);
+                LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh color");
+            }
+            std::vector<float> sums(size_t(vertex_count) * 3);
+            std::vector<float> weights(vertex_count);
+            LFS_CUDA_CHECK(cudaMemcpyAsync(sums.data(), color_sum.data(), sums.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+            LFS_CUDA_CHECK(cudaMemcpyAsync(weights.data(), color_weight.data(), weights.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+            LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh color download");
+            mesh.colors.resize(vertex_count);
+            size_t colored = 0;
+            for (size_t v = 0; v < vertex_count; ++v) {
+                colored += weights[v] > 0.f;
+                for (int c = 0; c < 3; ++c) {
+                    const float value = weights[v] > 0.f ? 255.f * sums[3 * v + c] / weights[v] : 128.f;
+                    mesh.colors[v][c] = static_cast<uint8_t>(std::clamp(std::lround(value), 0l, 255l));
+                }
+            }
+            mesh.colored_vertex_share = float(colored) / float(vertex_count);
+            mesh.seconds_color = seconds_since(step);
+            LOG_INFO("Mesh: colored with the trained appearance taken out of {} views", mesh.views_color_corrected);
+            // Reducing faces is the peak of RAM use; it needs none of these, and recomputes the normals.
+            depths = {};
+            sums = {};
+            weights = {};
+            if (settings.simplify_error > 0.f)
+                mesh.normals = {};
+            vertices_device = {};
+            color_sum = {};
+            color_weight = {};
+            core::Tensor::trim_memory_pool();
+            core::reportProgress(stop, progress, geometry_share * .95f, stage("mesh.stage_simplify", "Reducing faces"));
+            log_phase_mem("before_simplify");
+            step = Clock::now();
+            simplify_splat_mesh(mesh, settings.simplify_error, kSimplifyColorWeight);
+            mesh.seconds_simplify = seconds_since(step);
+            LOG_INFO("Mesh: simplification in {:.2f}s, {} vertices, {} faces", mesh.seconds_simplify,
+                     mesh.vertices.size(), mesh.faces.size());
+            log_phase_mem("after_simplify");
+            // Reducing faces moves the kept vertices and merges their neighbors, which can leave the
+            // same corner several times. Cleaning after the decimation keeps that damage off the raw
+            // mesh: deleting faces up front leaves rims the simplifier would keep at full resolution.
+            sub = Clock::now();
+            if (settings.clean_topology)
+                mesh.faces_removed_degenerate += clean_mesh_topology(mesh);
+            // Same OpenMVS ordering: spurious before spikes, so spikes do not waste time on junk
+            // triangles the long-edge pass eliminates first.
+            if (settings.spurious_edge_factor > 0.f || settings.spurious_component_factor > 0.f)
+                mesh.faces_removed_spurious += remove_spurious_components(mesh, settings.spurious_edge_factor,
+                                                                          settings.spurious_component_factor);
+            if (settings.remove_spikes)
+                mesh.faces_removed_spikes += remove_mesh_spikes(mesh);
+            // Pass #1 hole fill; simplification leaves the boundary structure intact enough to run it
+            // before another topology sweep.
+            mesh.holes_filled += fill_small_mesh_holes(mesh, settings.fill_hole_perimeter, settings.ear_cut_holes,
+                                                       kFillMaxEdgeVoxels * settings.voxel_size);
+            size_t second_topology = 0;
+            if (settings.clean_topology) {
+                second_topology = clean_mesh_topology(mesh);
+                mesh.faces_removed_degenerate += second_topology;
+            }
+            mesh.holes_filled += fill_small_mesh_holes(mesh, settings.fill_hole_perimeter, settings.ear_cut_holes,
+                                                       kFillMaxEdgeVoxels * settings.voxel_size);
+            size_t post_clean = 0;
+            if (settings.clean_non_manifold) {
+                post_clean = clean_non_manifold_only(mesh);
+                mesh.faces_removed_degenerate += post_clean;
+            }
+            size_t isolated_dropped = 0;
+            if (settings.remove_isolated_small_components && settings.isolated_component_max_faces > 0 && settings.voxel_size > 0.f) {
+                isolated_dropped = remove_isolated_small_mesh_components(
+                    mesh, settings.isolated_component_max_faces,
+                    settings.isolated_component_neighbor_radius * settings.voxel_size);
+                mesh.faces_removed_spurious += isolated_dropped;
+            }
+            LOG_INFO("Mesh: cleanup in {:.2f}s, {} holes filled ({}), second topology {} faces dropped, {} non-manifold faces dropped{}",
+                     seconds_since(sub), mesh.holes_filled,
+                     settings.ear_cut_holes > 0 ? std::format("ear cut under {} edges, fan for the rest", settings.ear_cut_holes) : "fan",
+                     second_topology, post_clean,
+                     isolated_dropped > 0 ? std::format(", {} from small isolated components", isolated_dropped) : std::string{});
+            // No topology clean after the final hole fill. A full clean would collapse coincident
+            // vertices and split non-manifold ones, which can reopen holes the fills just closed.
+            // The non-manifold-only pass already happens before that final fill so its light touch
+            // can expose small rims that fill then closes.
+            LOG_INFO("Mesh: leaves {} vertices, {} faces, {} normals and {} colors", mesh.vertices.size(),
+                     mesh.faces.size(), mesh.normals.size(), mesh.colors.size());
+            LOG_INFO("Mesh: dropped {} faces as degenerate or non-manifold and {} as spikes",
+                     mesh.faces_removed_degenerate, mesh.faces_removed_spikes);
+            core::reportProgress(stop, progress, geometry_share, stage("mesh.stage_simplify", "Reducing faces"));
+            LOG_INFO("Mesh: render {:.2f}s, fusion {:.2f}s, extract {:.2f}s, color {:.2f}s, simplify {:.2f}s",
+                     mesh.seconds_render + seconds_touch, mesh.seconds_fusion, mesh.seconds_extract, mesh.seconds_color,
+                     mesh.seconds_simplify);
+            log_phase_mem("mesh_done");
+        }
+    } // namespace
+
     SplatMesh extract_splat_mesh(core::SplatData& model, const std::span<core::Camera* const> cameras,
                                  const core::SplatMeshSettings& settings, const std::stop_token stop, const core::ProgressCallback& progress,
                                  const PPISP* appearance) try {
         validate(settings);
         const auto stage = [](const std::string_view key, const char* diagnostic) { return std::string(core::collisionStage(key, diagnostic)); };
+        // Baking takes about as long as all the rest.
+        const float geometry_share = settings.texel_size > 0.f ? .5f : 1.f;
         std::vector<core::Camera*> views;
         for (size_t i = 0; i < cameras.size(); i += settings.view_stride)
             if (cameras[i])
@@ -2366,325 +3078,227 @@ namespace lfs::training {
         const auto stream = core::getCurrentCUDAStream();
         SplatMesh mesh;
         mesh.views = views.size();
-        // Widen the band to the local depth spacing where neighbouring pixels disagree, which is
-        // the one lever that reaches voxels no view ever touched. Defaults come from the settings;
-        // LFS_MESH_TRUNC_GRAD / LFS_MESH_TRUNC_CAP can still override them from the environment.
-        float trunc_gradient = resolved.trunc_gradient, trunc_cap = resolved.trunc_cap;
-        if (const char* text = std::getenv("LFS_MESH_TRUNC_GRAD"); text != nullptr && *text != '\0')
-            trunc_gradient = std::strtof(text, nullptr);
-        if (const char* text = std::getenv("LFS_MESH_TRUNC_CAP"); text != nullptr && *text != '\0')
-            trunc_cap = std::strtof(text, nullptr);
-        // A zero cap asks for the one that scales with the voxel grid: four bands keeps the cap above
-        // the truncation so the gradient still widens something, and keeps the block reach bounded.
-        if (!(trunc_cap > 0.f))
-            trunc_cap = kAutoTruncCapBands * resolved.band();
-        Tsdf tsdf;
-        tsdf.grid = {.voxel = resolved.voxel_size, .block = static_cast<uint32_t>(resolved.block_voxels),
-                     .trunc = resolved.band(), .trunc_gradient = trunc_gradient, .trunc_cap = trunc_cap,
-                     .full_weight_range = resolved.full_weight_range, .max_range = resolved.max_range};
-        mesh.voxel_size = resolved.voxel_size;
-        mesh.truncation = tsdf.grid.trunc;
-        if (trunc_gradient > 0.f)
-            LOG_INFO("Mesh: band {} to {} by {} times the local depth step", tsdf.grid.trunc, tsdf.grid.trunc_cap, trunc_gradient);
-        const float block_extent = resolved.voxel_size * static_cast<float>(resolved.block_voxels);
-        const uint32_t touch_reach = static_cast<uint32_t>(std::max(1.f, std::ceil(gsplat_lfs::tsdf_widest_band(tsdf.grid) / block_extent)));
-
-        MeshDepthDump depth_dump;
-        if (const char* dir = std::getenv("LFS_MESH_DUMP_DIR"); dir != nullptr && *dir != '\0')
-            depth_dump.open(dir, resolved, views.size(), tsdf.grid.trunc);
-
         CameraSizes sizes;
-        for (auto* camera : views)
-            sizes.saved.push_back({camera, camera->image_width(), camera->image_height(), camera->image_size_loaded()});
+        for (auto* camera : cameras)
+            if (camera)
+                sizes.saved.push_back({camera, camera->image_width(), camera->image_height(), camera->image_size_loaded()});
 
-        // Depth stays in RAM between the touch and the integrate passes, which need the block set first.
+        if (settings.from_mesh.empty()) {
+            extract_surface(mesh, model, views, resolved, stream, stop, progress, appearance, geometry_share);
+        } else {
+            core::reportProgress(stop, progress, 0.f, stage("mesh.stage_read", "Reading mesh"));
+            auto read = read_splat_mesh_ply(core::utf8_to_path(settings.from_mesh));
+            read.views = mesh.views;
+            mesh = std::move(read);
+            LOG_INFO("Mesh: {} vertices and {} faces from {}", mesh.vertices.size(), mesh.faces.size(), settings.from_mesh);
+        }
         auto step = Clock::now();
-        std::vector<std::vector<float>> depths(views.size());
-        DeviceArray<uint64_t> block_keys;
-        Tensor rays;
-        size_t block_count = 0;
-        size_t touch_batches = 0, split_touch_views = 0;
-        double seconds_touch = 0.;
-        for (size_t i = 0; i < views.size(); ++i) {
-            core::reportProgress(stop, progress, .5f * float(i) / views.size(), stage("mesh.stage_render", "Rendering depth"));
-            if (i > 0 && (i % 50 == 0 || i + 1 == views.size()))
-                log_phase_mem(std::format("render_view_{}/{}", i, views.size()).c_str());
-            auto& camera = *views[i];
-            camera.load_image_size(1, settings.max_width);
-            const auto view = make_view(camera);
-            // Once touch has needed splitting, do not let idle render caches compete with the next
-            // view and the growing key set. The normal-memory path keeps those caches for speed.
-            if (split_touch_views > 0) {
-                core::GlobalArenaManager::instance().get_arena().release_idle_for_pressure();
-                core::Tensor::trim_memory_pool();
+        if (settings.texel_size > 0.f) {
+            texture_ram_preflight(mesh, settings);
+            step = Clock::now();
+            core::reportProgress(stop, progress, .5f, stage("mesh.stage_unwrap", "Unwrapping"));
+            mesh.tiled = std::make_shared<TiledMesh>(build_tiled_mesh(mesh, settings.texel_size, std::min(settings.texture_size, kOsgbMaxPage), kOsgbMaxLevels, settings.simplify_error, stop));
+            mesh.seconds_unwrap = seconds_since(step);
+            step = Clock::now();
+            std::vector<core::Camera*> all_views;
+            for (auto* camera : cameras)
+                if (camera)
+                    all_views.push_back(camera);
+            // The levels of a tile stay together, and tiles come in the order of the splits: neighbors in the list are neighbors in space.
+            std::vector<std::pair<size_t, size_t>> page_groups;
+            for (const auto& level : mesh.tiled->levels) {
+                const size_t last = level.first_page + level.page_count;
+                if (level.level == 0 || page_groups.empty())
+                    page_groups.push_back({level.first_page, last});
+                else
+                    page_groups.back().second = last;
             }
-            auto depth = render_median_depth(camera, model, settings, stream);
-            const auto touch_start = Clock::now();
-            const size_t pixels = size_t(view.width) * view.height;
-            if (!rays.is_valid() || rays.numel() != pixels * 3 || i == 0 || views[i - 1]->camera_id() != camera.camera_id()) {
-                rays = Tensor::empty({pixels * 3}, Device::CUDA);
-                rays.set_stream(stream);
-                camera_rays(view, rays.ptr<float>(), stream);
-            }
-            const size_t samples = size_t((view.width + 1) / 2) * ((view.height + 1) / 2);
-            const size_t touch_stride = 2 * size_t(touch_reach) + 1;
-            size_t view_batches = 0;
-            for (size_t first_sample = 0; first_sample < samples;) {
-                // Before this batch the existing keys, depth and rays are already resident. Budget
-                // everything that joins them: added, merged, scratch, the counter and CUB's workspace.
-                const auto room = core::MemoryPressureCoordinator::instance().preflight({.operation = "Mesh depth touch"});
-                const size_t available = room.effective_free_bytes > room.required_peak_bytes
-                                             ? room.effective_free_bytes - room.required_peak_bytes
-                                             : 0;
-                const size_t budget = size_t(double(available) * kMeshShareOfFreeMemory);
-                size_t batch_samples = samples - first_sample;
-                size_t added_count = 0, required = 0;
-                for (;;) {
-                    added_count = core::checked_product(batch_samples, touch_stride, "Mesh touch keys");
-                    const size_t total = block_count + added_count;
-                    const size_t arrays = core::saturating_add(
-                        core::saturating_multiply(added_count, sizeof(uint64_t)),
-                        core::saturating_multiply(total, 2 * sizeof(uint64_t)));
-                    required = core::saturating_add(
-                        core::saturating_add(arrays, gsplat_lfs::tsdf_sort_unique_workspace_bytes(total, stream)),
-                        sizeof(uint64_t));
-                    if (required <= budget)
-                        break;
-                    if (batch_samples == 1)
-                        throw collisionError("mesh.memory", "Not enough GPU memory to merge TSDF block keys; free memory or use a larger voxel size",
-                                             ErrorCode::ResourceExhausted,
-                                             std::format("{} existing blocks, {:.1f} MiB available", block_count,
-                                                         static_cast<double>(available) / (1 << 20)));
-                    batch_samples = std::max<size_t>(1, batch_samples / 2);
-                }
-                if (batch_samples < samples)
-                    LOG_INFO("Mesh: touch view {}: {} samples + {} existing blocks, {:.2f} GiB temporary, {:.2f} GiB available",
-                             i, batch_samples, block_count, static_cast<double>(required) / (1 << 30),
-                             static_cast<double>(available) / (1 << 30));
-                DeviceArray<uint64_t> added(added_count, stream);
-                gsplat_lfs::tsdf_touch_keys_range(depth.ptr<float>(), rays.ptr<float>(), view, tsdf.grid, touch_reach,
-                                                  first_sample, batch_samples, added.data(), stream);
-                block_keys = merge_unique_keys(block_keys, block_count, added, block_count, stream);
-                first_sample += batch_samples;
-                ++view_batches;
-            }
-            touch_batches += view_batches;
-            split_touch_views += view_batches > 1;
-            seconds_touch += seconds_since(touch_start);
-            depths[i].resize(pixels);
-            LFS_CUDA_CHECK(cudaMemcpyAsync(depths[i].data(), depth.ptr<float>(), pixels * sizeof(float), cudaMemcpyDeviceToHost, stream));
-            LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh depth download");
-            depth_dump.write(i, camera.uid(), camera.image_name(), view.width, view.height, depths[i]);
+            bake_texture(mesh.tiled->combined, model, all_views, settings, stream, [&](const float value) { core::reportProgress(stop, progress, .6f + .4f * value, stage("mesh.stage_bake", "Baking texture")); }, appearance, page_groups);
+            mesh.seconds_bake = seconds_since(step);
+            mesh.charts = mesh.tiled->combined.charts;
+            mesh.texels = mesh.tiled->combined.texels;
+            mesh.observed_texel_share = mesh.tiled->combined.observed_texel_share;
         }
-        rays = {};
-        mesh.seconds_render = seconds_since(step) - seconds_touch;
-        LOG_INFO("Mesh: rendering in {:.2f}s and depth touch in {:.2f}s over {} views, {} blocks",
-                 mesh.seconds_render, seconds_touch, views.size(), block_count);
-        if (split_touch_views > 0)
-            LOG_INFO("Mesh: adaptive depth touch split {} views into {} batches", split_touch_views, touch_batches);
-        log_phase_mem("after_render_and_touch");
-        if (block_count == 0)
-            throw collisionError("mesh.empty", "No surface was rendered from these cameras");
-        if (block_count > (size_t{1} << 31))
-            throw collisionError("mesh.memory", "Too many TSDF blocks; use a larger voxel size", ErrorCode::ResourceExhausted);
-
-        step = Clock::now();
-        mesh.blocks = block_count;
-        std::vector<uint64_t> host_blocks(block_count);
-        LFS_CUDA_CHECK(cudaMemcpyAsync(host_blocks.data(), block_keys.data(), block_count * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
-        LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh block download");
-        block_keys = {};
-        // What the renders left behind is the largest thing in the way of the TSDF.
-        core::GlobalArenaManager::instance().get_arena().release_idle_for_pressure();
-        core::Tensor::trim_memory_pool();
-        const auto room = core::MemoryPressureCoordinator::instance().preflight({.operation = "Mesh TSDF"});
-        const size_t available = room.effective_free_bytes > room.required_peak_bytes ? room.effective_free_bytes - room.required_peak_bytes : 0;
-        // The rest holds a depth map, the normals, the voxels on their way to RAM and whatever else runs on the GPU.
-        const size_t max_blocks = std::min(size_t(double(available) * kMeshShareOfFreeMemory) / tsdf_block_bytes(tsdf.grid), size_t{1} << 31);
-        const auto chunks = plan_chunks(host_blocks, max_blocks);
-        LOG_INFO("Mesh: {} blocks, {:.2f} GB TSDF in {} chunks, {:.2f} GB free", block_count,
-                 static_cast<double>(block_count * tsdf_block_bytes(tsdf.grid)) / (1 << 30), chunks.size(), static_cast<double>(available) / (1 << 30));
-        SparseVoxels voxels;
-        const float view_steps = float(chunks.size()) * float(views.size());
-        for (size_t c = 0; c < chunks.size(); ++c) {
-            const auto& chunk = chunks[c];
-            {
-                const auto grid = tsdf.grid;
-                tsdf = {};
-                tsdf.grid = grid;
-            }
-            core::Tensor::trim_memory_pool();
-            const size_t held = chunk.held_last - chunk.held_first;
-            DeviceArray<uint64_t> held_keys(held, stream);
-            LFS_CUDA_CHECK(cudaMemcpyAsync(held_keys.data(), host_blocks.data() + chunk.held_first, held * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
-            allocate_tsdf(tsdf, std::move(held_keys), held, stream);
-            log_phase_mem(std::format("tsdf_chunk_{}/{}_allocated", c + 1, chunks.size()).c_str());
-            for (size_t i = 0; i < views.size(); ++i) {
-                core::reportProgress(stop, progress, .5f + .3f * (float(c) * float(views.size()) + float(i)) / view_steps, stage("mesh.stage_fuse", "Fusing depth"));
-                const auto view = make_view(*views[i]);
-                auto depth = Tensor::empty({size_t(view.height), size_t(view.width)}, Device::CUDA);
-                depth.set_stream(stream);
-                LFS_CUDA_CHECK(cudaMemcpyAsync(depth.ptr<float>(), depths[i].data(), depths[i].size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-                integrate_view(tsdf, view, depth, stream);
-                LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh fusion");
-            }
-            collect_voxels(tsdf, static_cast<uint32_t>(chunk.first - chunk.held_first), static_cast<uint32_t>(chunk.last - chunk.held_first),
-                           static_cast<uint32_t>(settings.min_views), voxels, depth_dump, stream);
-        }
-        depth_dump.finish();
-        host_blocks = {};
-        tsdf = {};
-        core::Tensor::trim_memory_pool();
-        mesh.seconds_fusion = seconds_since(step);
-        log_phase_mem("after_fusion");
-        ram_preflight(voxels.keys.size());
-
-        step = Clock::now();
-        core::reportProgress(stop, progress, .8f, stage("mesh.stage_extract", "Extracting surface"));
-        mesh.band_voxels = voxels.keys.size();
-        LOG_INFO("Mesh: extracting surface from {} voxels at voxel size {:.4f}", mesh.band_voxels,
-                 resolved.voxel_size);
-        surface_nets(voxels.keys, voxels.tsdf, resolved.voxel_size, mesh);
-        voxels = {};
-        LOG_INFO("Mesh: surface nets in {:.2f}s, {} vertices, {} faces", seconds_since(step), mesh.vertices.size(),
-                 mesh.faces.size());
-        if (mesh.faces.empty())
-            throw collisionError("mesh.empty", "No surface survived; lower the view count or use a larger voxel size");
-        // Every topology pass waits until simplification has spent the face budget. The raw surface
-        // nets mesh is an order of magnitude denser, and deleting its faces first leaves rims the
-        // simplifier has to keep at full resolution, which is what shows up as clusters of sub-voxel
-        // triangles. OpenMVS decimates before its later Clean calls for the same reason.
-        auto sub = Clock::now();
-        compute_splat_mesh_normals(mesh);
-        LOG_INFO("Mesh: normals in {:.2f}s", seconds_since(sub));
-        mesh.seconds_extract = seconds_since(step);
-
-        step = Clock::now();
-        const auto vertex_count = static_cast<uint32_t>(mesh.vertices.size());
-        DeviceArray<float> vertices_device(size_t(vertex_count) * 3, stream);
-        LFS_CUDA_CHECK(cudaMemcpyAsync(vertices_device.data(), mesh.vertices.data(), size_t(vertex_count) * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
-        DeviceArray<float> color_sum(size_t(vertex_count) * 3, stream, true);
-        DeviceArray<float> color_weight(vertex_count, stream, true);
-        const float tolerance = 2.5f * resolved.voxel_size;
-        for (size_t i = 0; i < views.size(); i += settings.color_stride) {
-            core::reportProgress(stop, progress, .85f + .1f * float(i) / views.size(), stage("mesh.stage_color", "Coloring"));
-            auto& camera = *views[i];
-            if (!camera.has_image())
-                continue;
-            const auto view = make_view(camera);
-            auto photo = camera.load_and_get_image(1, settings.max_width, false, false);
-            const size_t pixels = size_t(view.width) * view.height;
-            if (photo.numel() != pixels * 3) {
-                LOG_WARN("Mesh: photo size of {} does not match the render; skipping its colors", camera.image_name());
-                continue;
-            }
-            photo = photo.to(Device::CUDA, stream).to(core::DataType::Float32).contiguous();
-            if (appearance && appearance->is_known_camera(camera.camera_id()) && appearance->is_known_frame(camera.uid())) {
-                photo = appearance->invert(photo, camera.camera_id(), camera.uid(), stream);
-                ++mesh.views_color_corrected;
-            }
-            auto depth = Tensor::empty({size_t(view.height), size_t(view.width)}, Device::CUDA);
-            depth.set_stream(stream);
-            LFS_CUDA_CHECK(cudaMemcpyAsync(depth.ptr<float>(), depths[i].data(), depths[i].size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-            gsplat_lfs::mesh_color_accumulate(vertices_device.data(), vertex_count, view, depth.ptr<float>(), photo.ptr<float>(), tolerance, color_sum.data(), color_weight.data(), stream);
-            LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh color");
-        }
-        std::vector<float> sums(size_t(vertex_count) * 3);
-        std::vector<float> weights(vertex_count);
-        LFS_CUDA_CHECK(cudaMemcpyAsync(sums.data(), color_sum.data(), sums.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-        LFS_CUDA_CHECK(cudaMemcpyAsync(weights.data(), color_weight.data(), weights.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-        LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh color download");
-        mesh.colors.resize(vertex_count);
-        size_t colored = 0;
-        for (size_t v = 0; v < vertex_count; ++v) {
-            colored += weights[v] > 0.f;
-            for (int c = 0; c < 3; ++c) {
-                const float value = weights[v] > 0.f ? 255.f * sums[3 * v + c] / weights[v] : 128.f;
-                mesh.colors[v][c] = static_cast<uint8_t>(std::clamp(std::lround(value), 0l, 255l));
-            }
-        }
-        mesh.colored_vertex_share = float(colored) / float(vertex_count);
-        mesh.seconds_color = seconds_since(step);
-        LOG_INFO("Mesh: coloring in {:.2f}s, {} vertices", mesh.seconds_color, vertex_count);
-        LOG_INFO("Mesh: colored with the trained appearance taken out of {} views", mesh.views_color_corrected);
-        // Reducing faces is the peak of RAM use; it needs none of these, and recomputes the normals.
-        depths = {};
-        sums = {};
-        weights = {};
-        if (resolved.simplify_error > 0.f)
-            mesh.normals = {};
-        vertices_device = {};
-        color_sum = {};
-        color_weight = {};
-        core::Tensor::trim_memory_pool();
-        core::reportProgress(stop, progress, .95f, stage("mesh.stage_simplify", "Reducing faces"));
-        log_phase_mem("before_simplify");
-        step = Clock::now();
-        simplify_splat_mesh(mesh, resolved.simplify_error, kSimplifyColorWeight);
-        mesh.seconds_simplify = seconds_since(step);
-        LOG_INFO("Mesh: simplification in {:.2f}s, {} vertices, {} faces", mesh.seconds_simplify,
-                 mesh.vertices.size(), mesh.faces.size());
-        log_phase_mem("after_simplify");
-        // Reducing faces moves the kept vertices and merges their neighbors, which can leave the
-        // same corner several times. Cleaning after the decimation keeps that damage off the raw
-        // mesh: deleting faces up front leaves rims the simplifier would keep at full resolution.
-        sub = Clock::now();
-        if (resolved.clean_topology)
-            mesh.faces_removed_degenerate += clean_mesh_topology(mesh);
-        // Same OpenMVS ordering: spurious before spikes, so spikes do not waste time on junk
-        // triangles the long-edge pass eliminates first.
-        if (resolved.spurious_edge_factor > 0.f || resolved.spurious_component_factor > 0.f)
-            mesh.faces_removed_spurious += remove_spurious_components(mesh, resolved.spurious_edge_factor,
-                                                                      resolved.spurious_component_factor);
-        if (resolved.remove_spikes)
-            mesh.faces_removed_spikes += remove_mesh_spikes(mesh);
-        // Pass #1 hole fill; simplification leaves the boundary structure intact enough to run it
-        // before another topology sweep.
-        mesh.holes_filled += fill_small_mesh_holes(mesh, resolved.fill_hole_perimeter, resolved.ear_cut_holes,
-                                                   kFillMaxEdgeVoxels * resolved.voxel_size);
-        size_t second_topology = 0;
-        if (resolved.clean_topology) {
-            second_topology = clean_mesh_topology(mesh);
-            mesh.faces_removed_degenerate += second_topology;
-        }
-        mesh.holes_filled += fill_small_mesh_holes(mesh, resolved.fill_hole_perimeter, resolved.ear_cut_holes,
-                                                   kFillMaxEdgeVoxels * resolved.voxel_size);
-        size_t post_clean = 0;
-        if (resolved.clean_non_manifold) {
-            post_clean = clean_non_manifold_only(mesh);
-            mesh.faces_removed_degenerate += post_clean;
-        }
-        size_t isolated_dropped = 0;
-        if (resolved.remove_isolated_small_components && resolved.isolated_component_max_faces > 0 && resolved.voxel_size > 0.f) {
-            isolated_dropped = remove_isolated_small_mesh_components(
-                mesh, resolved.isolated_component_max_faces,
-                resolved.isolated_component_neighbor_radius * resolved.voxel_size);
-            mesh.faces_removed_spurious += isolated_dropped;
-        }
-        LOG_INFO("Mesh: cleanup in {:.2f}s, {} holes filled ({}), second topology {} faces dropped, {} non-manifold faces dropped{}",
-                 seconds_since(sub), mesh.holes_filled,
-                 resolved.ear_cut_holes > 0 ? std::format("ear cut under {} edges, fan for the rest", resolved.ear_cut_holes) : "fan",
-                 second_topology, post_clean,
-                 isolated_dropped > 0 ? std::format(", {} from small isolated components", isolated_dropped) : std::string{});
-        // No topology clean after the final hole fill. A full clean would collapse coincident
-        // vertices and split non-manifold ones, which can reopen holes the fills just closed.
-        // The non-manifold-only pass already happens before that final fill so its light touch
-        // can expose small rims that fill then closes.
-        LOG_INFO("Mesh: leaves {} vertices, {} faces, {} normals and {} colors", mesh.vertices.size(),
-                 mesh.faces.size(), mesh.normals.size(), mesh.colors.size());
-        LOG_INFO("Mesh: dropped {} faces as degenerate or non-manifold and {} as spikes",
-                 mesh.faces_removed_degenerate, mesh.faces_removed_spikes);
-        core::reportProgress(stop, progress, 1.f, stage("mesh.stage_simplify", "Reducing faces"));
-        LOG_INFO("Mesh: render {:.2f}s, fusion {:.2f}s, extract {:.2f}s, color {:.2f}s, simplify {:.2f}s",
-                 mesh.seconds_render + seconds_touch, mesh.seconds_fusion, mesh.seconds_extract, mesh.seconds_color,
-                 mesh.seconds_simplify);
-        log_phase_mem("mesh_done");
         return mesh;
     } catch (const std::bad_alloc&) {
         throw collisionError("mesh.ram", "Not enough RAM for the mesh; use a larger voxel size or a maximum range", ErrorCode::ResourceExhausted);
     }
 
+    SplatMesh read_splat_mesh_ply(const std::filesystem::path& path) {
+        const auto bad = [&](const std::string_view why) { return collisionError("mesh.read_failed", "Could not read the mesh; it must be a PLY of triangles or polygons", ErrorCode::InvalidArgument, std::format("{}: {}", core::path_to_utf8(path), why)); };
+        std::ifstream in(core::native_fs::native_path(path), std::ios::binary);
+        if (!in)
+            throw collisionError("mesh.read_failed", "Could not open the mesh", ErrorCode::NotFound, core::path_to_utf8(path));
+        struct Property {
+            std::string name, type, count_type; // count_type is set for a list
+        };
+        struct Element {
+            std::string name;
+            size_t count = 0;
+            std::vector<Property> properties;
+        };
+        std::vector<Element> elements;
+        bool ascii = false, started = false, ended = false;
+        for (std::string line; !ended && std::getline(in, line);) {
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            std::istringstream words(line);
+            std::string word;
+            words >> word;
+            if (!started) {
+                if (word != "ply")
+                    throw bad("no ply header");
+                started = true;
+            } else if (word == "format") {
+                words >> word;
+                ascii = word == "ascii";
+                if (!ascii && word != "binary_little_endian")
+                    throw bad(word);
+            } else if (word == "element") {
+                Element element;
+                words >> element.name >> element.count;
+                elements.push_back(std::move(element));
+            } else if (word == "property") {
+                if (elements.empty())
+                    throw bad("a property before any element");
+                Property property;
+                words >> property.type;
+                if (property.type == "list")
+                    words >> property.count_type >> property.type;
+                words >> property.name;
+                elements.back().properties.push_back(std::move(property));
+            } else if (word == "end_header") {
+                ended = true;
+            }
+        }
+        if (!ended)
+            throw bad("no end of header");
+
+        const auto type_size = [&](const std::string_view type) -> size_t {
+            if (type == "char" || type == "uchar" || type == "int8" || type == "uint8")
+                return 1;
+            if (type == "short" || type == "ushort" || type == "int16" || type == "uint16")
+                return 2;
+            if (type == "int" || type == "uint" || type == "int32" || type == "uint32" || type == "float" || type == "float32")
+                return 4;
+            if (type == "double" || type == "float64")
+                return 8;
+            throw bad(type);
+        };
+        const auto read_number = [&](const std::string_view type) -> double {
+            if (ascii) {
+                double value = 0.;
+                if (!(in >> value))
+                    throw bad("the file ends early");
+                return value;
+            }
+            char raw[8];
+            if (!in.read(raw, std::streamsize(type_size(type))))
+                throw bad("the file ends early");
+            const auto as = [&]<typename T>(T value) {
+                std::memcpy(&value, raw, sizeof(T));
+                return double(value);
+            };
+            if (type == "char" || type == "int8")
+                return as(int8_t{});
+            if (type == "uchar" || type == "uint8")
+                return as(uint8_t{});
+            if (type == "short" || type == "int16")
+                return as(int16_t{});
+            if (type == "ushort" || type == "uint16")
+                return as(uint16_t{});
+            if (type == "int" || type == "int32")
+                return as(int32_t{});
+            if (type == "uint" || type == "uint32")
+                return as(uint32_t{});
+            if (type == "float" || type == "float32")
+                return as(float{});
+            return as(double{});
+        };
+
+        SplatMesh mesh;
+        for (const auto& element : elements) {
+            if (element.name == "vertex") {
+                const auto find = [&](const std::string_view name) {
+                    for (size_t p = 0; p < element.properties.size(); ++p)
+                        if (element.properties[p].name == name)
+                            return int(p);
+                    return -1;
+                };
+                const int position[3] = {find("x"), find("y"), find("z")};
+                const int color[3] = {find("red"), find("green"), find("blue")};
+                if (position[0] < 0 || position[1] < 0 || position[2] < 0)
+                    throw bad("vertices without x, y, z");
+                const bool has_color = color[0] >= 0 && color[1] >= 0 && color[2] >= 0;
+                mesh.vertices.resize(element.count);
+                mesh.colors.assign(element.count, {128, 128, 128});
+                std::vector<double> values(element.properties.size());
+                for (size_t v = 0; v < element.count; ++v) {
+                    for (size_t p = 0; p < values.size(); ++p) {
+                        if (!element.properties[p].count_type.empty())
+                            throw bad("a list property on vertices");
+                        values[p] = read_number(element.properties[p].type);
+                    }
+                    for (int c = 0; c < 3; ++c) {
+                        mesh.vertices[v][c] = float(values[size_t(position[c])]);
+                        if (has_color)
+                            mesh.colors[v][c] = static_cast<uint8_t>(std::clamp(values[size_t(color[c])], 0., 255.));
+                    }
+                }
+            } else {
+                const bool faces = element.name == "face";
+                if (faces)
+                    mesh.faces.reserve(element.count);
+                std::vector<int32_t> corners;
+                for (size_t e = 0; e < element.count; ++e)
+                    for (const auto& property : element.properties) {
+                        if (property.count_type.empty()) {
+                            read_number(property.type);
+                            continue;
+                        }
+                        const auto count = size_t(read_number(property.count_type));
+                        const bool indices = faces && (property.name == "vertex_indices" || property.name == "vertex_index");
+                        corners.resize(count);
+                        for (size_t c = 0; c < count; ++c) {
+                            const double value = read_number(property.type);
+                            corners[c] = int32_t(value);
+                        }
+                        if (!indices)
+                            continue;
+                        // A polygon as a fan.
+                        for (size_t c = 2; c < count; ++c)
+                            mesh.faces.push_back({corners[0], corners[c - 1], corners[c]});
+                    }
+            }
+        }
+        for (const auto& face : mesh.faces)
+            for (const auto vertex : face)
+                if (vertex < 0 || size_t(vertex) >= mesh.vertices.size())
+                    throw bad("a face refers to a vertex that does not exist");
+        if (mesh.faces.empty())
+            throw bad("no faces");
+        compute_splat_mesh_normals(mesh);
+        return mesh;
+    }
+
     void write_splat_mesh_ply(const SplatMesh& mesh, const std::filesystem::path& path) {
+        if (!mesh.uv_source.empty()) {
+            const auto welded = weld_chart_seams(mesh);
+            SplatMesh surface;
+            surface.vertices.reserve(welded.originals.size());
+            surface.normals.reserve(welded.originals.size());
+            surface.colors.reserve(welded.originals.size());
+            for (const auto original : welded.originals) {
+                surface.vertices.push_back(mesh.vertices[original]);
+                surface.normals.push_back(mesh.normals[original]);
+                surface.colors.push_back(mesh.colors[original]);
+            }
+            surface.faces.reserve(mesh.faces.size());
+            for (const auto& face : mesh.faces)
+                surface.faces.push_back({welded.index[face[0]], welded.index[face[1]], welded.index[face[2]]});
+            write_splat_mesh_ply(surface, path);
+            return;
+        }
         const auto temporary = std::filesystem::path(path).concat(".tmp");
         {
             std::ofstream out(core::native_fs::native_path(temporary), std::ios::binary | std::ios::trunc);
@@ -2761,7 +3375,30 @@ namespace lfs::training {
         }
         core::MeshData data(std::move(vertices), std::move(indices));
         data.normals = std::move(normals);
-        data.colors = std::move(colors);
+        if (mesh.pages.empty()) {
+            data.colors = std::move(colors);
+            return data;
+        }
+        auto texcoords = Tensor::empty({v, size_t{2}}, Device::CPU);
+        std::memcpy(texcoords.ptr<float>(), mesh.uvs.data(), v * 8);
+        data.texcoords = std::move(texcoords);
+        // The viewport treats texture values as linear, as it does vertex colors.
+        std::array<uint8_t, 256> to_linear{};
+        for (int i = 0; i < 256; ++i)
+            to_linear[size_t(i)] = static_cast<uint8_t>(std::lround(255.f * linear(uint8_t(i))));
+        for (size_t p = 0; p < mesh.pages.size(); ++p) {
+            core::TextureImage image;
+            image.width = image.height = mesh.page_size;
+            image.channels = 3;
+            image.pixels.resize(mesh.pages[p].size());
+            std::ranges::transform(mesh.pages[p], image.pixels.begin(), [&](const uint8_t value) { return to_linear[value]; });
+            data.texture_images.push_back(std::move(image));
+            core::Material material;
+            material.name = std::format("page_{}", p);
+            material.albedo_tex = static_cast<uint32_t>(p + 1);
+            data.materials.push_back(std::move(material));
+            data.submeshes.push_back({3 * mesh.page_first_face[p], 3 * (mesh.page_first_face[p + 1] - mesh.page_first_face[p]), p});
+        }
         return data;
     }
 

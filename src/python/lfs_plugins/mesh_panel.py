@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Mesh extraction controls; the work runs on the native collision job."""
+from pathlib import Path
+
 import lichtfeld as lf
 from . import rml_widgets as w
 from .scrub_fields import ScrubFieldController, ScrubFieldSpec
@@ -29,6 +31,8 @@ SPECS = {
     "remove_isolated_small_components": ScrubFieldSpec(0, 1, 1, "%.0f"),
     "isolated_component_max_faces": ScrubFieldSpec(0, 1000, 10, "%.0f"),
     "isolated_component_neighbor_radius": ScrubFieldSpec(0, 50, 1, "%.0f"),
+    "max_range": ScrubFieldSpec(0, 1000, 1, "%.3g"),
+    "texel_size": ScrubFieldSpec(0, .05, .001, "%.3g"),
 }
 LABELS = {"voxel_size": "main_panel.voxel_size", "view_stride": "mesh.view_stride",
           "full_weight_range": "mesh.full_weight_range", "min_views": "mesh.min_views",
@@ -42,7 +46,11 @@ LABELS = {"voxel_size": "main_panel.voxel_size", "view_stride": "mesh.view_strid
           "fill_hole_perimeter": "mesh.fill_hole_perimeter",
           "remove_isolated_small_components": "mesh.remove_isolated_small_components",
           "isolated_component_max_faces": "mesh.isolated_component_max_faces",
-          "isolated_component_neighbor_radius": "mesh.isolated_component_neighbor_radius"}
+          "isolated_component_neighbor_radius": "mesh.isolated_component_neighbor_radius",
+          "max_range": "mesh.max_range", "texel_size": "mesh.texel_size"}
+# Which container each field goes in. The voxel size also sets how far a photo may see past a surface when baking,
+# so it stays when the surface comes from a file.
+CONTAINERS = {"voxel_size": "mesh-shared-fields", "texel_size": "mesh-texture-fields"}
 
 
 @panel_class("mesh")
@@ -56,7 +64,8 @@ class MeshPanel(Panel):
                            fill_hole_perimeter=.0,
                            remove_isolated_small_components=1, isolated_component_max_faces=100,
                            isolated_component_neighbor_radius=10.,
-                           error="")
+                           max_range=0., texel_size=0.,
+                           use_file=False, file="", error="")
         self.state = {}
         self.close_when_done = False
         self.scrubs = ScrubFieldController(
@@ -68,24 +77,56 @@ class MeshPanel(Panel):
         self.values[prop] = value
         invalidate_panel(self.handle, "*")
 
+    def textured(self):
+        return self.values["texel_size"] > 0
+
+    def notice(self):
+        """Why the settings cannot run as they are, or empty. A missing file shows on its own row."""
+        if self.values["use_file"] and not self.textured():
+            return lf.ui.tr("mesh.needs_texel")
+        return ""
+
+    def output(self):
+        return lf.ui.tr("mesh.output_osgb" if self.textured() else "mesh.output_ply")
+
+    def ready(self):
+        if self.values["use_file"] and not self.values["file"]:
+            return False
+        return bool(self.state.get("source_name")) and not self.state.get("active", False) and not self.notice()
+
+    def choose_file(self, *_):
+        start = str(Path(self.values["file"]).parent) if self.values["file"] else ""
+        path = lf.ui.open_mesh_file_dialog(start)
+        if not path:
+            return
+        if Path(path).suffix.lower() != ".ply":
+            self.values["error"] = lf.ui.tr("mesh.ply_only")
+        else:
+            self.values["error"] = ""
+            self.values["file"] = path
+        invalidate_panel(self.handle, "*")
+
     def generate(self, *_):
-        path = lf.ui.save_ply_file_dialog(self.state.get("source_name", "") + "_mesh")
+        if not self.ready():
+            return
+        name = Path(self.values["file"]).stem + "_baked" if self.values["use_file"] else self.state.get("source_name", "") + "_mesh"
+        path = lf.ui.save_ply_file_dialog(name)
         if not path:
             return
         self.values["error"] = ""
         try:
             lf.generate_mesh(path, self.values["voxel_size"], int(self.values["view_stride"]),
                              self.values["full_weight_range"], int(self.values["min_views"]),
-                             self.values["simplify_error"], self.values["trunc_gradient"],
-                             self.values["trunc_cap"], int(self.values["clean_topology"]),
-                             int(self.values["clean_non_manifold"]), int(self.values["remove_spikes"]),
-                             int(self.values["ear_cut_holes"]),
+                             self.values["simplify_error"], self.values["max_range"], self.values["texel_size"],
+                             self.values["file"] if self.values["use_file"] else "",
+                             self.values["trunc_gradient"], self.values["trunc_cap"],
+                             int(self.values["clean_topology"]), int(self.values["clean_non_manifold"]),
+                             int(self.values["remove_spikes"]), int(self.values["ear_cut_holes"]),
                              self.values["spurious_edge_factor"], self.values["spurious_component_factor"],
                              self.values["fill_hole_perimeter"],
                              int(self.values["remove_isolated_small_components"]),
                              int(self.values["isolated_component_max_faces"]),
-                             self.values["isolated_component_neighbor_radius"],
-                             .0)
+                             self.values["isolated_component_neighbor_radius"])
             self.close_when_done = True
         except (RuntimeError, TypeError, ValueError) as exc:
             key = getattr(exc, "message_key", "")
@@ -117,6 +158,13 @@ class MeshPanel(Panel):
         model.bind_func("mesh_progress", lambda: self.state.get("progress", 0))
         model.bind_func("mesh_error", lambda: self.values["error"] or self.state.get("error", ""))
         model.bind_func("mesh_status", lambda: f'{self.state.get("stage") or lf.ui.tr("training_panel.running")} {self.state.get("progress", 0):.0%}')
+        model.bind_func("mesh_file", lambda: self.values["file"])
+        model.bind_func("mesh_file_name", lambda: Path(self.values["file"]).name if self.values["file"] else lf.ui.tr("mesh.no_file"))
+        model.bind_func("mesh_output", self.output)
+        model.bind_func("mesh_notice", self.notice)
+        model.bind_func("mesh_ready", self.ready)
+        model.bind("mesh_use_file", lambda: self.values["use_file"], lambda value: self.set_value("use_file", bool(value)))
+        model.bind_event("mesh_choose_file", self.choose_file)
         model.bind_event("mesh_generate", self.generate)
         model.bind_event("mesh_cancel", self.cancel)
         model.bind_event("mesh_close", lambda *_: lf.ui.set_panel_enabled("lfs.mesh", False))
@@ -124,14 +172,15 @@ class MeshPanel(Panel):
     def on_mount(self, doc):
         super().on_mount(doc)
         self.update()
-        container = doc.get_element_by_id("mesh-fields")
-        if container is not None:
-            for key, spec in SPECS.items():
-                row = w.slider(container, key, label=lf.ui.tr(LABELS[key]), min=spec.min_value, max=spec.max_value,
-                               step=spec.step, value=self.values[key])
-                row.query_selector(".setting-row__label-col").set_attribute("data-lfs-i18n", LABELS[key])
-                row.query_selector("input").set_attribute("data-value", key)
-                row.set_attribute("data-tooltip", "tooltip.mesh." + key)
+        for key, spec in SPECS.items():
+            container = doc.get_element_by_id(CONTAINERS.get(key, "mesh-fields"))
+            if container is None:
+                continue
+            row = w.slider(container, key, label=lf.ui.tr(LABELS[key]), min=spec.min_value, max=spec.max_value,
+                           step=spec.step, value=self.values[key])
+            row.query_selector(".setting-row__label-col").set_attribute("data-lfs-i18n", LABELS[key])
+            row.query_selector("input").set_attribute("data-value", key)
+            row.set_attribute("data-tooltip", "tooltip.mesh." + key)
         self.scrubs.mount(doc)
         self.binding = PanelStateBinding(self.handle).watch(
             RuntimeState.scene_generation, RuntimeState.selection_generation,

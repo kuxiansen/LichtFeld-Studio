@@ -81,10 +81,10 @@
 
 namespace lfs::app {
 
-    std::optional<std::filesystem::path> prepare_lpips_weights(const bool allow_download) {
-        if (const auto path = core::environment::value("LFS_LPIPS_WEIGHTS"))
-            return core::utf8_to_path(*path);
-        auto result = lfs::preprocessing::ensure_lpips_weights(allow_download);
+    std::optional<core::nn::WeightFile> prepare_lpips_weights(const bool allow_download) {
+        const auto custom = core::environment::value("LFS_LPIPS_WEIGHTS");
+        auto result = custom ? core::nn::WeightFile::open(core::utf8_to_path(*custom))
+                             : lfs::preprocessing::ensure_lpips_weights(allow_download);
         if (result)
             return std::move(*result);
         LOG_WARN("LPIPS unavailable: {}", result.error().detail());
@@ -1063,7 +1063,7 @@ namespace lfs::app {
                     auto trainer =
                         std::move(installed->trainer);
                     if (project->params.optimization.enable_eval)
-                        trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
+                        trainer->set_lpips_weights_preparer([allow_download = !params->no_download] { return prepare_lpips_weights(allow_download); });
                     training::grant_headless_project_saves(
                         *trainer, project->params,
                         headless_project_save_destination(
@@ -1131,7 +1131,7 @@ namespace lfs::app {
                     }
                     LOG_INFO("Resumed from iteration {}", *ckpt_result);
                     if (ckpt_params_result->optimization.enable_eval)
-                        trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
+                        trainer->set_lpips_weights_preparer([allow_download = !params->no_download] { return prepare_lpips_weights(allow_download); });
 
                     core::Tensor::trim_memory_pool();
 
@@ -1174,7 +1174,7 @@ namespace lfs::app {
                         return 1;
                     }
                     if (params->optimization.enable_eval)
-                        trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
+                        trainer->set_lpips_weights_preparer([allow_download = !params->no_download] { return prepare_lpips_weights(allow_download); });
                     training::grant_headless_project_saves(
                         *trainer, *params,
                         headless_dataset_project_destination(*params),
@@ -1276,7 +1276,7 @@ namespace lfs::app {
             if (!trainer)
                 return 1;
 
-            trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
+            trainer->set_lpips_weights_preparer([allow_download = !params->no_download] { return prepare_lpips_weights(allow_download); });
             core::Tensor::trim_memory_pool();
             const auto result = trainer->evaluate_current_model();
             trainer->shutdown();
@@ -1313,6 +1313,12 @@ namespace lfs::app {
                                                                trained && trainer->hasPPISP() ? trainer->getPPISP() : nullptr);
                 core::native_fs::create_directories(params->mesh_output.parent_path());
                 training::write_splat_mesh_ply(mesh, params->mesh_output);
+                if (mesh.tiled) {
+                    auto folder = params->mesh_output;
+                    folder.replace_extension();
+                    folder += "_osgb";
+                    training::write_splat_mesh_osgb(*mesh.tiled, folder);
+                }
                 bar.complete();
                 const auto& settings = *params->mesh_settings;
                 const nlohmann::json report{{"voxel_size", mesh.voxel_size}, {"truncation", mesh.truncation},
@@ -1326,7 +1332,9 @@ namespace lfs::app {
                                             {"components_total", mesh.components_total}, {"area", mesh.area},
                                             {"colored_vertex_share", mesh.colored_vertex_share}, {"views_color_corrected", mesh.views_color_corrected}, {"seconds_render", mesh.seconds_render},
                                             {"seconds_fusion", mesh.seconds_fusion}, {"seconds_extract", mesh.seconds_extract},
-                                            {"seconds_color", mesh.seconds_color}};
+                                            {"seconds_color", mesh.seconds_color}, {"texel_size", settings.texel_size}, {"texture_size", settings.texture_size},
+                                            {"texture_width", settings.texture_width}, {"pages", mesh.tiled ? mesh.tiled->combined.page_first_face.size() - 1 : mesh.pages.size()}, {"tile_levels", mesh.tiled ? mesh.tiled->levels.size() : size_t{0}}, {"charts", mesh.charts}, {"texels", mesh.texels},
+                                            {"observed_texel_share", mesh.observed_texel_share}, {"seconds_unwrap", mesh.seconds_unwrap}, {"seconds_bake", mesh.seconds_bake}};
                 auto report_path = params->mesh_output;
                 report_path.replace_extension(".json");
                 std::ofstream(core::native_fs::native_path(report_path)) << report.dump(2);

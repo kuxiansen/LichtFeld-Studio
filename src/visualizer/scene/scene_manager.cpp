@@ -38,6 +38,7 @@
 #include "training/components/ppisp.hpp"
 #include "training/components/ppisp_controller.hpp"
 #include "training/components/ppisp_file.hpp"
+#include "training/noise_infill.hpp"
 #include "training/trainer.hpp"
 #include "training/training_manager.hpp"
 #include "training/training_setup.hpp"
@@ -2035,6 +2036,45 @@ namespace lfs::vis {
         return {};
     }
 
+    SceneManager::DisabledCameraRemovalResult SceneManager::removeDisabledCamerasWithResult(
+        const core::NodeId camera_group_id) {
+        const auto* const group = scene_.getNodeById(camera_group_id);
+        if (!group)
+            return lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::NotFound,
+                .domain = lfs::ErrorDomain::App,
+                .user_message = "Camera group not found",
+                .detection = LFS_SOURCE_SITE_CURRENT()});
+        if (group->type != core::NodeType::CAMERA_GROUP)
+            return lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::InvalidArgument,
+                .domain = lfs::ErrorDomain::App,
+                .user_message = "Node is not a camera group",
+                .detection = LFS_SOURCE_SITE_CURRENT()});
+
+        std::vector<core::NodeId> disabled_camera_ids;
+        disabled_camera_ids.reserve(group->children.size());
+        for (const core::NodeId child_id : group->children) {
+            const auto* const child = scene_.getNodeById(child_id);
+            if (child && child->type == core::NodeType::CAMERA && !child->training_enabled)
+                disabled_camera_ids.push_back(child_id);
+        }
+        if (disabled_camera_ids.empty())
+            return 0;
+
+        auto result = removeNodesByIdsWithResult(disabled_camera_ids, false);
+        if (!result) {
+            const auto removal = lfs::from_legacy_expected<void>(
+                std::move(result), lfs::LegacyErrorContext{
+                                       .code = lfs::ErrorCode::FailedPrecondition,
+                                       .domain = lfs::ErrorDomain::App,
+                                       .operation = "Remove disabled cameras",
+                                       .source = LFS_SOURCE_SITE_CURRENT()});
+            return removal.error();
+        }
+        return disabled_camera_ids.size();
+    }
+
     void SceneManager::removePLY(std::string name, const bool keep_children) {
         if (const auto result = removePLYWithResult(std::move(name), keep_children); !result) {
             LOG_WARN("{}", result.error());
@@ -3722,6 +3762,19 @@ namespace lfs::vis {
         // Keep the model owned by the scene until trainer teardown succeeds:
         // a deferred clear must not destroy it through a local unique_ptr.
         auto splat_data = std::move(model_node->model);
+        // Edit mode has no training left to guide: the noise infill ends here, as in every export.
+        try {
+            if (auto without_noise = lfs::training::without_noise_infill(*splat_data)) {
+                *splat_data = std::move(*without_noise);
+                const auto splat_allocator = makeViewerSplatTensorAllocator();
+                if (splat_allocator && !lfs::io::splatTensorsRendererReady(*splat_data)) {
+                    if (auto migrated = lfs::io::migrateSplatTensorsToAllocator(*splat_data, splat_allocator); !migrated)
+                        throw std::runtime_error(migrated.error().format());
+                }
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Edit mode keeps the noise infill: {}", e.what());
+        }
         const size_t num_gaussians = splat_data->size();
 
         scene_.clear();

@@ -152,19 +152,24 @@ namespace lfs::core::nn::models {
 
     lfs::Result<Sam2> Sam2::load(const std::filesystem::path& weights, Device device,
                                  std::optional<DataType> compute) {
-        if (device != Device::CUDA) {
-            return sam_error(lfs::ErrorCode::InvalidArgument, "SAM2 requires a CUDA device");
-        }
         auto file = WeightFile::open(weights);
         if (!file) {
             return std::move(file.error());
+        }
+        return load(*file, device, compute);
+    }
+
+    lfs::Result<Sam2> Sam2::load(const WeightFile& file, Device device,
+                                 std::optional<DataType> compute) {
+        if (device != Device::CUDA) {
+            return sam_error(lfs::ErrorCode::InvalidArgument, "SAM2 requires a CUDA device");
         }
         DataType dtype = DataType::Float32;
         if (compute) {
             dtype = *compute;
         } else {
-            for (const auto& name : file->names()) {
-                const auto* info = file->info(name);
+            for (const auto& name : file.names()) {
+                const auto* info = file.info(name);
                 if (info && info->dtype == DataType::Float16) {
                     dtype = DataType::Float16;
                     break;
@@ -175,7 +180,7 @@ namespace lfs::core::nn::models {
             return sam_error(lfs::ErrorCode::InvalidArgument,
                              "SAM2 compute dtype must be float16 or float32");
         }
-        auto loaded = file->load_all(device, dtype);
+        auto loaded = file.load_all(device, dtype);
         if (!loaded) {
             return std::move(loaded.error());
         }
@@ -206,6 +211,18 @@ namespace lfs::core::nn::models {
         model.std_ = Tensor::from_vector({0.229f, 0.224f, 0.225f}, shape_of({1, 3, 1, 1}), Device::CPU)
                          .to(device, getCurrentCUDAStream());
         return model;
+    }
+
+    std::size_t Sam2::weights_bytes() const {
+        std::size_t bytes = 0;
+        for (const auto* weights : {&weights_, &encoder_weights_}) {
+            for (const auto& [name, tensor] : *weights) {
+                (void)name;
+                if (tensor.is_valid())
+                    bytes += tensor.bytes();
+            }
+        }
+        return bytes;
     }
 
     void Sam2::set_encoder_dtype(const DataType dtype) {
@@ -240,7 +257,12 @@ namespace lfs::core::nn::models {
         }
         const std::size_t elem = dtype_size(like.dtype());
         const std::size_t count = (bytes + elem - 1) / elem;
+        // The workspace outlives the forward pass, so it must not come from the activation arena, which every forward
+        // rewinds and hands out again: the next predict's activations would alias the convolutions' scratch.
+        ActivationArena* prev = ActivationArena::current();
+        ActivationArena::bind(nullptr);
         workspace_ = Tensor::empty(shape_of({count}), like.device(), like.dtype());
+        ActivationArena::bind(prev);
         workspace_.set_stream(like.stream());
         return workspace_;
     }
@@ -538,15 +560,15 @@ namespace lfs::core::nn::models {
 
     lfs::Result<Sam2Prediction> Sam2::predict(const std::vector<Sam2PointPrompt>& points,
                                               const std::optional<std::array<float, 4>>& box,
-                                              bool multimask, const Tensor* mask_logits) {
+                                              bool multimask, const Tensor* mask_logits, const Sam2MaskOutput output) {
         if (mask_logits) {
             LFS_ASSERT_MSG(mask_logits->ndim() == 4 && mask_logits->size(0) == 1 && mask_logits->size(1) == 1 &&
                                mask_logits->size(2) == 256 && mask_logits->size(3) == 256,
                            "SAM2 mask prompts are 1 x 1 x 256 x 256 logits");
             const auto prompt = mask_logits->to(compute_);
-            return run_decoder(points, box, multimask, false, &prompt);
+            return run_decoder(points, box, multimask, false, &prompt, output);
         }
-        return run_decoder(points, box, multimask);
+        return run_decoder(points, box, multimask, false, nullptr, output);
     }
 
     lfs::Result<void> Sam2::run_encoder(const Tensor& image, bool video) {
@@ -709,7 +731,7 @@ namespace lfs::core::nn::models {
 
     lfs::Result<Sam2Prediction> Sam2::run_decoder(const std::vector<Sam2PointPrompt>& points,
                                                   const std::optional<std::array<float, 4>>& box,
-                                                  bool multimask, bool video, const Tensor* mask_input) {
+                                                  bool multimask, bool video, const Tensor* mask_input, const Sam2MaskOutput output) {
         if (!image_set_) {
             return sam_error(lfs::ErrorCode::FailedPrecondition,
                              "set_image must be called before predict");
@@ -873,12 +895,14 @@ namespace lfs::core::nn::models {
         {
             NvtxRange nvtx("sam2/postprocess");
             ActivationArena::bind(nullptr);
-            auto nchw = sel.reshape(shape_of({static_cast<std::size_t>(count), 1,
-                                              static_cast<std::size_t>(kEmbed * 4),
-                                              static_cast<std::size_t>(kEmbed * 4)}));
-            auto up = resize2d(nchw.to(DataType::Float32), orig_h_, orig_w_, ResizeMode::Bilinear,
-                               CoordTransform::HalfPixel);
-            masks_up = up.squeeze(1).contiguous();
+            if (output == Sam2MaskOutput::OriginalResolution) {
+                auto nchw = sel.reshape(shape_of({static_cast<std::size_t>(count), 1,
+                                                  static_cast<std::size_t>(kEmbed * 4),
+                                                  static_cast<std::size_t>(kEmbed * 4)}));
+                auto up = resize2d(nchw.to(DataType::Float32), orig_h_, orig_w_, ResizeMode::Bilinear,
+                                   CoordTransform::HalfPixel);
+                masks_up = up.squeeze(1).contiguous();
+            }
             low_out = sel.reshape(shape_of({static_cast<std::size_t>(count),
                                             static_cast<std::size_t>(kEmbed * 4),
                                             static_cast<std::size_t>(kEmbed * 4)}))

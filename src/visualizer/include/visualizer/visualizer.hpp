@@ -6,6 +6,7 @@
 
 #include "core/error.hpp"
 #include "core/export.hpp"
+#include "core/nn/weight_file.hpp"
 #include "io/project_chapters.hpp"
 
 #include <cstddef>
@@ -229,7 +230,7 @@ namespace lfs::vis {
         [[nodiscard]] virtual bool acceptsPostedWork() const { return true; }
         virtual void setShutdownRequestedCallback(std::function<void()> callback) = 0;
         virtual void set_evaluation_weights_preparer(
-            std::function<std::optional<std::filesystem::path>(bool allow_download)> preparer) {
+            std::function<std::optional<core::nn::WeightFile>(bool allow_download)> preparer) {
             static_cast<void>(preparer);
         }
         virtual std::expected<void, std::string> startTraining() = 0;
@@ -291,6 +292,13 @@ namespace lfs::vis {
         virtual lfs::Result<ProjectWritePoll>
         projectPollWrite() {
             return ProjectWritePoll{};
+        }
+        virtual lfs::Result<void> applyCameraMask(const lfs::core::Uuid&, const std::filesystem::path&, std::shared_ptr<const std::vector<std::byte>>, int, int) {
+            return lfs::Status::failure(lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::Unsupported,
+                .domain = lfs::ErrorDomain::App,
+                .user_message = "This viewer cannot apply image masks.",
+                .detection = LFS_SOURCE_SITE_CURRENT()}));
         }
         virtual lfs::Result<ProjectTrainingSource>
         projectTrainingSource() {
