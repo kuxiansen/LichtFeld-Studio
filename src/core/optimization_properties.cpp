@@ -960,6 +960,7 @@ namespace lfs::core::param {
             .tooltip("training.tooltip.mix_voxel_size")
             .precision(3)
             .ui_step(0.005)
+            .all_strategies()
             .string_prop(&OptimizationParameters::noise_infill_mesh,
                          "noise_infill_mesh", "Noise Infill Mesh", d.noise_infill_mesh,
                          "Closed mesh whose interior opaque noise Gaussians fill during training, re-coloured every step, so "
