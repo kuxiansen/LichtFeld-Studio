@@ -27,12 +27,18 @@ namespace lfs::training {
         std::vector<std::array<int32_t, 3>> faces;
 
         // What each stage found, for reports.
+        float voxel_size = 0.f; // as resolved when the settings asked for automatic
+        float truncation = 0.f;
         size_t views = 0;
         size_t blocks = 0;
         uint64_t band_voxels = 0;
         size_t raw_faces = 0;
         size_t holes_filled = 0;
         size_t faces_before_simplify = 0;
+        size_t faces_removed_degenerate = 0; // zero-area, repeated or non-manifold faces and the repeats of merged vertices
+        size_t faces_removed_spikes = 0;
+        size_t faces_removed_spurious = 0;    // outlier long-edge faces and oversized disconnected components
+        size_t vertices_split_non_manifold = 0;
         float simplify_result_error = 0.f;
         size_t components_kept = 0;
         size_t components_total = 0;
@@ -62,9 +68,24 @@ namespace lfs::training {
                       float max_step = 1.5f);
     // Removes connected components with fewer faces and the vertices they leave unused.
     void remove_small_mesh_components(SplatMesh& mesh, int min_faces);
-    // Closes open boundaries with a rim shorter than max_perimeter scene units, by a fan around a
-    // new center vertex. Runs before normals and colors exist. Returns how many it closed.
-    size_t fill_small_mesh_holes(SplatMesh& mesh, float max_perimeter);
+    // Closes open boundaries. A rim shorter than max_perimeter scene units gets a fan around a new
+    // centre vertex. When ear_cut_edges > 0 a rim with fewer boundary edges than that is instead
+    // filled with the ear clipping OpenMVS uses (VCG's SelfIntersectionEar), which keeps the rim
+    // vertices and leaves concave rims intact. Returns how many loops it closed.
+    size_t fill_small_mesh_holes(SplatMesh& mesh, float max_perimeter, int ear_cut_edges = 0, float max_edge = 0.f);
+    // Drops zero-area and repeated faces, merges vertices that share a position, drops faces that
+    // share an edge with more than one other face and splits vertices whose faces form more than one
+    // fan. Keeps vertices, normals and colors in step and drops the vertices it leaves unused.
+    // Returns how many faces it dropped.
+    size_t clean_mesh_topology(SplatMesh& mesh);
+    // Drops vertices that hang off a single face, until none are left, with the faces they empty.
+    // Returns how many faces it dropped.
+    size_t remove_mesh_spikes(SplatMesh& mesh);
+    // OpenMVS's adaptive outlier pass, split in two: drop faces with any edge longer than the 95th
+    // percentile edge times edge_factor, then drop connected components whose bounding-box diagonal
+    // is shorter than the 55th percentile edge times component_factor. A factor of 0 disables its
+    // phase.
+    size_t remove_spurious_components(SplatMesh& mesh, float edge_factor, float component_factor);
     // Area-weighted vertex normals and the mesh area.
     void compute_splat_mesh_normals(SplatMesh& mesh);
     // Reduces faces while the surface stays within about max_error scene units, moving the kept

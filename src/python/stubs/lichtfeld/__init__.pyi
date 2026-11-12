@@ -33,7 +33,6 @@ from .scene import (
     export_collision as export_collision,
     generate_collision as generate_collision,
     generate_mesh as generate_mesh,
-    generate_mesh_gof as generate_mesh_gof,
     get_collision_state as get_collision_state,
     set_walk_settings as set_walk_settings
 )
@@ -2668,7 +2667,9 @@ class OptimizationParams:
 
     @property
     def depth_distortion_weight(self) -> float:
-        """Weight for the spread of depth along each ray, which thins layered surfaces (--gut)"""
+        """
+        Weight for the spread of depth along each ray, which thins layered surfaces (--gut)
+        """
 
     @depth_distortion_weight.setter
     def depth_distortion_weight(self, arg: float, /) -> None: ...

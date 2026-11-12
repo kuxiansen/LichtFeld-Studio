@@ -3,6 +3,7 @@
 #pragma once
 
 #include "Common.h"
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -37,18 +38,39 @@ namespace gsplat_lfs {
         float voxel = 0.f;
         uint32_t block = 0;      // voxels per block side
         float trunc = 0.f;       // scene units
+        // Neighbouring pixels of a depth map differ by this view's sample spacing along the surface.
+        // On ground seen at a grazing angle that spacing grows with the square of the range, so a
+        // fixed band leaves gaps; this widens it by trunc_gradient times the local spacing, up to
+        // trunc_cap. 0 keeps trunc everywhere.
+        float trunc_gradient = 0.f;
+        float trunc_cap = 0.f;   // 0 = no cap, which only makes sense while trunc_gradient is 0
         float full_weight_range = 0.f; // views beyond this range count less, by 1/r^2; 0 = equal weights
         float max_range = 0.f;   // depth beyond this touches no blocks; 0 = no limit
     };
 
-    // Block keys around the surface of a depth map, sampled at every 2nd pixel at
-    // depth and depth +- trunc, up to grid.max_range. keys holds 3 * ceil(W / 2) * ceil(H / 2); kTsdfNoKey fills the rest.
+    [[nodiscard]] inline __host__ __device__ float tsdf_widest_band(const TsdfGrid& grid) {
+        return grid.trunc_gradient > 0.f ? fmaxf(grid.trunc, grid.trunc_cap) : grid.trunc;
+    }
+
+    // Block keys around the surface of a depth map, sampled at every 2nd pixel along depth, from
+    // -reach to +reach blocks about the surface, up to grid.max_range. keys holds
+    // (2 * reach + 1) * ceil(W / 2) * ceil(H / 2); kTsdfNoKey fills the rest. reach 1 with a band
+    // no wider than a block touches depth and depth +- trunc, as before.
     void tsdf_touch_keys(const float* depth, const float* rays, const TsdfView& view, const TsdfGrid& grid,
-                         uint64_t* keys, cudaStream_t stream);
+                         uint32_t reach, uint64_t* keys, cudaStream_t stream);
+
+    // The same operation on [first_sample, first_sample + sample_count). depth and rays still describe
+    // the complete view, so gradient bands at batch boundaries see exactly the same neighbours.
+    void tsdf_touch_keys_range(const float* depth, const float* rays, const TsdfView& view, const TsdfGrid& grid,
+                               uint32_t reach, uint64_t first_sample, uint64_t sample_count, uint64_t* keys,
+                               cudaStream_t stream);
 
     // Sorts keys in place and removes duplicates and kTsdfNoKey. Returns how many remain.
     // scratch holds count keys, counter one on the device.
     [[nodiscard]] size_t tsdf_sort_unique(uint64_t* keys, uint64_t* scratch, size_t count, uint64_t* counter, cudaStream_t stream);
+
+    // Largest temporary allocation made by tsdf_sort_unique, without allocating it.
+    [[nodiscard]] size_t tsdf_sort_unique_workspace_bytes(size_t count, cudaStream_t stream);
 
     [[nodiscard]] inline __host__ __device__ uint32_t tsdf_tile_count(const uint32_t pixels) {
         return (pixels + kTsdfTilePixels - 1) / kTsdfTilePixels;
@@ -74,12 +96,14 @@ namespace gsplat_lfs {
     // Voxels of blocks [first_block, last_block) with a face neighbor of the opposite sign, all
     // that surface extraction reads. A voxel counts when at least min_views views saw it and
     // |tsdf| < 1. Neighbors may lie in any block of block_keys, which is sorted. With null keys
-    // it only counts them.
+    // it only counts them. Diagnostics only: with reasons, fills 5 counters (considered, below
+    // min_views, outside the band, no sign change, emitted); the mesh never reads them.
     [[nodiscard]] uint64_t tsdf_collect_voxels(const uint64_t* block_keys, uint32_t block_count, uint32_t first_block,
                                                uint32_t last_block, const TsdfGrid& grid,
                                                const float* sum, const float* weight, const uint16_t* views,
                                                const float* carve, uint32_t min_views,
-                                               uint64_t* keys, float* tsdf, uint64_t* counter, cudaStream_t stream);
+                                               uint64_t* keys, float* tsdf, uint64_t* counter, cudaStream_t stream,
+                                               uint64_t* reasons = nullptr);
 
     // Adds the photo [3, H, W] to the vertices this view sees as its surface, weighted by 1 / distance.
     // No weight by angle: on a flat floor seen at a low angle, the noise in the normals makes such a

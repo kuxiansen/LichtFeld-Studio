@@ -127,19 +127,55 @@ namespace gsplat_lfs {
             return ratio * ratio;
         }
 
-        __global__ void touch_kernel(const float* depth, const float* rays, const TsdfView view, const TsdfGrid grid, uint64_t* keys) {
-            const uint32_t half_w = (view.width + 1) / 2, half_h = (view.height + 1) / 2;
-            const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-            if (i >= half_w * half_h)
+        // How far a depth sample speaks for. Where neighbouring pixels differ in depth by more than
+        // the band, the samples are further apart than the band is wide and the voxels between them
+        // are never touched: the hole. The neighbour difference is that spacing, so the band follows
+        // it. Pixels without a surface say nothing about it and are skipped.
+        __device__ __forceinline__ float band_at(const TsdfGrid& grid, const float* depth, const uint32_t pixel,
+                                                 const uint32_t width, const uint32_t height, const float range) {
+            if (grid.trunc_gradient <= 0.f || !(range > 0.f))
+                return grid.trunc;
+            const uint32_t x = pixel % width, y = pixel / width;
+            float step = 0.f;
+            const auto keep = [&](const uint32_t at) {
+                const float d = depth[at];
+                if (d > 0.f)
+                    step = fmaxf(step, fabsf(d - range));
+            };
+            if (x + 1 < width)
+                keep(pixel + 1);
+            if (x > 0)
+                keep(pixel - 1);
+            if (y + 1 < height)
+                keep(pixel + width);
+            if (y > 0)
+                keep(pixel - width);
+            const float band = fmaxf(grid.trunc, grid.trunc_gradient * step);
+            return grid.trunc_cap > 0.f ? fminf(band, grid.trunc_cap) : band;
+        }
+
+        __global__ void touch_kernel(const float* depth, const float* rays, const TsdfView view, const TsdfGrid grid,
+                                     const uint32_t reach, const uint64_t first_sample, const uint64_t sample_count,
+                                     uint64_t* keys) {
+            const uint32_t half_w = (view.width + 1) / 2;
+            const uint64_t local = blockIdx.x * blockDim.x + threadIdx.x;
+            if (local >= sample_count)
                 return;
+            const uint64_t i = first_sample + local;
             const uint32_t pixel = (i / half_w) * 2 * view.width + (i % half_w) * 2;
             const float d = depth[pixel];
             const float* m = view.viewmat;
             const float block_size = grid.voxel * static_cast<float>(grid.block);
-            for (int k = 0; k < 3; ++k) {
+            // Every block across the band, not only its ends: a band wider than a block would leave
+            // the blocks between the ends untouched.
+            const float band = band_at(grid, depth, pixel, view.width, view.height, d);
+            const float stride_along = fminf(block_size, band);
+            const int span = static_cast<int>(ceilf(band / stride_along));
+            const uint32_t out_stride = 2 * reach + 1;
+            for (int k = -static_cast<int>(reach); k <= static_cast<int>(reach); ++k) {
                 uint64_t key = kTsdfNoKey;
-                if (d > 0.f && (grid.max_range <= 0.f || d <= grid.max_range)) {
-                    const float along = d + static_cast<float>(k - 1) * grid.trunc;
+                if (abs(k) <= span && d > 0.f && (grid.max_range <= 0.f || d <= grid.max_range)) {
+                    const float along = d + static_cast<float>(k) * stride_along;
                     const float px = rays[3 * pixel] * along - m[3];
                     const float py = rays[3 * pixel + 1] * along - m[7];
                     const float pz = rays[3 * pixel + 2] * along - m[11];
@@ -152,7 +188,7 @@ namespace gsplat_lfs {
                                          static_cast<int>(floorf(wz / block_size)));
                     }
                 }
-                keys[3 * static_cast<uint64_t>(i) + k] = key;
+                keys[local * out_stride + static_cast<uint32_t>(k + static_cast<int>(reach))] = key;
             }
         }
 
@@ -199,6 +235,9 @@ namespace gsplat_lfs {
                 return;
             const float block_size = grid.voxel * static_cast<float>(grid.block);
             const float radius = 0.8660254f * block_size;
+            // The loosest band the grid can open: pruning by a narrower one would discard the voxels
+            // a widened band exists to fill.
+            const float band = tsdf_widest_band(grid);
             const glm::ivec3 ijk = decode_key(block_keys[b]);
             const glm::fvec3 center((static_cast<float>(ijk.x) + 0.5f) * block_size, (static_cast<float>(ijk.y) + 0.5f) * block_size,
                                     (static_cast<float>(ijk.z) + 0.5f) * block_size);
@@ -214,8 +253,8 @@ namespace gsplat_lfs {
                                     ? static_cast<float>(view.width) / 6.2831853f
                                     : fmaxf(view.fx, view.fy);
             const bool spans_tiles = focal * radius / pixel.range > static_cast<float>(kTsdfTilePixels);
-            const bool behind = !spans_tiles && seen && pixel.range - radius > block_high + grid.trunc;
-            const bool front = !spans_tiles && seen && pixel.range + radius < block_low - grid.trunc;
+            const bool behind = !spans_tiles && seen && pixel.range - radius > block_high + band;
+            const bool front = !spans_tiles && seen && pixel.range + radius < block_low - band;
             if (front)
                 carve[b] += view_weight(grid, pixel.range);
             if ((seen || spans_tiles) && !behind && !front)
@@ -245,10 +284,11 @@ namespace gsplat_lfs {
                         continue;
                     const float measured = depth[pixel.y * view.width + pixel.x];
                     const float sdf = measured - pixel.range;
-                    if (!(measured > 0.f) || !(sdf > -grid.trunc))
+                    const float band = band_at(grid, depth, pixel.y * view.width + pixel.x, view.width, view.height, measured);
+                    if (!(measured > 0.f) || !(sdf > -band))
                         continue;
                     const float w = view_weight(grid, pixel.range);
-                    sum[first + i] += w * fminf(sdf / grid.trunc, 1.f);
+                    sum[first + i] += w * fminf(sdf / band, 1.f);
                     weight[first + i] += w;
                     views[first + i] += 1;
                 }
@@ -267,60 +307,92 @@ namespace gsplat_lfs {
             return low < block_count && block_keys[low] == key ? low : kNoBlock;
         }
 
+        // Tally slots of the diagnostic path; see tsdf_collect_voxels.
+        constexpr uint32_t kTallyConsidered = 0;
+        constexpr uint32_t kTallyFewViews = 1;
+        constexpr uint32_t kTallyOutOfBand = 2;
+        constexpr uint32_t kTallyNoSignChange = 3;
+        constexpr uint32_t kTallyEmitted = 4;
+        constexpr uint32_t kTallySlots = 5;
+
         __global__ void collect_kernel(const uint64_t* block_keys, const uint32_t block_count, const uint32_t first_block, const uint32_t last_block,
                                        const TsdfGrid grid, const float* sum, const float* weight, const uint16_t* views, const float* carve,
-                                       const uint32_t min_views, uint64_t* keys, float* tsdf, uint64_t* counter) {
+                                       const uint32_t min_views, uint64_t* keys, float* tsdf, uint64_t* counter, uint64_t* reasons) {
+            // Counted per block in shared memory, so the diagnostic run stays cheap when it is on.
+            __shared__ unsigned long long tally[kTallySlots];
+            if (reasons != nullptr) {
+                if (threadIdx.x < kTallySlots)
+                    tally[threadIdx.x] = 0;
+                __syncthreads();
+            }
             const uint32_t b = first_block + blockIdx.x * blockDim.x + threadIdx.x;
-            if (b >= last_block)
-                return;
-            const glm::ivec3 ijk = decode_key(block_keys[b]);
-            const uint32_t side = grid.block;
-            const uint32_t voxels = side * side * side;
-            const auto read = [&](const uint32_t block, const uint32_t i, float& value) {
-                const uint64_t at = static_cast<uint64_t>(block) * voxels + i;
-                if (views[at] < min_views)
-                    return false;
-                value = (sum[at] + carve[block]) / fmaxf(weight[at] + carve[block], 1e-6f);
-                return fabsf(value) < 1.f;
-            };
-            // Found on first use: most blocks' voxels never look across a face.
-            uint32_t faces[6] = {kNoBlock, kNoBlock, kNoBlock, kNoBlock, kNoBlock, kNoBlock};
-            bool looked[6] = {};
-            const uint32_t stride[3] = {1, side, side * side};
-            const auto opposite = [&](const uint32_t i, const uint32_t local, const int axis, const bool up, const float value) {
-                uint32_t block = b, neighbor;
-                if (up ? local + 1 < side : local > 0) {
-                    neighbor = up ? i + stride[axis] : i - stride[axis];
-                } else {
-                    const int face = 2 * axis + (up ? 1 : 0);
-                    if (!looked[face]) {
-                        looked[face] = true;
-                        glm::ivec3 next = ijk;
-                        next[axis] += up ? 1 : -1;
-                        faces[face] = find_block(block_keys, block_count, encode_key(next.x, next.y, next.z));
+            if (b < last_block) {
+                const glm::ivec3 ijk = decode_key(block_keys[b]);
+                const uint32_t side = grid.block;
+                const uint32_t voxels = side * side * side;
+                // 0 when the value is usable, else the tally slot that rejected it.
+                const auto read = [&](const uint32_t block, const uint32_t i, float& value) {
+                    const uint64_t at = static_cast<uint64_t>(block) * voxels + i;
+                    if (views[at] < min_views)
+                        return kTallyFewViews;
+                    value = (sum[at] + carve[block]) / fmaxf(weight[at] + carve[block], 1e-6f);
+                    return fabsf(value) < 1.f ? 0u : kTallyOutOfBand;
+                };
+                // Found on first use: most blocks' voxels never look across a face.
+                uint32_t faces[6] = {kNoBlock, kNoBlock, kNoBlock, kNoBlock, kNoBlock, kNoBlock};
+                bool looked[6] = {};
+                const uint32_t stride[3] = {1, side, side * side};
+                const auto opposite = [&](const uint32_t i, const uint32_t local, const int axis, const bool up, const float value) {
+                    uint32_t block = b, neighbor;
+                    if (up ? local + 1 < side : local > 0) {
+                        neighbor = up ? i + stride[axis] : i - stride[axis];
+                    } else {
+                        const int face = 2 * axis + (up ? 1 : 0);
+                        if (!looked[face]) {
+                            looked[face] = true;
+                            glm::ivec3 next = ijk;
+                            next[axis] += up ? 1 : -1;
+                            faces[face] = find_block(block_keys, block_count, encode_key(next.x, next.y, next.z));
+                        }
+                        block = faces[face];
+                        if (block == kNoBlock)
+                            return false;
+                        neighbor = up ? i - (side - 1) * stride[axis] : i + (side - 1) * stride[axis];
                     }
-                    block = faces[face];
-                    if (block == kNoBlock)
-                        return false;
-                    neighbor = up ? i - (side - 1) * stride[axis] : i + (side - 1) * stride[axis];
+                    float other = 0.f;
+                    return read(block, neighbor, other) == 0u && (other < 0.f) != (value < 0.f);
+                };
+                for (uint32_t i = 0; i < voxels; ++i) {
+                    float value = 0.f;
+                    const uint32_t code = read(b, i, value);
+                    if (reasons != nullptr)
+                        atomicAdd(&tally[kTallyConsidered], 1ull);
+                    if (code != 0u) {
+                        if (reasons != nullptr)
+                            atomicAdd(&tally[code], 1ull);
+                        continue;
+                    }
+                    const uint32_t lx = i % side, ly = (i / side) % side, lz = i / (side * side);
+                    if (!opposite(i, lx, 0, true, value) && !opposite(i, lx, 0, false, value) && !opposite(i, ly, 1, true, value) &&
+                        !opposite(i, ly, 1, false, value) && !opposite(i, lz, 2, true, value) && !opposite(i, lz, 2, false, value)) {
+                        if (reasons != nullptr)
+                            atomicAdd(&tally[kTallyNoSignChange], 1ull);
+                        continue;
+                    }
+                    const uint64_t slot = atomicAdd(reinterpret_cast<unsigned long long*>(counter), 1ull);
+                    if (keys != nullptr) {
+                        const int side_i = static_cast<int>(side);
+                        keys[slot] = encode_key(ijk.x * side_i + static_cast<int>(lx), ijk.y * side_i + static_cast<int>(ly), ijk.z * side_i + static_cast<int>(lz));
+                        tsdf[slot] = value;
+                    }
+                    if (reasons != nullptr)
+                        atomicAdd(&tally[kTallyEmitted], 1ull);
                 }
-                float other = 0.f;
-                return read(block, neighbor, other) && (other < 0.f) != (value < 0.f);
-            };
-            for (uint32_t i = 0; i < voxels; ++i) {
-                float value = 0.f;
-                if (!read(b, i, value))
-                    continue;
-                const uint32_t lx = i % side, ly = (i / side) % side, lz = i / (side * side);
-                if (!opposite(i, lx, 0, true, value) && !opposite(i, lx, 0, false, value) && !opposite(i, ly, 1, true, value) &&
-                    !opposite(i, ly, 1, false, value) && !opposite(i, lz, 2, true, value) && !opposite(i, lz, 2, false, value))
-                    continue;
-                const uint64_t slot = atomicAdd(reinterpret_cast<unsigned long long*>(counter), 1ull);
-                if (keys != nullptr) {
-                    const int side_i = static_cast<int>(side);
-                    keys[slot] = encode_key(ijk.x * side_i + static_cast<int>(lx), ijk.y * side_i + static_cast<int>(ly), ijk.z * side_i + static_cast<int>(lz));
-                    tsdf[slot] = value;
-                }
+            }
+            if (reasons != nullptr) {
+                __syncthreads();
+                if (threadIdx.x < kTallySlots)
+                    atomicAdd(reinterpret_cast<unsigned long long*>(reasons + threadIdx.x), tally[threadIdx.x]);
             }
         }
 
@@ -358,10 +430,35 @@ namespace gsplat_lfs {
         }
     } // namespace
 
-    void tsdf_touch_keys(const float* depth, const float* rays, const TsdfView& view, const TsdfGrid& grid, uint64_t* keys, cudaStream_t stream) {
-        const uint64_t samples = static_cast<uint64_t>((view.width + 1) / 2) * ((view.height + 1) / 2);
-        touch_kernel<<<launch_blocks(samples), kThreads, 0, stream>>>(depth, rays, view, grid, keys);
+    void tsdf_touch_keys_range(const float* depth, const float* rays, const TsdfView& view, const TsdfGrid& grid,
+                               const uint32_t reach, const uint64_t first_sample, const uint64_t sample_count,
+                               uint64_t* keys, cudaStream_t stream) {
+        if (sample_count == 0)
+            return;
+        touch_kernel<<<launch_blocks(sample_count), kThreads, 0, stream>>>(depth, rays, view, grid, reach, first_sample,
+                                                                          sample_count, keys);
         LFS_CUDA_LAUNCH_CHECK(stream, "tsdf.touch");
+    }
+
+    void tsdf_touch_keys(const float* depth, const float* rays, const TsdfView& view, const TsdfGrid& grid, const uint32_t reach,
+                         uint64_t* keys, cudaStream_t stream) {
+        const uint64_t samples = static_cast<uint64_t>((view.width + 1) / 2) * ((view.height + 1) / 2);
+        tsdf_touch_keys_range(depth, rays, view, grid, reach, 0, samples, keys, stream);
+    }
+
+    size_t tsdf_sort_unique_workspace_bytes(const size_t count, cudaStream_t stream) {
+        if (count == 0)
+            return 0;
+        uint64_t* keys = nullptr;
+        uint64_t* scratch = nullptr;
+        uint64_t* counter = nullptr;
+        size_t sort_bytes = 0, unique_bytes = 0;
+        LFS_CUDA_CHECK_MSG(cub::DeviceRadixSort::SortKeys(nullptr, sort_bytes, keys, scratch, count, 0, 64, stream),
+                           "tsdf.sort_keys workspace query");
+        LFS_CUDA_CHECK_MSG(cub::DeviceSelect::Unique(nullptr, unique_bytes, scratch, keys, counter,
+                                                     static_cast<int64_t>(count), stream),
+                           "tsdf.unique_keys workspace query");
+        return sort_bytes > unique_bytes ? sort_bytes : unique_bytes;
     }
 
     size_t tsdf_sort_unique(uint64_t* keys, uint64_t* scratch, const size_t count, uint64_t* counter, cudaStream_t stream) {
@@ -417,10 +514,13 @@ namespace gsplat_lfs {
     uint64_t tsdf_collect_voxels(const uint64_t* block_keys, const uint32_t block_count, const uint32_t first_block,
                                  const uint32_t last_block, const TsdfGrid& grid,
                                  const float* sum, const float* weight, const uint16_t* views, const float* carve,
-                                 const uint32_t min_views, uint64_t* keys, float* tsdf, uint64_t* counter, cudaStream_t stream) {
+                                 const uint32_t min_views, uint64_t* keys, float* tsdf, uint64_t* counter, cudaStream_t stream,
+                                 uint64_t* reasons) {
         LFS_CUDA_CHECK_MSG(cudaMemsetAsync(counter, 0, sizeof(uint64_t), stream), "tsdf.collect clear");
+        if (reasons != nullptr)
+            LFS_CUDA_CHECK_MSG(cudaMemsetAsync(reasons, 0, kTallySlots * sizeof(uint64_t), stream), "tsdf.collect reasons clear");
         collect_kernel<<<launch_blocks(last_block - first_block), kThreads, 0, stream>>>(block_keys, block_count, first_block, last_block, grid, sum, weight, views, carve,
-                                                                                         min_views, keys, tsdf, counter);
+                                                                                         min_views, keys, tsdf, counter, reasons);
         LFS_CUDA_LAUNCH_CHECK(stream, "tsdf.collect");
         uint64_t count = 0;
         LFS_CUDA_CHECK_MSG(cudaMemcpyAsync(&count, counter, sizeof(uint64_t), cudaMemcpyDeviceToHost, stream), "tsdf.collect count");

@@ -114,17 +114,12 @@ class SplatData:
 
 def generate_collision(voxel_size: float = 0.05000000074505806, opacity: float = 0.10000000149011612, auto_resolution: bool = False, cleanup: bool = True, max_gaussian_area: float = 0.0) -> None: ...
 
-def export_collision(uuid: str, path: str) -> None: ...
-
-def generate_mesh(path: str, voxel_size: float = 0.019999999552965164, view_stride: int = 2, full_weight_range: float = 1.0, min_views: int = 3, simplify_error: float = 0.004999999888241291, max_range: float = 0.0) -> None:
+def generate_mesh(path: str, voxel_size: float = 0.0, view_stride: int = 2, full_weight_range: float = 1.0, min_views: int = 2, simplify_error: float = 0.0, trunc_gradient: float = 1.5, trunc_cap: float = 0.0, clean_topology: int = 1, clean_non_manifold: int = 1, remove_spikes: int = 1, ear_cut_holes: int = 50, spurious_edge_factor: float = 30.0, spurious_component_factor: float = 10.0, fill_hole_perimeter: float = 0.0, remove_isolated_small_components: int = 1, isolated_component_max_faces: int = 100, isolated_component_neighbor_radius: float = 10.0, max_range: float = 0.0) -> None:
     """
     Mesh the selected splat from the scene's cameras into a PLY and a new mesh node; progress is in get_collision_state, cancel with cancel_collision
     """
 
-def generate_mesh_gof(path: str, voxel_size: float = 0.019999999552965164, view_stride: int = 2, min_component_faces: int = 100) -> None:
-    """
-    Mesh the selected splat from its opacity field, into a PLY and a new mesh node; progress is in get_collision_state, cancel with cancel_collision
-    """
+def export_collision(uuid: str, path: str) -> None: ...
 
 def cancel_collision() -> None: ...
 

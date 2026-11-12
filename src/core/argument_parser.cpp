@@ -2579,15 +2579,25 @@ depth from the training cameras, fuses it into a sparse TSDF and colors the surf
 photos. A splat file needs -d. Distances are in scene units. Held-out views are not fused unless
 --all-views is given. Dataset options work as in training.
 
-  --voxel-size <v>           Voxel edge (default 0.02)
-  --truncation <v>           Band around the surface (default: 0.08 or 4 voxels, the larger)
+  --voxel-size <v>           Voxel edge; 0 derives it from the model's splat spacing (default 0, auto)
+  --truncation <v>           Band around the surface (default: 0.06 or 4 voxels, the larger)
+  --trunc-gradient <v>       Widen the band by this factor of the local depth step; 0 keeps the fixed band (default 1.5)
+  --trunc-cap <v>            Upper bound of the widened band in scene units; 0 = auto, 5x the truncation (default 0)
   --full-weight-range <v>    Views beyond this range count less, by 1/r^2; 0 = equal (default 1)
   --view-stride <n>          Fuse every Nth view (default 2)
   --color-stride <n>         Color from every Nth fused view (default 2)
-  --min-views <n>            Views a voxel needs to count as observed (default 3)
-  --min-component-faces <n>  Drop smaller connected pieces (default 100)
-  --fill-holes <v>           Close holes with a shorter rim; 0 leaves them open (default 0.3)
-  --simplify-error <v>       Reduce faces within this surface deviation; 0 keeps all (default 0.005)
+  --min-views <n>            Views a voxel needs to count as observed (default 2)
+  --fill-holes <v>           Close holes with a shorter rim, in scene units; 0 = 20x voxel (default 0, auto)
+  --simplify-error <v>       Reduce faces within this surface deviation; 0 = 0.9 voxel (default 0, auto)
+  --ear-cut-holes <n>        Ear-cut fills holes with fewer boundary edges than n; 0 = fan fill (default 0)
+  --spurious-edge-factor <v> Drop faces with any edge longer than the mesh's 95th-percentile edge
+                             times this factor; 0 disables the phase (default 30)
+  --spurious-component-factor <v>  Drop connected pieces whose bounding-box diagonal is shorter than
+                             the mesh's 55th-percentile edge times this factor; 0 disables the phase
+                             (default 5)
+  --keep-spikes              Keep vertices that hang off a single face
+  --no-topology-clean        Keep degenerate, repeated and non-manifold faces as they come
+  --no-non-manifold-clean    Skip the final lightweight non-manifold pass after the second hole fill
   --max-range <v>            Mesh only surfaces a view saw from closer than this; 0 = no limit (default 0)
   --render-width <n>         Render and photo width limit (default 1600)
   --all-views                Also fuse the held-out views
@@ -2628,6 +2638,10 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
                     settings.voxel_size = std::stof(value());
                 } else if (flag == "--truncation") {
                     settings.truncation = std::stof(value());
+                } else if (flag == "--trunc-gradient") {
+                    settings.trunc_gradient = std::stof(value());
+                } else if (flag == "--trunc-cap") {
+                    settings.trunc_cap = std::stof(value());
                 } else if (flag == "--fill-holes") {
                     settings.fill_hole_perimeter = std::stof(value());
                 } else if (flag == "--full-weight-range") {
@@ -2638,10 +2652,20 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
                     settings.color_stride = std::stoi(value());
                 } else if (flag == "--min-views") {
                     settings.min_views = std::stoi(value());
-                } else if (flag == "--min-component-faces") {
-                    settings.min_component_faces = std::stoi(value());
                 } else if (flag == "--simplify-error") {
                     settings.simplify_error = std::stof(value());
+                } else if (flag == "--ear-cut-holes") {
+                    settings.ear_cut_holes = std::stoi(value());
+                } else if (flag == "--spurious-edge-factor") {
+                    settings.spurious_edge_factor = std::max(std::stof(value()), 0.f);
+                } else if (flag == "--spurious-component-factor") {
+                    settings.spurious_component_factor = std::max(std::stof(value()), 0.f);
+                } else if (flag == "--keep-spikes") {
+                    settings.remove_spikes = false;
+                } else if (flag == "--no-topology-clean") {
+                    settings.clean_topology = false;
+                } else if (flag == "--no-non-manifold-clean") {
+                    settings.clean_non_manifold = false;
                 } else if (flag == "--max-range") {
                     settings.max_range = std::stof(value());
                 } else if (flag == "--render-width") {

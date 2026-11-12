@@ -11,7 +11,6 @@
 #include "io/loader.hpp"
 #include "py_error.hpp"
 #include "python/python_runtime.hpp"
-#include "training/splat_mesh_gof.hpp"
 #include "rendering/selection_ops.hpp"
 #include "visualizer/gui/gui_manager.hpp"
 #include "visualizer/gui_capabilities.hpp"
@@ -1485,7 +1484,7 @@ namespace lfs::python {
             const core::CollisionSettings settings{.voxel_size = size, .opacity = opacity, .max_gaussian_area = max_area,
                                                     .auto_resolution = automatic, .cleanup = cleanup};
             collision_access([&](auto& tasks, auto*) { tasks.startCollision(settings); }); }, nb::arg("voxel_size") = .05f, nb::arg("opacity") = .1f, nb::arg("auto_resolution") = false, nb::arg("cleanup") = true, nb::arg("max_gaussian_area") = 0.f);
-        m.def("generate_mesh", [collision_access](const std::string& path, float voxel_size, int view_stride, float full_weight_range, int min_views, float simplify_error, float max_range) {
+        m.def("generate_mesh", [collision_access](const std::string& path, float voxel_size, int view_stride, float full_weight_range, int min_views, float simplify_error, float trunc_gradient, float trunc_cap, int clean_topology, int clean_non_manifold, int remove_spikes, int ear_cut_holes, float spurious_edge_factor, float spurious_component_factor, float fill_hole_perimeter, int remove_isolated_small_components, int isolated_component_max_faces, float isolated_component_neighbor_radius, float max_range) {
             core::SplatMeshSettings settings;
             settings.simplify_error = simplify_error;
             settings.max_range = max_range;
@@ -1493,15 +1492,20 @@ namespace lfs::python {
             settings.view_stride = view_stride;
             settings.full_weight_range = full_weight_range;
             settings.min_views = min_views;
-            collision_access([&](auto& tasks, auto*) { tasks.startSplatMesh(settings, core::utf8_to_path(path)); }); }, nb::arg("path"), nb::arg("voxel_size") = .02f, nb::arg("view_stride") = 2, nb::arg("full_weight_range") = 1.f, nb::arg("min_views") = 3, nb::arg("simplify_error") = .005f, nb::arg("max_range") = 0.f,
+            settings.trunc_gradient = trunc_gradient;
+            settings.trunc_cap = trunc_cap;
+            settings.clean_topology = clean_topology != 0;
+            settings.clean_non_manifold = clean_non_manifold != 0;
+            settings.remove_spikes = remove_spikes != 0;
+            settings.ear_cut_holes = std::max(ear_cut_holes, 0);
+            settings.spurious_edge_factor = std::max(spurious_edge_factor, 0.f);
+            settings.spurious_component_factor = std::max(spurious_component_factor, 0.f);
+            settings.fill_hole_perimeter = std::max(fill_hole_perimeter, 0.f);
+            settings.remove_isolated_small_components = remove_isolated_small_components;
+            settings.isolated_component_max_faces = std::max(isolated_component_max_faces, 0);
+            settings.isolated_component_neighbor_radius = std::max(isolated_component_neighbor_radius, 0.f);
+            collision_access([&](auto& tasks, auto*) { tasks.startSplatMesh(settings, core::utf8_to_path(path)); }); }, nb::arg("path"), nb::arg("voxel_size") = .0f, nb::arg("view_stride") = 2, nb::arg("full_weight_range") = 1.f, nb::arg("min_views") = 2, nb::arg("simplify_error") = .0f, nb::arg("trunc_gradient") = 1.5f, nb::arg("trunc_cap") = .0f, nb::arg("clean_topology") = 1, nb::arg("clean_non_manifold") = 1, nb::arg("remove_spikes") = 1, nb::arg("ear_cut_holes") = 50, nb::arg("spurious_edge_factor") = 30.f, nb::arg("spurious_component_factor") = 10.f, nb::arg("fill_hole_perimeter") = 0.f, nb::arg("remove_isolated_small_components") = 1, nb::arg("isolated_component_max_faces") = 100, nb::arg("isolated_component_neighbor_radius") = 10.f, nb::arg("max_range") = 0.f,
               "Mesh the selected splat from the scene's cameras into a PLY and a new mesh node; progress is in get_collision_state, cancel with cancel_collision");
-        m.def("generate_mesh_gof", [collision_access](const std::string& path, float voxel_size, int view_stride, int min_component_faces) {
-            training::GofMeshSettings settings;
-            settings.voxel_size = voxel_size;
-            settings.view_stride = view_stride;
-            settings.min_component_faces = min_component_faces;
-            collision_access([&](auto& tasks, auto*) { tasks.startSplatMeshGof(settings, core::utf8_to_path(path)); }); }, nb::arg("path"), nb::arg("voxel_size") = .02f, nb::arg("view_stride") = 2, nb::arg("min_component_faces") = 100,
-              "Mesh the selected splat from its opacity field, into a PLY and a new mesh node; progress is in get_collision_state, cancel with cancel_collision");
         m.def("export_collision", [collision_access](const std::string& uuid, const std::string& path) {
             const auto parsed = core::Uuid::from_string(uuid);
             if (!parsed)

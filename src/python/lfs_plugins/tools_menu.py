@@ -63,7 +63,6 @@ class ToolsMenu:
             ),
             menu_action(tr("collision.title"), lambda: lf.ui.get_panel_object("lfs.collision").show()),
             menu_action(tr("mesh.title"), lambda: lf.ui.set_panel_enabled("lfs.mesh", True)),
-            menu_action(tr("mesh_gof.title"), lambda: lf.ui.set_panel_enabled("lfs.mesh_gof", True)),
             menu_separator(),
             menu_submenu(tr("menu.tools.developer"), developer_items),
             menu_action(

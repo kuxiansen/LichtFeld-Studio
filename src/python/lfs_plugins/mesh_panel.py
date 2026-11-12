@@ -12,23 +12,51 @@ __lfs_panel_classes__ = ["MeshPanel"]
 __lfs_panel_ids__ = ["lfs.mesh"]
 
 SPECS = {
-    "voxel_size": ScrubFieldSpec(.0001, 10, .001, "%.4g"),
+    "voxel_size": ScrubFieldSpec(0, 10, .001, "%.4g"),
     "view_stride": ScrubFieldSpec(1, 64, 1, "%.0f"),
     "full_weight_range": ScrubFieldSpec(0, 1000, .1, "%.3g"),
     "min_views": ScrubFieldSpec(1, 64, 1, "%.0f"),
     "simplify_error": ScrubFieldSpec(0, .05, .001, "%.3g"),
-    "max_range": ScrubFieldSpec(0, 1000, 1, "%.3g"),
+    "trunc_gradient": ScrubFieldSpec(0, 5, .05, "%.2f"),
+    "trunc_cap": ScrubFieldSpec(0, 2, .01, "%.2f"),
+    "clean_topology": ScrubFieldSpec(0, 1, 1, "%.0f"),
+    "clean_non_manifold": ScrubFieldSpec(0, 1, 1, "%.0f"),
+    "remove_spikes": ScrubFieldSpec(0, 1, 1, "%.0f"),
+    "spurious_edge_factor": ScrubFieldSpec(0, 100, 1, "%.0f"),
+    "spurious_component_factor": ScrubFieldSpec(0, 30, .5, "%.1f"),
+    "ear_cut_holes": ScrubFieldSpec(0, 64, 1, "%.0f"),
+    "fill_hole_perimeter": ScrubFieldSpec(0, 10, .01, "%.3g"),
+    "remove_isolated_small_components": ScrubFieldSpec(0, 1, 1, "%.0f"),
+    "isolated_component_max_faces": ScrubFieldSpec(0, 1000, 10, "%.0f"),
+    "isolated_component_neighbor_radius": ScrubFieldSpec(0, 50, 1, "%.0f"),
 }
 LABELS = {"voxel_size": "main_panel.voxel_size", "view_stride": "mesh.view_stride",
           "full_weight_range": "mesh.full_weight_range", "min_views": "mesh.min_views",
-          "simplify_error": "mesh.simplify_error", "max_range": "mesh.max_range"}
+          "simplify_error": "mesh.simplify_error", "trunc_gradient": "mesh.trunc_gradient",
+          "trunc_cap": "mesh.trunc_cap", "clean_topology": "mesh.clean_topology",
+          "clean_non_manifold": "mesh.clean_non_manifold",
+          "remove_spikes": "mesh.remove_spikes",
+          "spurious_edge_factor": "mesh.spurious_edge_factor",
+          "spurious_component_factor": "mesh.spurious_component_factor",
+          "ear_cut_holes": "mesh.ear_cut_holes",
+          "fill_hole_perimeter": "mesh.fill_hole_perimeter",
+          "remove_isolated_small_components": "mesh.remove_isolated_small_components",
+          "isolated_component_max_faces": "mesh.isolated_component_max_faces",
+          "isolated_component_neighbor_radius": "mesh.isolated_component_neighbor_radius"}
 
 
 @panel_class("mesh")
 class MeshPanel(Panel):
     def __init__(self):
         self.handle = None
-        self.values = dict(voxel_size=.02, view_stride=2, full_weight_range=1., min_views=3, simplify_error=.005, max_range=0., error="")
+        self.values = dict(voxel_size=.0, view_stride=2, full_weight_range=1., min_views=2, simplify_error=.0,
+                           trunc_gradient=1.5, trunc_cap=0., clean_topology=1, clean_non_manifold=1,
+                           remove_spikes=1,
+                           spurious_edge_factor=30., spurious_component_factor=10., ear_cut_holes=50,
+                           fill_hole_perimeter=.0,
+                           remove_isolated_small_components=1, isolated_component_max_faces=100,
+                           isolated_component_neighbor_radius=10.,
+                           error="")
         self.state = {}
         self.close_when_done = False
         self.scrubs = ScrubFieldController(
@@ -48,9 +76,18 @@ class MeshPanel(Panel):
         try:
             lf.generate_mesh(path, self.values["voxel_size"], int(self.values["view_stride"]),
                              self.values["full_weight_range"], int(self.values["min_views"]),
-                             self.values["simplify_error"], self.values["max_range"])
+                             self.values["simplify_error"], self.values["trunc_gradient"],
+                             self.values["trunc_cap"], int(self.values["clean_topology"]),
+                             int(self.values["clean_non_manifold"]), int(self.values["remove_spikes"]),
+                             int(self.values["ear_cut_holes"]),
+                             self.values["spurious_edge_factor"], self.values["spurious_component_factor"],
+                             self.values["fill_hole_perimeter"],
+                             int(self.values["remove_isolated_small_components"]),
+                             int(self.values["isolated_component_max_faces"]),
+                             self.values["isolated_component_neighbor_radius"],
+                             .0)
             self.close_when_done = True
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, TypeError, ValueError) as exc:
             key = getattr(exc, "message_key", "")
             details = getattr(exc, "message_details", "")
             self.values["error"] = (lf.ui.tr(key) + (f"\n{details}" if details else "")) if key else lf.ui.tr("selection.operation_failed_generic")

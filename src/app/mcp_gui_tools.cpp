@@ -2478,7 +2478,7 @@ namespace lfs::app {
         registry.register_tool(
             McpTool{.name = "scene.generate_mesh",
                     .description = "Mesh exactly one selected loaded splat from the scene's cameras into a PLY and a new undoable mesh node; observe collision.main",
-                    .input_schema = {.type = "object", .properties = json{{"path", {{"type", "string"}}}, {"voxel_size", {{"type", "number"}}}, {"view_stride", {{"type", "integer"}}}, {"full_weight_range", {{"type", "number"}}}, {"min_views", {{"type", "integer"}}}, {"simplify_error", {{"type", "number"}}}, {"max_range", {{"type", "number"}}}}, .required = {"path"}},
+                    .input_schema = {.type = "object", .properties = json{{"path", {{"type", "string"}}}, {"voxel_size", {{"type", "number"}, {"description", "Voxel edge in scene units; 0 derives it from the model's median splat spacing"}}}, {"view_stride", {{"type", "integer"}}}, {"full_weight_range", {{"type", "number"}}}, {"min_views", {{"type", "integer"}}}, {"simplify_error", {{"type", "number"}}}, {"trunc_gradient", {{"type", "number"}, {"description", "Widen the TSDF band by this factor of the local depth step; 0 keeps the fixed band"}}}, {"trunc_cap", {{"type", "number"}, {"description", "Upper bound of the widened band in scene units; 0 derives it as 4x the truncation"}}}, {"max_range", {{"type", "number"}}}}, .required = {"path"}},
                     .metadata = {.category = "scene", .kind = "mutation", .runtime = "gui", .thread_affinity = "gui_thread", .long_running = true, .user_visible = true}},
             [viewer, viewer_impl](const json& args) -> json {
                 return post_and_wait(viewer, [viewer_impl, args]() -> json {
@@ -2487,6 +2487,8 @@ namespace lfs::app {
                     core::SplatMeshSettings settings;
                     settings.simplify_error = args.value("simplify_error", settings.simplify_error);
                     settings.max_range = args.value("max_range", settings.max_range);
+                    settings.trunc_gradient = args.value("trunc_gradient", settings.trunc_gradient);
+                    settings.trunc_cap = args.value("trunc_cap", settings.trunc_cap);
                     settings.voxel_size = args.value("voxel_size", settings.voxel_size);
                     settings.view_stride = args.value("view_stride", settings.view_stride);
                     settings.full_weight_range = args.value("full_weight_range", settings.full_weight_range);

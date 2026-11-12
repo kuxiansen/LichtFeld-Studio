@@ -308,7 +308,7 @@ namespace {
         Device<uint64_t> keys(samples * walls.size()), scratch(samples * walls.size()), counter(1);
         for (size_t w = 0; w < walls.size(); ++w) {
             upload(walls[w]);
-            gsplat_lfs::tsdf_touch_keys(depth_d.data, rays_d.data, pinhole_at(walls[w].camera_z), grid, keys.data + w * samples, nullptr);
+            gsplat_lfs::tsdf_touch_keys(depth_d.data, rays_d.data, pinhole_at(walls[w].camera_z), grid, 1, keys.data + w * samples, nullptr);
             ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         }
         const size_t blocks = gsplat_lfs::tsdf_sort_unique(keys.data, scratch.data, samples * walls.size(), counter.data, nullptr);
@@ -383,6 +383,51 @@ TEST_F(SplatMeshGpu, ColorsLeanOnCloseViews) {
     ASSERT_EQ(cudaMemcpy(&w, weight.data, 4, cudaMemcpyDeviceToHost), cudaSuccess);
     // Weights 1 and 1/4.
     EXPECT_NEAR(s / w, .8f, .001f);
+}
+
+TEST_F(SplatMeshGpu, TouchBatchesMatchTheWholeView) {
+    const auto view = pinhole_at(-1.f);
+    constexpr uint32_t reach = 2;
+    constexpr size_t touch_stride = 2 * reach + 1;
+    const size_t samples = size_t((kSize + 1) / 2) * ((kSize + 1) / 2);
+    const size_t key_count = samples * touch_stride;
+    std::vector<float> rays(size_t(kSize) * kSize * 3), depth(size_t(kSize) * kSize);
+    for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x) {
+            const size_t pixel = y * kSize + x;
+            rays[3 * pixel] = (x + .5f - 100.f) / 200.f;
+            rays[3 * pixel + 1] = (y + .5f - 100.f) / 200.f;
+            rays[3 * pixel + 2] = 1.f;
+            depth[pixel] = 2.f + .002f * x + .003f * y + ((x / 7 + y / 11) % 9 == 0 ? .2f : 0.f);
+            if ((x + y) % 53 == 0)
+                depth[pixel] = 0.f;
+        }
+    Device<float> rays_d(rays.size()), depth_d(depth.size());
+    ASSERT_EQ(cudaMemcpy(rays_d.data, rays.data(), rays.size() * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(depth_d.data, depth.data(), depth.size() * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+    const gsplat_lfs::TsdfGrid grid{.voxel = .02f, .block = 8, .trunc = .06f, .trunc_gradient = 1.5f, .trunc_cap = .4f};
+    Device<uint64_t> whole(key_count), batched(key_count);
+    gsplat_lfs::tsdf_touch_keys(depth_d.data, rays_d.data, view, grid, reach, whole.data, nullptr);
+    for (size_t first = 0; first < samples;) {
+        const size_t count = std::min<size_t>(777, samples - first);
+        gsplat_lfs::tsdf_touch_keys_range(depth_d.data, rays_d.data, view, grid, reach, first, count,
+                                          batched.data + first * touch_stride, nullptr);
+        first += count;
+    }
+    std::vector<uint64_t> whole_raw(key_count), batched_raw(key_count);
+    ASSERT_EQ(cudaMemcpy(whole_raw.data(), whole.data, key_count * sizeof(uint64_t), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(batched_raw.data(), batched.data, key_count * sizeof(uint64_t), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(batched_raw, whole_raw);
+
+    Device<uint64_t> whole_scratch(key_count), batched_scratch(key_count), counter(1);
+    const size_t whole_count = gsplat_lfs::tsdf_sort_unique(whole.data, whole_scratch.data, key_count, counter.data, nullptr);
+    const size_t batched_count = gsplat_lfs::tsdf_sort_unique(batched.data, batched_scratch.data, key_count, counter.data, nullptr);
+    ASSERT_EQ(batched_count, whole_count);
+    whole_raw.resize(whole_count);
+    batched_raw.resize(batched_count);
+    ASSERT_EQ(cudaMemcpy(whole_raw.data(), whole.data, whole_count * sizeof(uint64_t), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(batched_raw.data(), batched.data, batched_count * sizeof(uint64_t), cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(batched_raw, whole_raw);
 }
 
 TEST_F(SplatMeshGpu, TrainedAppearanceInvertsBackToTheRender) {

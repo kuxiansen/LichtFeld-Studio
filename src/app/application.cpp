@@ -1315,7 +1315,7 @@ namespace lfs::app {
                 training::write_splat_mesh_ply(mesh, params->mesh_output);
                 bar.complete();
                 const auto& settings = *params->mesh_settings;
-                const nlohmann::json report{{"voxel_size", settings.voxel_size}, {"truncation", settings.band()},
+                const nlohmann::json report{{"voxel_size", mesh.voxel_size}, {"truncation", mesh.truncation},
                                             {"fill_hole_perimeter", settings.fill_hole_perimeter}, {"holes_filled", mesh.holes_filled},
                                             {"full_weight_range", settings.full_weight_range}, {"views", mesh.views}, {"blocks", mesh.blocks},
                                             {"band_voxels", mesh.band_voxels}, {"raw_faces", mesh.raw_faces}, {"vertices", mesh.vertices.size()},
