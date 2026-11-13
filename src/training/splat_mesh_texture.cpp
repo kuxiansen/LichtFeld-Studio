@@ -677,6 +677,50 @@ namespace lfs::training {
         return image;
     }
 
+    void sharpen_mesh_page(std::vector<uint8_t>& rgb, const int page_size, const float amount) {
+        if (!(amount > 0.f) || page_size <= 0 || rgb.size() != size_t(page_size) * size_t(page_size) * 3)
+            return;
+        constexpr float kSigma = 1.5f;
+        constexpr int kRadius = 4;
+        constexpr int kTaps = 2 * kRadius + 1;
+        constexpr int kStrip = 64;
+        float kernel[kTaps];
+        float sum = 0.f;
+        for (int i = -kRadius; i <= kRadius; ++i) {
+            kernel[i + kRadius] = std::exp(-.5f * float(i * i) / (kSigma * kSigma));
+            sum += kernel[i + kRadius];
+        }
+        for (auto& weight : kernel)
+            weight /= sum;
+        const size_t side = size_t(page_size);
+        // Horizontal blurs of the rows a strip needs, so the blurred copy never has to exist for the whole page at once.
+        std::vector<float> rows(size_t(kStrip + 2 * kRadius) * side * 3);
+        for (size_t first = 0; first < side; first += kStrip) {
+            const size_t count = std::min<size_t>(kStrip, side - first);
+            for (size_t r = 0; r < count + 2 * size_t(kRadius); ++r) {
+                const size_t y = std::clamp<ptrdiff_t>(ptrdiff_t(first) + ptrdiff_t(r) - kRadius, 0, ptrdiff_t(side) - 1);
+                const uint8_t* line = rgb.data() + y * side * 3;
+                float* out = rows.data() + r * side * 3;
+                for (size_t x = 0; x < side; ++x)
+                    for (size_t c = 0; c < 3; ++c) {
+                        float acc = 0.f;
+                        for (int k = -kRadius; k <= kRadius; ++k) {
+                            const size_t sx = std::clamp<ptrdiff_t>(ptrdiff_t(x) + k, 0, ptrdiff_t(side) - 1);
+                            acc += kernel[k + kRadius] * float(line[sx * 3 + c]);
+                        }
+                        out[x * 3 + c] = acc;
+                    }
+            }
+            for (size_t r = 0; r < count; ++r) {
+                const uint8_t* original = rgb.data() + (first + r) * side * 3;
+                const float* blurred = rows.data() + (r + kRadius) * side * 3;
+                uint8_t* out = rgb.data() + (first + r) * side * 3;
+                for (size_t i = 0; i < side * 3; ++i)
+                    out[i] = static_cast<uint8_t>(std::clamp(std::lround(float(original[i]) + amount * (float(original[i]) - blurred[i])), 0l, 255l));
+            }
+        }
+    }
+
     WeldedVertices weld_chart_seams(const SplatMesh& mesh) {
         WeldedVertices welded;
         const size_t count = mesh.vertices.size();

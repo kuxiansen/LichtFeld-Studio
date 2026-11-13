@@ -3750,6 +3750,9 @@
   "mesh.simplify_error": "Tolerancja upraszczania",
   "mesh.max_range": "Maksymalna odległość",
   "mesh.texel_size": "Rozmiar teksela",
+  "mesh.texture_size": "Rozmiar strony tekstury",
+  "mesh.texture_sharpen": "Wyostrzanie tekstury",
+  "mesh.lod_levels": "Poziomy LOD",
   "tooltip.mesh.voxel_size": "Krawędź woksela w jednostkach sceny. Mniejsze woksele zużywają więcej pamięci i dodają szum poniżej dokładności głębi.",
   "tooltip.mesh.view_stride": "Używaj co N-tej kamery. Więcej widoków wypełnia dziury i czyni powierzchnie bardziej chropowatymi.",
   "tooltip.mesh.full_weight_range": "Widoki poza tym zasięgiem liczą się mniej (1/r²), więc wygrywają bliskie. 0 oznacza równe wagi.",
@@ -3757,6 +3760,9 @@
   "tooltip.mesh.simplify_error": "Dopuszczalne odchylenie powierzchni przy redukcji ścian, w jednostkach sceny. Zachowuje więcej ścian tam, gdzie zmieniają się kolory. 0 wyznacza je z 0,9 woksela.",
   "tooltip.mesh.max_range": "Tworzy siatkę tylko z powierzchni widzianych z bliższej odległości niż ta, w jednostkach sceny. 0 oznacza brak limitu. Przydatne przy małych wokselach w dużych scenach.",
   "tooltip.mesh.texel_size": "Rozmiar piksela tekstury na powierzchni, w jednostkach sceny. Tworzy teksturę ze zdjęć i zapisuje obok pliku PLY model OSGB w kafelkach i poziomach szczegółowości dla DasViewer. 0 zachowuje tylko kolory wierzchołków.",
+  "tooltip.mesh.texture_size": "Bok strony tekstury w tekselach. Większe strony zachowują żądany rozmiar teksela na dużych kafelkach zamiast go zgrubiać; 4096 lub 8192.",
+  "tooltip.mesh.texture_sharpen": "Maska wyostrzająca stosowana do każdej strony tekstury, jak w OpenMVS: ostrzejsze krawędzie, ale wzmacnia też szum. 0 pozostawia strony bez zmian.",
+  "tooltip.mesh.lod_levels": "Poziomy szczegółowości zapisywane na kafelek, każdy poziom ma dwa razy większy teksel. 1 zapisuje tylko najdokładniejszy poziom, bez rozmycia z odległości.",
   "mesh.hint": "Wymaga kamer zbioru danych, a do tekstury także jego zdjęć.",
   "mesh.section_surface": "Powierzchnia",
   "mesh.section_texture": "Tekstura",
@@ -4043,6 +4049,6 @@
   "tooltip.mesh.ear_cut_holes": "Ear-cut first fills holes whose boundary has fewer edges than this, keeping the rim vertices and concave rims. Every hole still open afterwards, including the ones ear cutting could not close, then gets a fan around a new center vertex when its rim is shorter than the hole perimeter. 0 keeps the fan for every hole.",
   "tooltip.mesh.fill_hole_perimeter": "Wypełnia dziury, których obwód jest krótszy, w jednostkach sceny. 0 wylicza go jako 20x woksel, dzięki czemu próg podąża za szczegółowością sceny, a nie stałą odległością; dziury pozostawione przez wycinanie uszu wypełnia tu wachlarz.",
   "tooltip.mesh.remove_isolated_small_components": "Final cleanup after every topology pass: drops connected components that are both smaller than the face limit AND isolated from every other component by more than the neighbor radius. 0 disables it; default 1.",
-  "tooltip.mesh.isolated_component_max_faces": "Only components with fewer faces than this are candidates for the isolated-cluster cull. Set to 0 to disable; default 100.",
-  "tooltip.mesh.isolated_component_neighbor_radius": "Neighbor distance, in voxel widths. A small component is kept if any of its vertices sits within this distance of any vertex of a different component; default 10."
+  "tooltip.mesh.isolated_component_max_faces": "Only components with fewer faces than this are candidates for the isolated-cluster cull. Set to 0 to disable; default 150.",
+  "tooltip.mesh.isolated_component_neighbor_radius": "Neighbor distance, in voxel widths. A small component is kept if any of its vertices sits within this distance of any vertex of a different component; default 8."
 }

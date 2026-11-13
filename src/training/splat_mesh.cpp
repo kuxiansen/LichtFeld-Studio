@@ -87,7 +87,7 @@ namespace lfs::training {
         // The surface of a reduced level is within about 1.4 times its allowed error, and depth maps have their own.
         constexpr float kFaceErrorToTolerance = 2.f;
         constexpr int kOsgbMaxLevels = 4;
-        constexpr int kOsgbMaxPage = 4096;
+        constexpr int kOsgbMaxPage = 8192;
         // Sharper weights rest each vertex on fewer views and lost color on both test scenes.
         constexpr int kSimplifyThreads = 8;
         // What RAM use rises by from the end of fusion to its peak, as measured on an outdoor scene at
@@ -2517,6 +2517,128 @@ namespace lfs::training {
             // see. A fisheye sees most of a room, so leaving out the rest saves most of the reads.
             constexpr size_t kCandidates = FaceViewCandidates::kPerFace;
             constexpr float kFillsIn = .5f;
+            // Diagnostic, with LFS_MESH_TEX_DIAG=1: how much photo a face's texels really get. The ground sample
+            // distance of a view on a face is what one photo pixel covers there: range / (pixels per radian * cos),
+            // the cosine between the face normal and the view ray. Pixels per radian is f / cos^2 of the angle to the
+            // optical axis for a pinhole; an OpenCV fisheye spreads them evenly at f, bent by its distortion only.
+            // Chosen against best says whether a coarser view was taken; chosen against the texel size says whether
+            // a finer texel could add anything at all.
+            if (const char* diag = std::getenv("LFS_MESH_TEX_DIAG"); diag != nullptr && *diag != '\0') {
+                struct Lens {
+                    std::array<float, 16> world_to_camera{}; // row major, from the world
+                    std::array<float, 3> center{};           // the camera's own position in the world
+                    float focal = 0.f;                       // pixels, the coarser axis
+                    bool fisheye = false;
+                    float radial[4] = {};                    // k1..k4, the fisheye polynomial's
+                };
+                std::vector<Lens> lenses(views.size());
+                for (size_t i = 0; i < views.size(); ++i) {
+                    if (!views[i]->has_image())
+                        continue;
+                    const auto view = make_view(*views[i]);
+                    Lens& lens = lenses[i];
+                    std::copy(std::begin(view.viewmat), std::end(view.viewmat), lens.world_to_camera.begin());
+                    const float* m = view.viewmat; // its transpose rotates a direction back to the world
+                    lens.center = {-(m[0] * m[3] + m[4] * m[7] + m[8] * m[11]),
+                                   -(m[1] * m[3] + m[5] * m[7] + m[9] * m[11]),
+                                   -(m[2] * m[3] + m[6] * m[7] + m[10] * m[11])};
+                    lens.focal = std::min(view.fx, view.fy);
+                    lens.fisheye = view.model == CameraModelType::FISHEYE || view.model == CameraModelType::THIN_PRISM_FISHEYE;
+                    std::copy(std::begin(view.radial), std::begin(view.radial) + 4, lens.radial);
+                }
+                // Area weighted, in halvings: a few bins answer quantiles without sorting.
+                struct Bins {
+                    double lo = 0., hi = 1., total = 0.;
+                    std::array<double, 48> weight{};
+                    void add(const double value, const double w) {
+                        const double where = std::clamp((std::log2(std::max(value, 1e-9)) - lo) / (hi - lo), 0., .9999);
+                        weight[size_t(where * double(weight.size()))] += w;
+                        total += w;
+                    }
+                    [[nodiscard]] double at(const double q) const {
+                        double seen = 0.;
+                        for (size_t b = 0; b < weight.size(); ++b) {
+                            seen += weight[b];
+                            if (seen >= q * total)
+                                return std::exp2(lo + (hi - lo) * (double(b) + .5) / double(weight.size()));
+                        }
+                        return std::exp2(hi);
+                    }
+                };
+                Bins best_gsd{.lo = -11., .hi = -3.}, chosen_gsd{.lo = -11., .hi = -3.};
+                Bins coarser{.lo = 0., .hi = 1.}, texels_per_pixel{.lo = -3., .hi = 3.};
+                double area = 0., area_unseen = 0., area_unlabeled = 0., area_off_20 = 0., area_off_50 = 0., area_upsampled = 0.;
+                const auto count = size_t(face_count);
+                for (size_t f = 0; f < count; ++f) {
+                    const auto& a = mesh.vertices[size_t(mesh.faces[f][0])];
+                    const auto& b = mesh.vertices[size_t(mesh.faces[f][1])];
+                    const auto& c = mesh.vertices[size_t(mesh.faces[f][2])];
+                    const double u[3] = {double(b[0]) - a[0], double(b[1]) - a[1], double(b[2]) - a[2]};
+                    const double v[3] = {double(c[0]) - a[0], double(c[1]) - a[1], double(c[2]) - a[2]};
+                    const double n[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+                    const double twice = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                    if (!(twice > 0.))
+                        continue;
+                    const double face_area = .5 * twice;
+                    const float middle[3] = {(a[0] + b[0] + c[0]) / 3.f, (a[1] + b[1] + c[1]) / 3.f, (a[2] + b[2] + c[2]) / 3.f};
+                    double best = INFINITY, picked = 0.;
+                    for (size_t slot = 0; slot < kCandidates && candidates.scores[f * kCandidates + slot] > 0.f; ++slot) {
+                        const auto index = size_t(candidates.views[f * kCandidates + slot]);
+                        const auto& lens = lenses[index];
+                        if (!(lens.focal > 0.f))
+                            continue;
+                        const auto& center = lens.center;
+                        const double ray[3] = {middle[0] - center[0], middle[1] - center[1], middle[2] - center[2]};
+                        const double range = std::sqrt(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
+                        if (!(range > 1e-3))
+                            continue;
+                        // How squarely the surface meets the ray, and how far off the lens axis the ray is.
+                        const double cosine = std::abs(n[0] * ray[0] + n[1] * ray[1] + n[2] * ray[2]) / (twice * range);
+                        if (cosine < .2) // past 78 degrees the footprint says nothing about detail
+                            continue;
+                        const float* m = lens.world_to_camera.data();
+                        const double axis_angle = std::atan2(std::hypot(m[0] * middle[0] + m[1] * middle[1] + m[2] * middle[2] + m[3],
+                                                                       m[4] * middle[0] + m[5] * middle[1] + m[6] * middle[2] + m[7]),
+                                                             double(m[8] * middle[0] + m[9] * middle[1] + m[10] * middle[2] + m[11]));
+                        const double square = axis_angle * axis_angle;
+                        // d(radius) / d(angle), in pixels per radian: the fisheye polynomial's slope, or the
+                        // pinhole's tangent that stretches with the square of the angle.
+                        const double per_radian = lens.fisheye
+                            ? double(lens.focal) * (1. + square * (3. * lens.radial[0] + square * (5. * lens.radial[1] + square * (7. * lens.radial[2] + 9. * square * lens.radial[3]))))
+                            : double(lens.focal) / (std::cos(axis_angle) * std::cos(axis_angle));
+                        const double gsd = range / (per_radian * cosine);
+                        best = std::min(best, gsd);
+                        if (static_cast<int32_t>(index) == face_views[f])
+                            picked = gsd;
+                    }
+                    area += face_area;
+                    if (!(best < INFINITY)) {
+                        area_unseen += face_area;
+                        continue;
+                    }
+                    if (!(picked > 0.)) {
+                        area_unlabeled += face_area;
+                        continue;
+                    }
+                    best_gsd.add(best, face_area);
+                    chosen_gsd.add(picked, face_area);
+                    coarser.add(picked / best, face_area);
+                    texels_per_pixel.add(double(settings.texel_size) / picked, face_area);
+                    area_off_20 += picked > 1.2 * best ? face_area : 0.;
+                    area_off_50 += picked > 1.5 * best ? face_area : 0.;
+                    area_upsampled += picked > double(settings.texel_size) ? face_area : 0.;
+                }
+                const auto share = [&](const double part) { return area > 0. ? 100. * part / area : 0.; };
+                LOG_INFO("Mesh texture diagnostic, texel {:.4g} m over {} faces:", settings.texel_size, count);
+                LOG_INFO("  ground sample distance p10/p50/p90: best {:.2f}/{:.2f}/{:.2f} mm, chosen {:.2f}/{:.2f}/{:.2f} mm",
+                         1000. * best_gsd.at(.1), 1000. * best_gsd.at(.5), 1000. * best_gsd.at(.9),
+                         1000. * chosen_gsd.at(.1), 1000. * chosen_gsd.at(.5), 1000. * chosen_gsd.at(.9));
+                LOG_INFO("  chosen / best p10/p50/p90 {:.2f}/{:.2f}/{:.2f}; coarser than 1.2x on {:.1f}% of the area, than 1.5x on {:.1f}%",
+                         coarser.at(.1), coarser.at(.5), coarser.at(.9), share(area_off_20), share(area_off_50));
+                LOG_INFO("  photo pixels per texel p10/p50/p90 {:.2f}/{:.2f}/{:.2f}; chosen coarser than the texel on {:.1f}% of the area, where a finer texel gains nothing",
+                         texels_per_pixel.at(.1), texels_per_pixel.at(.5), texels_per_pixel.at(.9), share(area_upsampled));
+                LOG_INFO("  no usable view {:.1f}%, chosen view too oblique or missing {:.1f}%", share(area_unseen), share(area_unlabeled));
+            }
             size_t batch_views_total = 0;
             for (auto& batch : batches) {
                 for (size_t f = mesh.page_first_face[batch.first_page]; f < mesh.page_first_face[batch.last_page]; ++f) {
@@ -2708,7 +2830,10 @@ namespace lfs::training {
                                 colors[3 * t + c] = std::max((direct ? 0.f : sums[3 * at + c] / sum_weights[at]) + highs[3 * at + c] + level[c], 0.f);
                         }
                         seen_here += seen_page;
-                        mesh.pages[batch.first_page + p] = compose_mesh_page(texels[p], colors, mesh.page_side(batch.first_page + p));
+                        const int side = mesh.page_side(batch.first_page + p);
+                        auto image = compose_mesh_page(texels[p], colors, side);
+                        sharpen_mesh_page(image, side, settings.texture_sharpen);
+                        mesh.pages[batch.first_page + p] = std::move(image);
                         texels[p] = {};
                     });
                     first = last;
@@ -3097,7 +3222,8 @@ namespace lfs::training {
             texture_ram_preflight(mesh, settings);
             step = Clock::now();
             core::reportProgress(stop, progress, .5f, stage("mesh.stage_unwrap", "Unwrapping"));
-            mesh.tiled = std::make_shared<TiledMesh>(build_tiled_mesh(mesh, settings.texel_size, std::min(settings.texture_size, kOsgbMaxPage), kOsgbMaxLevels, settings.simplify_error, stop));
+            const int levels = std::clamp(resolved.lod_levels, 1, kOsgbMaxLevels);
+            mesh.tiled = std::make_shared<TiledMesh>(build_tiled_mesh(mesh, resolved.texel_size, std::min(resolved.texture_size, kOsgbMaxPage), levels, resolved.simplify_error, stop));
             mesh.seconds_unwrap = seconds_since(step);
             step = Clock::now();
             std::vector<core::Camera*> all_views;
@@ -3113,7 +3239,7 @@ namespace lfs::training {
                 else
                     page_groups.back().second = last;
             }
-            bake_texture(mesh.tiled->combined, model, all_views, settings, stream, [&](const float value) { core::reportProgress(stop, progress, .6f + .4f * value, stage("mesh.stage_bake", "Baking texture")); }, appearance, page_groups);
+            bake_texture(mesh.tiled->combined, model, all_views, resolved, stream, [&](const float value) { core::reportProgress(stop, progress, .6f + .4f * value, stage("mesh.stage_bake", "Baking texture")); }, appearance, page_groups);
             mesh.seconds_bake = seconds_since(step);
             mesh.charts = mesh.tiled->combined.charts;
             mesh.texels = mesh.tiled->combined.texels;

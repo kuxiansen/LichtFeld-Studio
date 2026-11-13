@@ -3750,6 +3750,9 @@
   "mesh.simplify_error": "简化容差",
   "mesh.max_range": "最大距离",
   "mesh.texel_size": "贴图像素大小",
+  "mesh.texture_size": "贴图页尺寸",
+  "mesh.texture_sharpen": "贴图锐化",
+  "mesh.lod_levels": "LOD 层数",
   "tooltip.mesh.voxel_size": "体素边长，单位为场景单位。体素越小越占内存，小于深度精度后只会增加噪声。",
   "tooltip.mesh.view_stride": "每 N 个相机取一个。视角越多，空洞越少，表面也越粗糙。",
   "tooltip.mesh.full_weight_range": "超过此距离（场景单位）的视角按 1/r² 降低权重，让近处视角优先。0 表示所有视角等权。",
@@ -3757,6 +3760,9 @@
   "tooltip.mesh.simplify_error": "减面时允许的表面偏差（场景单位）。颜色变化处会保留更多面。0 表示自动，取 0.9 倍体素大小。",
   "tooltip.mesh.max_range": "只为有视角在此距离内（场景单位）看到的表面生成网格。0 表示不限。大场景使用细体素时建议设置。",
   "tooltip.mesh.texel_size": "贴图一个像素在表面上的大小（场景单位）。从照片烘焙贴图，并在 PLY 旁写出供 DasViewer 打开的分块多层细节 OSGB 模型。0 表示只保留顶点色。",
+  "tooltip.mesh.texture_size": "一张贴图页的边长（texel）。页越大，大瓦片上越能保持设定的 texel 大小而不会被自动变粗；常用 4096 或 8192。",
+  "tooltip.mesh.texture_sharpen": "对每张贴图页施加 unsharp mask，与 OpenMVS 一致：边缘更锐，但也会放大噪声。0 表示不处理。",
+  "tooltip.mesh.lod_levels": "每个瓦片写出的细节层数，每层 texel 大小翻倍。1 表示只写最细一层，不产生远距离的降采样模糊。",
   "mesh.hint": "需要数据集的相机；烘焙贴图还需要照片。",
   "mesh.section_surface": "表面",
   "mesh.section_texture": "贴图",
@@ -4043,6 +4049,6 @@
   "tooltip.mesh.ear_cut_holes": "与 OpenMVS 一致：边界边数小于该值的洞先用耳切法填充，保留原有边界顶点并贴合凹形洞沿；之后所有仍开着的洞（包括耳切未能封闭的洞）在周长小于补洞周长时再用中心扇形填充。0 表示全部使用扇形填充。",
   "tooltip.mesh.fill_hole_perimeter": "周长小于该值的洞会被填充，单位为场景单位。0 表示自动取 20 倍体素大小，让阈值随场景分辨率自适应，而不是固定一个距离；耳切未能封闭的洞也由扇形在这一步兜底。",
   "tooltip.mesh.remove_isolated_small_components": "Final cleanup after every topology pass: drops connected components that are both smaller than the face limit AND isolated from every other component by more than the neighbor radius. 0 disables it; default 1.",
-  "tooltip.mesh.isolated_component_max_faces": "Only components with fewer faces than this are candidates for the isolated-cluster cull. Set to 0 to disable; default 100.",
-  "tooltip.mesh.isolated_component_neighbor_radius": "Neighbor distance, in voxel widths. A small component is kept if any of its vertices sits within this distance of any vertex of a different component; default 10."
+  "tooltip.mesh.isolated_component_max_faces": "Only components with fewer faces than this are candidates for the isolated-cluster cull. Set to 0 to disable; default 150.",
+  "tooltip.mesh.isolated_component_neighbor_radius": "Neighbor distance, in voxel widths. A small component is kept if any of its vertices sits within this distance of any vertex of a different component; default 8."
 }

@@ -2641,7 +2641,7 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
 
   --voxel-size <v>           Voxel edge; 0 derives it from the model's splat spacing (default 0, auto)
   --truncation <v>           Band around the surface (default: 0.06 or 4 voxels, the larger)
-  --trunc-gradient <v>       Widen the band by this factor of the local depth step; 0 keeps the fixed band (default 1.5)
+  --trunc-gradient <v>       Widen the band by this factor of the local depth step; 0 keeps the fixed band (default 1.25)
   --trunc-cap <v>            Upper bound of the widened band in scene units; 0 = auto, 5x the truncation (default 0)
   --full-weight-range <v>    Views beyond this range count less, by 1/r^2; 0 = equal (default 1)
   --view-stride <n>          Fuse every Nth view (default 2)
@@ -2663,6 +2663,8 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
   --texel-size <v>           Bake a texture with texels of this size, and write <output>_osgb beside the PLY: an OSGB
                              model of tiles with levels of detail; 0 = vertex colors only (default 0)
   --texture-size <n>         Side of a texture page (default 4096)
+  --texture-sharpen <v>      Unsharp mask amount applied to every texture page before writing; 0 keeps it off (default 0.5)
+  --lod-levels <n>           Levels of detail per OSGB tile, 1 writes the finest level only (default 4)
   --texture-width <n>        Render and photo width limit when baking; 0 = the photos' own (default 0)
   --all-views                Also fuse the held-out views
   --from-mesh <mesh.ply>     Bake this mesh, made earlier or edited since, instead of extracting one; needs a texel size.
@@ -2740,6 +2742,10 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
                     settings.texel_size = std::stof(value());
                 } else if (flag == "--texture-size") {
                     settings.texture_size = std::stoi(value());
+                } else if (flag == "--texture-sharpen") {
+                    settings.texture_sharpen = std::clamp(std::stof(value()), 0.f, 5.f);
+                } else if (flag == "--lod-levels") {
+                    settings.lod_levels = std::clamp(std::stoi(value()), 1, 4);
                 } else if (flag == "--texture-width") {
                     settings.texture_width = std::stoi(value());
                 } else if (flag == "--osgb") {

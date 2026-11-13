@@ -14,7 +14,7 @@ namespace lfs::core {
         float truncation = 0.f;        // band around the surface; narrower than the depth spread opens holes. 0 = automatic
         // Widens the band where neighbouring pixels of a depth map disagree: band = max(trunc,
         // trunc_gradient * local depth step), capped at trunc_cap. 0 keeps trunc everywhere.
-        float trunc_gradient = 1.5f;
+        float trunc_gradient = 1.25f;
         float trunc_cap = 0.f;         // 0 derives the cap as 5x the truncation, so it scales with the voxel
         float full_weight_range = 1.f; // views beyond this range count less, by 1/r^2; 0 = equal weights
         int view_stride = 2;           // fuse every Nth view
@@ -48,12 +48,16 @@ namespace lfs::core {
         // more than isolated_component_neighbor_radius voxel widths. Components that stay near the
         // main mesh are left alone — they are likely real patches that just failed to fuse.
         int remove_isolated_small_components = 1;
-        int isolated_component_max_faces = 100;
-        float isolated_component_neighbor_radius = 10.f;
+        int isolated_component_max_faces = 150;
+        float isolated_component_neighbor_radius = 8.f;
         float max_range = 0.f;         // surfaces no view saw from closer are not meshed; 0 = no limit
         int max_width = 1600;          // render and photo width limit
         float texel_size = 0.f;        // size of a texel on the surface, for an OSGB model beside the PLY; 0 = vertex colors only
         int texture_size = 4096;       // side of a texture page
+        // Unsharp mask applied to every page before it is written, as OpenMVS does: out = in + amount * (in - blur).
+        // It restores the edge contrast that resampling and JPEG give up; 0 writes the pages untouched.
+        float texture_sharpen = .5f;
+        int lod_levels = 4;            // levels of detail per OSGB tile; 1 writes the finest level only
         int texture_width = 0;         // render and photo width limit when baking; 0 = the photos' own
         std::string from_mesh;         // a PLY to bake instead of extracting the surface, UTF-8
         bool invert_mask = false;

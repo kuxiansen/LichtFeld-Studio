@@ -3750,6 +3750,9 @@
   "mesh.simplify_error": "단순화 허용 오차",
   "mesh.max_range": "최대 거리",
   "mesh.texel_size": "텍셀 크기",
+  "mesh.texture_size": "텍스처 페이지 크기",
+  "mesh.texture_sharpen": "텍스처 선명화",
+  "mesh.lod_levels": "LOD 레벨",
   "tooltip.mesh.voxel_size": "복셀 변 길이(씬 단위). 작을수록 메모리를 더 쓰고, 깊이 정밀도보다 작아지면 노이즈만 늘어납니다.",
   "tooltip.mesh.view_stride": "카메라를 N개마다 사용합니다. 뷰가 많을수록 구멍은 메워지고 표면은 거칠어집니다.",
   "tooltip.mesh.full_weight_range": "이 거리를 넘는 뷰는 1/r²로 가중치가 줄어 가까운 뷰가 우선합니다. 0이면 모든 뷰가 같은 가중치입니다.",
@@ -3757,6 +3760,9 @@
   "tooltip.mesh.simplify_error": "면을 줄일 때 허용하는 표면 편차(장면 단위)입니다. 색이 바뀌는 곳에는 면을 더 많이 남깁니다. 0이면 0.9복셀 크기로 자동 결정합니다.",
   "tooltip.mesh.max_range": "이 거리(장면 단위)보다 가까운 뷰에서 본 표면만 메시로 만듭니다. 0이면 제한이 없습니다. 큰 장면에서 작은 복셀을 쓸 때 사용합니다.",
   "tooltip.mesh.texel_size": "표면에서 텍스처 한 픽셀의 크기(장면 단위)입니다. 사진에서 텍스처를 베이크하고 PLY 옆에 DasViewer용 타일과 상세 수준을 가진 OSGB 모델을 씁니다. 0이면 정점 색상만 유지합니다.",
+  "tooltip.mesh.texture_size": "텍스처 페이지 한 변의 텍셀 수입니다. 페이지가 클수록 큰 타일에서도 지정한 텍셀 크기를 유지합니다(4096 또는 8192).",
+  "tooltip.mesh.texture_sharpen": "OpenMVS처럼 각 텍스처 페이지에 적용하는 언샤프 마스크입니다. 윤곽은 선명해지지만 노이즈도 강조됩니다. 0이면 그대로 둡니다.",
+  "tooltip.mesh.lod_levels": "타일당 기록하는 상세 수준 수입니다. 각 수준은 텍셀 크기가 2배가 됩니다. 1이면 가장 세밀한 수준만 기록하며 거리 흐림이 없습니다.",
   "mesh.hint": "데이터셋의 카메라가 필요하며, 텍스처에는 사진도 필요합니다.",
   "mesh.section_surface": "표면",
   "mesh.section_texture": "텍스처",
@@ -4043,6 +4049,6 @@
   "tooltip.mesh.ear_cut_holes": "Ear-cut first fills holes whose boundary has fewer edges than this, keeping the rim vertices and concave rims. Every hole still open afterwards, including the ones ear cutting could not close, then gets a fan around a new center vertex when its rim is shorter than the hole perimeter. 0 keeps the fan for every hole.",
   "tooltip.mesh.fill_hole_perimeter": "둘레가 이보다 짧은 구멍을 채웁니다(씬 단위). 0이면 복셀의 20배로 자동 계산되어 고정 거리가 아니라 씬의 세밀도에 맞춰집니다. 귀 자르기로 닫히지 않은 구멍은 여기서 부채꼴로 채워집니다.",
   "tooltip.mesh.remove_isolated_small_components": "Final cleanup after every topology pass: drops connected components that are both smaller than the face limit AND isolated from every other component by more than the neighbor radius. 0 disables it; default 1.",
-  "tooltip.mesh.isolated_component_max_faces": "Only components with fewer faces than this are candidates for the isolated-cluster cull. Set to 0 to disable; default 100.",
-  "tooltip.mesh.isolated_component_neighbor_radius": "Neighbor distance, in voxel widths. A small component is kept if any of its vertices sits within this distance of any vertex of a different component; default 10."
+  "tooltip.mesh.isolated_component_max_faces": "Only components with fewer faces than this are candidates for the isolated-cluster cull. Set to 0 to disable; default 150.",
+  "tooltip.mesh.isolated_component_neighbor_radius": "Neighbor distance, in voxel widths. A small component is kept if any of its vertices sits within this distance of any vertex of a different component; default 8."
 }

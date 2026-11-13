@@ -3750,6 +3750,9 @@
   "mesh.simplify_error": "Tolerancia de simplificación",
   "mesh.max_range": "Distancia máxima",
   "mesh.texel_size": "Tamaño de téxel",
+  "mesh.texture_size": "Tamaño de página de textura",
+  "mesh.texture_sharpen": "Nitidez de textura",
+  "mesh.lod_levels": "Niveles de LOD",
   "tooltip.mesh.voxel_size": "Arista del vóxel en unidades de escena. Los vóxeles pequeños usan más memoria y añaden ruido al superar la precisión de la profundidad.",
   "tooltip.mesh.view_stride": "Usa una de cada N cámaras. Más vistas rellenan huecos y hacen las superficies más rugosas.",
   "tooltip.mesh.full_weight_range": "Las vistas más allá de esta distancia cuentan menos (1/r²), de modo que ganan las cercanas. 0 las pondera por igual.",
@@ -3757,6 +3760,9 @@
   "tooltip.mesh.simplify_error": "Desviación de la superficie permitida al reducir caras, en unidades de escena. Conserva más caras donde cambian los colores. 0 lo deriva de 0,9 vóxeles.",
   "tooltip.mesh.max_range": "Solo genera malla de las superficies que una vista vio desde más cerca que esto, en unidades de escena. 0 no tiene límite. Útil con vóxeles finos en escenas grandes.",
   "tooltip.mesh.texel_size": "Tamaño de un píxel de textura en la superficie, en unidades de escena. Genera una textura a partir de las fotos y escribe junto al PLY un modelo OSGB en bloques y niveles de detalle para DasViewer. 0 conserva solo los colores de vértice.",
+  "tooltip.mesh.texture_size": "Lado de una página de textura en téxeles. Las páginas grandes mantienen el tamaño de téxel pedido en bloques grandes en vez de engrosarlo; 4096 u 8192.",
+  "tooltip.mesh.texture_sharpen": "Máscara de enfoque aplicada a cada página de textura, como en OpenMVS: bordes más nítidos, pero también amplifica el ruido. 0 deja las páginas intactas.",
+  "tooltip.mesh.lod_levels": "Niveles de detalle por bloque, cada nivel con el doble de tamaño de téxel. 1 escribe solo el nivel más fino, sin desenfoque por distancia.",
   "mesh.hint": "Necesita las cámaras del conjunto de datos y, para una textura, sus fotos.",
   "mesh.section_surface": "Superficie",
   "mesh.section_texture": "Textura",
@@ -4043,6 +4049,6 @@
   "tooltip.mesh.ear_cut_holes": "Ear-cut first fills holes whose boundary has fewer edges than this, keeping the rim vertices and concave rims. Every hole still open afterwards, including the ones ear cutting could not close, then gets a fan around a new center vertex when its rim is shorter than the hole perimeter. 0 keeps the fan for every hole.",
   "tooltip.mesh.fill_hole_perimeter": "Rellena los huecos cuyo borde sea más corto, en unidades de escena. 0 lo deriva como 20x el vóxel, así el umbral sigue el detalle de la escena en lugar de una distancia fija; los huecos que el recorte de orejas dejó abiertos se rellenan aquí con abanico.",
   "tooltip.mesh.remove_isolated_small_components": "Final cleanup after every topology pass: drops connected components that are both smaller than the face limit AND isolated from every other component by more than the neighbor radius. 0 disables it; default 1.",
-  "tooltip.mesh.isolated_component_max_faces": "Only components with fewer faces than this are candidates for the isolated-cluster cull. Set to 0 to disable; default 100.",
-  "tooltip.mesh.isolated_component_neighbor_radius": "Neighbor distance, in voxel widths. A small component is kept if any of its vertices sits within this distance of any vertex of a different component; default 10."
+  "tooltip.mesh.isolated_component_max_faces": "Only components with fewer faces than this are candidates for the isolated-cluster cull. Set to 0 to disable; default 150.",
+  "tooltip.mesh.isolated_component_neighbor_radius": "Neighbor distance, in voxel widths. A small component is kept if any of its vertices sits within this distance of any vertex of a different component; default 8."
 }

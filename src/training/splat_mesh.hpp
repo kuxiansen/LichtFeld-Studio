@@ -171,6 +171,9 @@ namespace lfs::training {
     // of the page filled outward from the charts, so that filtering and compression reach no background.
     [[nodiscard]] std::vector<uint8_t> compose_mesh_page(const MeshTexels& texels, const std::vector<float>& colors, int page_size);
 
+    // Unsharp mask on a composed page: out = in + amount * (in - gaussian(in, sigma 1.5)). amount 0 leaves it untouched.
+    void sharpen_mesh_page(std::vector<uint8_t>& rgb, int page_size, float amount);
+
     // Undoes the repetition of vertices along chart seams: which merged vertex each vertex is, and one original of each
     // merged vertex. Geometry stays connected across seams, so a viewer that computes its own normals shades it whole.
     struct WeldedVertices {
