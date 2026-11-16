@@ -29,6 +29,24 @@
 
     <div class="ep-section">
       <span class="ep-section-title text-accent">@tr:mesh.section_texture</span>
+      <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.texture_mode">
+        <span class="setting-row__label-col">@tr:mesh.texture_mode</span>
+        <div class="setting-row__control-col setting-row__control-col--fill">
+          <select data-value="mesh_texture_mode">
+            <option value="0">@tr:mesh.texture_mode.xatlas</option>
+            <option value="1">@tr:mesh.texture_mode.affine</option>
+          </select>
+        </div>
+      </div>
+      <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.seam_leveling">
+        <span class="setting-row__label-col">@tr:mesh.seam_leveling</span>
+        <div class="setting-row__control-col setting-row__control-col--fill">
+          <select data-value="mesh_seam_leveling">
+            <option value="0">@tr:mesh.seam_leveling.vertex</option>
+            <option value="1">@tr:mesh.seam_leveling.local</option>
+          </select>
+        </div>
+      </div>
       <div id="mesh-texture-fields"></div>
     </div>
     <div class="separator"></div>

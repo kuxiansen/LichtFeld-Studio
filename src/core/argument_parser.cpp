@@ -2665,6 +2665,9 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
   --texture-size <n>         Side of a texture page (default 4096)
   --texture-sharpen <v>      Unsharp mask amount applied to every texture page before writing; 0 keeps it off (default 0.5)
   --lod-levels <n>           Levels of detail per OSGB tile, 1 writes the finest level only (default 4)
+  --texture-mode <n>         Texture page layout: 0 = xatlas atlas (default), 1 = affine patches, one photo each
+  --texel-min <v>            Affine patches only: smallest texel allowed where photos are coarser; 0 = 1 mm (default 0)
+  --seam-leveling <n>        Seam color reconciliation: 0 = per-vertex offsets (default), 1 = OpenMVS local seam leveling
   --texture-width <n>        Render and photo width limit when baking; 0 = the photos' own (default 0)
   --all-views                Also fuse the held-out views
   --from-mesh <mesh.ply>     Bake this mesh, made earlier or edited since, instead of extracting one; needs a texel size.
@@ -2746,6 +2749,12 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
                     settings.texture_sharpen = std::clamp(std::stof(value()), 0.f, 5.f);
                 } else if (flag == "--lod-levels") {
                     settings.lod_levels = std::clamp(std::stoi(value()), 1, 4);
+                } else if (flag == "--texture-mode") {
+                    settings.texture_mode = std::clamp(std::stoi(value()), 0, 1);
+                } else if (flag == "--texel-min") {
+                    settings.texel_min = std::max(std::stof(value()), 0.f);
+                } else if (flag == "--seam-leveling") {
+                    settings.seam_leveling_mode = std::clamp(std::stoi(value()), 0, 1);
                 } else if (flag == "--texture-width") {
                     settings.texture_width = std::stoi(value());
                 } else if (flag == "--osgb") {

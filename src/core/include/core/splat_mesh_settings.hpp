@@ -58,6 +58,15 @@ namespace lfs::core {
         // It restores the edge contrast that resampling and JPEG give up; 0 writes the pages untouched.
         float texture_sharpen = .5f;
         int lod_levels = 4;            // levels of detail per OSGB tile; 1 writes the finest level only
+        // 0 = xatlas charts packed onto pages, as before; 1 = affine patches, each baked from a single
+        // photo at that photo's own pixel density. Both are kept so the two can be compared.
+        int texture_mode = 0;
+        // With affine patches: the smallest texel allowed when the photos are coarser than the requested
+        // texel size, in scene units. 0 = 1 mm.
+        float texel_min = .0f;
+        // How colors are reconciled across seams: 0 = per-vertex offsets, as before; 1 = OpenMVS's local
+        // seam leveling along patch borders.
+        int seam_leveling_mode = 0;
         int texture_width = 0;         // render and photo width limit when baking; 0 = the photos' own
         std::string from_mesh;         // a PLY to bake instead of extracting the surface, UTF-8
         bool invert_mask = false;

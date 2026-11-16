@@ -174,7 +174,9 @@ namespace lfs::training {
                             std::isfinite(s.spurious_component_factor) && s.spurious_component_factor >= 0 &&
                             s.remove_isolated_small_components >= 0 && s.isolated_component_max_faces >= 0 &&
                             std::isfinite(s.isolated_component_neighbor_radius) && s.isolated_component_neighbor_radius >= 0.f &&
-                            std::isfinite(s.texel_size) && s.texel_size >= 0 && (s.from_mesh.empty() || s.texel_size > 0) && s.texture_size >= 64 && s.texture_size <= 16384 && s.texture_width >= 0 && (s.texture_width == 0 || s.texture_width >= 16);
+                            std::isfinite(s.texel_size) && s.texel_size >= 0 && (s.from_mesh.empty() || s.texel_size > 0) && s.texture_size >= 64 && s.texture_size <= 16384 && s.texture_width >= 0 && (s.texture_width == 0 || s.texture_width >= 16) &&
+                            s.texture_mode >= 0 && s.texture_mode <= 1 && std::isfinite(s.texel_min) && s.texel_min >= 0 &&
+                            s.seam_leveling_mode >= 0 && s.seam_leveling_mode <= 1;
             if (!ok)
                 throw collisionError("mesh.settings_invalid", "Invalid mesh settings", ErrorCode::InvalidArgument,
                                      std::format("{}; {}", s.voxel_size, s.truncation));
@@ -3219,6 +3221,10 @@ namespace lfs::training {
         }
         auto step = Clock::now();
         if (settings.texel_size > 0.f) {
+            // Two texturing paths, kept side by side for comparison. Only the atlas one is wired up so far;
+            // the affine patch path takes over here once its builder lands.
+            if (resolved.texture_mode != 0)
+                LOG_WARN("Mesh: texture mode {} is not built yet; baking with the xatlas atlas", resolved.texture_mode);
             texture_ram_preflight(mesh, settings);
             step = Clock::now();
             core::reportProgress(stop, progress, .5f, stage("mesh.stage_unwrap", "Unwrapping"));
