@@ -80,77 +80,90 @@ namespace lfs::training {
             const auto power = std::bit_ceil(static_cast<uint32_t>(std::max(side, double(kMinPageSize))));
             return std::min(static_cast<int>(power), max_page);
         }
+
+        // Builds each tile's levels, handing every level to finish while the tile's thread still holds it. The
+        // atlas path unwraps in finish; the patch path keeps the geometry for its own packer.
+        template <class Finish>
+        [[nodiscard]] std::vector<TileChunk> build_tile_chunks(SplatMesh& base, const float texel_size, const int max_page,
+                                                               const int max_levels, const float finest_error, const std::stop_token stop,
+                                                               const size_t tile_faces, Finish finish) {
+            const float max_extent = kPieceShareOfPage * float(max_page) * texel_size;
+            const auto ranges = split_mesh_into_pieces(base, tile_faces, max_extent, kTileThreads);
+
+            // Vertices that tiles share stay put on every level, so that no level of a tile opens a crack against its neighbor.
+            std::vector<int32_t> owner(base.vertices.size(), -1);
+            std::vector<uint8_t> shared(base.vertices.size(), 0);
+            for (size_t r = 0; r < ranges.size(); ++r)
+                for (size_t f = ranges[r].first; f < ranges[r].second; ++f)
+                    for (const auto vertex : base.faces[f]) {
+                        if (owner[size_t(vertex)] < 0)
+                            owner[size_t(vertex)] = static_cast<int32_t>(r);
+                        else if (owner[size_t(vertex)] != static_cast<int32_t>(r))
+                            shared[size_t(vertex)] = 1;
+                    }
+            owner = {};
+
+            std::vector<TileChunk> tiles(ranges.size());
+            detail::parallel_for(ranges.size(), kTileWorkThreads, [&](const size_t r) {
+                auto& tile = tiles[r];
+                SplatMesh finest;
+                std::vector<uint8_t> locks;
+                // Only the tile's own vertices, in the order its faces reach them: a copy of the whole mesh per tile costs gigabytes.
+                {
+                    std::vector<int32_t> remap(base.vertices.size(), -1);
+                    finest.faces.assign(base.faces.begin() + std::ptrdiff_t(ranges[r].first), base.faces.begin() + std::ptrdiff_t(ranges[r].second));
+                    for (auto& face : finest.faces)
+                        for (auto& vertex : face) {
+                            auto& target = remap[size_t(vertex)];
+                            if (target < 0) {
+                                target = static_cast<int32_t>(finest.vertices.size());
+                                finest.vertices.push_back(base.vertices[size_t(vertex)]);
+                                if (!base.colors.empty())
+                                    finest.colors.push_back(base.colors[size_t(vertex)]);
+                                locks.push_back(shared[size_t(vertex)]);
+                            }
+                            vertex = target;
+                        }
+                }
+                std::array<double, 3> low{DBL_MAX, DBL_MAX, DBL_MAX}, high{-DBL_MAX, -DBL_MAX, -DBL_MAX};
+                for (const auto& p : finest.vertices)
+                    for (int c = 0; c < 3; ++c) {
+                        low[size_t(c)] = std::min(low[size_t(c)], double(p[size_t(c)]));
+                        high[size_t(c)] = std::max(high[size_t(c)], double(p[size_t(c)]));
+                    }
+                for (int c = 0; c < 3; ++c)
+                    tile.center[size_t(c)] = float(.5 * (low[size_t(c)] + high[size_t(c)]));
+                tile.radius = float(.5 * std::hypot(high[0] - low[0], high[1] - low[1], high[2] - low[2]));
+
+                tile.levels.push_back(std::move(finest));
+                tile.errors.push_back(finest_error);
+                float error = finest_error;
+                for (int level = 1; level < max_levels && tile.levels.back().faces.size() > kMinLevelFaces; ++level) {
+                    error *= kLevelErrorGrowth;
+                    auto coarser = reduce_level(tile.levels.back(), locks, error);
+                    if (coarser.faces.empty() || double(coarser.faces.size()) > kMinLevelReduction * double(tile.levels.back().faces.size()))
+                        break;
+                    tile.levels.push_back(std::move(coarser));
+                    tile.errors.push_back(error);
+                }
+                float texel = texel_size;
+                for (auto& mesh : tile.levels) {
+                    if (stop.stop_requested())
+                        throw core::OperationCancelled();
+                    finish(mesh, texel);
+                    texel *= 2.f;
+                }
+            });
+            return tiles;
+        }
     } // namespace
 
     TiledMesh build_tiled_mesh(SplatMesh& base, const float texel_size, const int max_page, const int max_levels, const float finest_error, const std::stop_token stop, const size_t tile_faces) {
-        const float max_extent = kPieceShareOfPage * float(max_page) * texel_size;
-        const auto ranges = split_mesh_into_pieces(base, tile_faces, max_extent, kTileThreads);
-
-        // Vertices that tiles share stay put on every level, so that no level of a tile opens a crack against its neighbor.
-        std::vector<int32_t> owner(base.vertices.size(), -1);
-        std::vector<uint8_t> shared(base.vertices.size(), 0);
-        for (size_t r = 0; r < ranges.size(); ++r)
-            for (size_t f = ranges[r].first; f < ranges[r].second; ++f)
-                for (const auto vertex : base.faces[f]) {
-                    if (owner[size_t(vertex)] < 0)
-                        owner[size_t(vertex)] = static_cast<int32_t>(r);
-                    else if (owner[size_t(vertex)] != static_cast<int32_t>(r))
-                        shared[size_t(vertex)] = 1;
-                }
-        owner = {};
-
-        std::vector<TileChunk> tiles(ranges.size());
-        detail::parallel_for(ranges.size(), kTileWorkThreads, [&](const size_t r) {
-            auto& tile = tiles[r];
-            SplatMesh finest;
-            std::vector<uint8_t> locks;
-            // Only the tile's own vertices, in the order its faces reach them: a copy of the whole mesh per tile costs gigabytes.
-            {
-                std::vector<int32_t> remap(base.vertices.size(), -1);
-                finest.faces.assign(base.faces.begin() + std::ptrdiff_t(ranges[r].first), base.faces.begin() + std::ptrdiff_t(ranges[r].second));
-                for (auto& face : finest.faces)
-                    for (auto& vertex : face) {
-                        auto& target = remap[size_t(vertex)];
-                        if (target < 0) {
-                            target = static_cast<int32_t>(finest.vertices.size());
-                            finest.vertices.push_back(base.vertices[size_t(vertex)]);
-                            if (!base.colors.empty())
-                                finest.colors.push_back(base.colors[size_t(vertex)]);
-                            locks.push_back(shared[size_t(vertex)]);
-                        }
-                        vertex = target;
-                    }
-            }
-            std::array<double, 3> low{DBL_MAX, DBL_MAX, DBL_MAX}, high{-DBL_MAX, -DBL_MAX, -DBL_MAX};
-            for (const auto& p : finest.vertices)
-                for (int c = 0; c < 3; ++c) {
-                    low[size_t(c)] = std::min(low[size_t(c)], double(p[size_t(c)]));
-                    high[size_t(c)] = std::max(high[size_t(c)], double(p[size_t(c)]));
-                }
-            for (int c = 0; c < 3; ++c)
-                tile.center[size_t(c)] = float(.5 * (low[size_t(c)] + high[size_t(c)]));
-            tile.radius = float(.5 * std::hypot(high[0] - low[0], high[1] - low[1], high[2] - low[2]));
-
-            tile.levels.push_back(std::move(finest));
-            tile.errors.push_back(finest_error);
-            float error = finest_error;
-            for (int level = 1; level < max_levels && tile.levels.back().faces.size() > kMinLevelFaces; ++level) {
-                error *= kLevelErrorGrowth;
-                auto coarser = reduce_level(tile.levels.back(), locks, error);
-                if (coarser.faces.empty() || double(coarser.faces.size()) > kMinLevelReduction * double(tile.levels.back().faces.size()))
-                    break;
-                tile.levels.push_back(std::move(coarser));
-                tile.errors.push_back(error);
-            }
-            float texel = texel_size;
-            for (auto& mesh : tile.levels) {
-                if (stop.stop_requested())
-                    throw core::OperationCancelled();
-                compute_splat_mesh_normals(mesh);
-                unwrap_splat_mesh(mesh, texel, page_side_for(mesh.area, texel, max_page), stop);
-                texel *= 2.f;
-            }
-        });
+        auto tiles = build_tile_chunks(base, texel_size, max_page, max_levels, finest_error, stop, tile_faces,
+                                       [&](SplatMesh& mesh, const float texel) {
+                                           compute_splat_mesh_normals(mesh);
+                                           unwrap_splat_mesh(mesh, texel, page_side_for(mesh.area, texel, max_page), stop);
+                                       });
 
         TiledMesh tiled;
         auto& all = tiled.combined;
@@ -218,6 +231,26 @@ namespace lfs::training {
                 finest_faces += (all.page_first_face[tiled.levels[i].first_page + tiled.levels[i].page_count] - all.page_first_face[tiled.levels[i].first_page]);
         LOG_INFO("Mesh: {} tiles, {} tile levels, {} faces on the finest level and {} in all, on {} pages", tiles.size(), tiled.levels.size(), finest_faces, all.faces.size(), all.page_sizes.size());
         return tiled;
+    }
+
+    std::vector<TiledLevelGeometry> build_tiled_level_geometry(SplatMesh& base, const float texel_size, const int max_page,
+                                                               const int max_levels, const float finest_error, const std::stop_token stop,
+                                                               const size_t tile_faces) {
+        auto tiles = build_tile_chunks(base, texel_size, max_page, max_levels, finest_error, stop, tile_faces,
+                                       [](SplatMesh&, const float) {});
+        std::vector<TiledLevelGeometry> levels;
+        for (size_t t = 0; t < tiles.size(); ++t)
+            for (size_t l = 0; l < tiles[t].levels.size(); ++l) {
+                auto mesh = std::move(tiles[t].levels[l]);
+                mesh.face_error.assign(mesh.faces.size(), tiles[t].errors[l]);
+                levels.push_back({.mesh = std::move(mesh), .tile = t, .level = l, .center = tiles[t].center,
+                                  .radius = tiles[t].radius, .texel = texel_size * float(1u << l)});
+            }
+        size_t faces = 0;
+        for (const auto& level : levels)
+            faces += level.mesh.faces.size();
+        LOG_INFO("Mesh: {} tiles and {} tile levels over {} faces, for the affine texture", tiles.size(), levels.size(), faces);
+        return levels;
     }
 
 } // namespace lfs::training

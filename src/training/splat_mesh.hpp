@@ -39,6 +39,9 @@ namespace lfs::training {
         int page_size = 0;
         [[nodiscard]] int page_side(const size_t page) const { return page_sizes.empty() ? page_size : page_sizes[page]; }
         std::shared_ptr<struct TiledMesh> tiled; // with a texel size: the OSGB model to write, baked
+        // Page p of this mesh is tiled->combined.pages[p]: the finest tile levels, whose pages the OSGB model
+        // already holds, so the viewer and the model share one copy. pages stays empty when this is set.
+        bool pages_in_tiled = false;
 
         // What each stage found, for reports.
         float voxel_size = 0.f; // as resolved when the settings asked for automatic
@@ -200,10 +203,22 @@ namespace lfs::training {
         SplatMesh combined;
         std::vector<TileLevel> levels;
     };
+    // One tile level before it is textured: its geometry and where it sits in the tile grid. The affine path
+    // builds them all first, so that one pass over the photos labels every level's faces and bakes them.
+    struct TiledLevelGeometry {
+        SplatMesh mesh;
+        size_t tile = 0, level = 0; // 0 is the finest
+        std::array<float, 3> center{0.f, 0.f, 0.f};
+        float radius = 0.f;
+        float texel = 0.f; // texel_size doubled on each level
+    };
     // Splits the mesh into tiles of at most tile_faces, whose charts fit a page of max_page, and reduces each to up to
     // max_levels of detail: each allows 4 times the surface deviation of the last and doubles the texel. Vertices that tiles
     // share stay put on every level, so no cracks open between tiles. Reorders base.faces. Unwraps every level; baking remains.
     [[nodiscard]] TiledMesh build_tiled_mesh(SplatMesh& base, float texel_size, int max_page, int max_levels, float finest_error, std::stop_token stop = {}, size_t tile_faces = 150'000);
+    // The tiles and levels build_tiled_mesh would unwrap, without unwrapping: geometry only, each level's faces
+    // carrying its own error. Reorders base.faces as build_tiled_mesh does.
+    [[nodiscard]] std::vector<TiledLevelGeometry> build_tiled_level_geometry(SplatMesh& base, float texel_size, int max_page, int max_levels, float finest_error, std::stop_token stop = {}, size_t tile_faces = 150'000);
     // Writes a model DasViewer opens: folder/metadata.xml and folder/Data/<tile>/<tile>.osgb, the coarsest level of a tile, with
     // the next finer one paged in as the tile fills the screen.
     // A mesh from a PLY file, binary or text; polygons become fans. To bake a mesh made earlier or edited elsewhere.

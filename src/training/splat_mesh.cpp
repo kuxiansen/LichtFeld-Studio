@@ -6,6 +6,7 @@
 #include "splat_mesh_pack.hpp"
 #include "splat_mesh_parallel.hpp"
 #include "splat_mesh_patch.hpp"
+#include "splat_mesh_patch_tiles.hpp"
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -2881,19 +2882,26 @@ namespace lfs::training {
             LOG_INFO("Mesh: {} pages, {} texels, {:.1f}% seen by a view", page_count, total, 100.f * mesh.observed_texel_share);
         }
 
-        // The affine patch texture: every patch painted from its own photo, on the CPU, straight into the mesh's
-        // pages. The pass that chooses the views, the depth renders and the appearance inverse stay on the GPU
-        // path the atlas bake uses; the rects themselves are baked on the threads, a photo and its depth held
-        // in memory only while their patches are.
-        void bake_affine_texture(SplatMesh& mesh, core::SplatData& model, const std::span<core::Camera* const> views, const core::SplatMeshSettings& settings,
-                                 cudaStream_t stream, const auto& report, const PPISP* appearance) {
+        // The affine patch texture over the tile levels: one pass chooses every level's views, one pass over the
+        // photos textures them all, and the levels are assembled into the OSGB model. The mesh the viewer shows is
+        // the finest levels, whose pages stay in that model rather than another copy.
+        void bake_affine_tiled_texture(SplatMesh& mesh, core::SplatData& model, const std::span<core::Camera* const> views,
+                                       const core::SplatMeshSettings& settings, const int max_page, const int level_count,
+                                       cudaStream_t stream, const std::stop_token stop, const auto& report, const PPISP* appearance) {
             auto step = Clock::now();
             core::GlobalArenaManager::instance().get_arena().release_idle_for_pressure();
             core::Tensor::trim_memory_pool();
-            // Which view sets the detail of each face.
-            const auto face_views = choose_mesh_face_views(mesh, model, views, settings, stream, [&](const float value) { report(.2f * value); }).labels;
-            auto bake_settings = settings;
-            bake_settings.max_width = settings.texture_width;
+            std::vector<PatchTiledLevel> levels;
+            for (auto& geometry : build_tiled_level_geometry(mesh, settings.texel_size, max_page, level_count, settings.simplify_error, stop))
+                levels.push_back({.mesh = std::move(geometry.mesh), .face_views = {}, .texel = geometry.texel, .tile = geometry.tile,
+                                  .level = geometry.level, .center = geometry.center, .radius = geometry.radius});
+            mesh.seconds_unwrap = seconds_since(step);
+            step = Clock::now();
+            // One pass over the photos chooses the view of every level's faces, so that the levels of a tile agree.
+            auto combined = combine_patch_tiled_levels(levels);
+            const auto face_views = choose_mesh_face_views(combined, model, views, settings, stream,
+                                                           [&](const float value) { report(.15f * value); }).labels;
+            combined = {};
             // The cameras the patches can read.
             std::vector<int32_t> patch_of_view(views.size(), -1);
             std::vector<PatchView> patch_views;
@@ -2906,55 +2914,22 @@ namespace lfs::training {
                 patch_views.push_back(patch_view);
                 patch_camera.push_back(views[i]);
             }
-            std::vector<int32_t> patch_labels(face_views.size(), -1);
-            for (size_t f = 0; f < face_views.size(); ++f)
-                if (face_views[f] >= 0)
-                    patch_labels[f] = patch_of_view[size_t(face_views[f])];
-            const auto patch_set = build_mesh_patches(mesh, patch_labels, patch_views);
-            const auto atlas = pack_mesh_patches(mesh, patch_set, patch_views,
-                                                  {.page_size = std::min(settings.texture_size, 8192),
-                                                   .padding = 4,
-                                                   .texel_size = settings.texel_size,
-                                                   .texel_min = settings.texel_min});
-            size_t painted = 0;
-            for (const auto patch : patch_set.face_patch)
-                painted += patch >= 0 ? 1 : 0;
-            // The pages: the atlas pages, then one per round of leftover faces the patches leave for the vertex
-            // colors. The mesh is rebuilt around them, its pages painted by the patches and their cells.
-            const int side = std::clamp(std::min(settings.texture_size, 8192), 16, 8192);
-            const size_t cells_per_page = size_t(std::max(1, side / 4)) * std::max(1, side / 4);
-            const size_t leftover = patch_set.face_patch.size() - painted;
-            const int color_pages = leftover > 0 ? int((leftover + cells_per_page - 1) / cells_per_page) : 0;
-            const size_t page_count = atlas.pages.size() + size_t(color_pages);
-            mesh.page_size = side;
-            mesh.pages.assign(page_count, std::vector<uint8_t>(size_t(side) * side * 3, 128));
-            LOG_INFO("Mesh: affine patches paint {} of {} faces ({:.1f} %) over {:.2f} M texels of {} pages", painted, face_views.size(),
-                     face_views.empty() ? 0. : 100. * double(painted) / double(face_views.size()), double(atlas.texels) / 1e6, page_count);
-            // Every patch by its own view, so that a photo and its depth stay in memory only while their
-            // patches are.
-            std::vector<std::vector<uint32_t>> patches_of_view(patch_views.size());
-            for (size_t p = 0; p < patch_set.patches.size(); ++p)
-                patches_of_view[size_t(patch_set.patches[p].view)].push_back(static_cast<uint32_t>(p));
-            const float base_tolerance = 2.5f * settings.voxel_size;
-            const float* face_error = mesh.face_error.empty() ? nullptr : mesh.face_error.data();
-            // The seams the views share are leveled once every view is baked: the photos' colors at the points two
-            // views both see, read with each view's own depth.
-            auto leveling = plan_color_leveling(mesh, patch_labels);
-            const size_t seam_samples = leveling.sample_labels.size();
-            std::vector<std::vector<uint32_t>> seams_of_view(patch_views.size());
-            for (size_t s = 0; s < seam_samples; ++s) {
-                const int32_t label = leveling.sample_labels[s];
-                if (label >= 0 && size_t(label) < seams_of_view.size())
-                    seams_of_view[size_t(label)].push_back(static_cast<uint32_t>(s));
+            size_t face_base = 0;
+            for (auto& level : levels) {
+                level.face_views.assign(level.mesh.faces.size(), -1);
+                for (size_t f = 0; f < level.mesh.faces.size(); ++f) {
+                    const int32_t view = face_views[face_base + f];
+                    if (view >= 0)
+                        level.face_views[f] = patch_of_view[size_t(view)];
+                }
+                face_base += level.mesh.faces.size();
             }
-            std::vector<float> seam_colors(seam_samples * 3, -1.f);
+            // A photo and its depth, read once for every level that has patches of it.
+            auto bake_settings = settings;
+            bake_settings.max_width = settings.texture_width;
             MaskCache masks;
-            size_t done = 0, total_patches = 0;
-            for (const auto& list : patches_of_view)
-                total_patches += list.size();
-            std::atomic<uint64_t> observed{0};
-            for (size_t v = 0; v < patch_views.size(); ++v) {
-                report(.2f + .8f * float(done) / float(std::max<size_t>(total_patches, 1)));
+            std::vector<float> host_photo, host_depth;
+            const auto photo_source = [&](const size_t v, PatchBakePhoto& out) {
                 auto& camera = *patch_camera[v];
                 camera.load_image_size(1, settings.texture_width);
                 auto depth = render_median_depth(camera, model, bake_settings, stream, &masks);
@@ -2964,72 +2939,30 @@ namespace lfs::training {
                                  .contiguous();
                 if (appearance && appearance->is_known_camera(camera.camera_id()) && appearance->is_known_frame(camera.uid()))
                     photo = appearance->invert(photo, camera.camera_id(), camera.uid(), stream).contiguous();
-                if (photo.numel() != size_t(patch_views[v].width) * patch_views[v].height * 3 || depth.numel() != size_t(patch_views[v].width) * patch_views[v].height) {
-                    done += patches_of_view[v].size();
-                    continue;
-                }
-                // The photo and its depth, on the CPU for the patches that read them.
-                std::vector<float> host_photo(photo.numel()), host_depth(depth.numel());
+                if (photo.numel() != size_t(patch_views[v].width) * patch_views[v].height * 3 ||
+                    depth.numel() != size_t(patch_views[v].width) * patch_views[v].height)
+                    return false;
+                host_photo.resize(photo.numel());
+                host_depth.resize(depth.numel());
                 LFS_CUDA_CHECK(cudaMemcpyAsync(host_photo.data(), photo.ptr<float>(), photo.numel() * sizeof(float), cudaMemcpyDeviceToHost, stream));
                 LFS_CUDA_CHECK(cudaMemcpyAsync(host_depth.data(), depth.ptr<float>(), depth.numel() * sizeof(float), cudaMemcpyDeviceToHost, stream));
                 LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh patch photo");
-                const PatchBakePhoto bake_photo{host_photo.data(), host_depth.data(), patch_views[v].width, patch_views[v].height};
-                if (!seams_of_view[v].empty())
-                    sample_patch_seam_colors(leveling, seams_of_view[v], static_cast<int32_t>(v), patch_views[v], bake_photo, face_error,
-                                             base_tolerance, seam_colors);
-                detail::parallel_for(patches_of_view[v].size(), kSimplifyThreads, [&](const size_t k) {
-                    const size_t p = patches_of_view[v][k];
-                    auto rect = bake_patch_texture(mesh, patch_set.patches[p], atlas.placements[p], patch_views[v], bake_photo, face_error,
-                                                   base_tolerance);
-                    for (const auto value : rect.valid)
-                        if (value != 0)
-                            observed.fetch_add(1, std::memory_order_relaxed);
-                    fill_patch_rect(rect, mesh, patch_set.patches[p]);
-                    apply_patch_texture(mesh.pages[atlas.placements[p].page].data(), side, atlas.placements[p], rect);
-                });
-                done += patches_of_view[v].size();
-            }
-            // The seams take up their steps on the pages, before the mesh is laid out around them: the atlas path's
-            // per-corner offsets, or OpenMVS's view gains with offsets kept to a band along the seams.
-            if (seam_samples > 0) {
-                std::vector<uint32_t> seam_unknowns;
-                std::vector<float> seam_offsets, gains;
-                if (settings.seam_leveling_mode == 0) {
-                    solve_color_leveling(leveling, mesh, seam_colors);
-                    leveling.release_samples();
-                    seam_unknowns = std::move(leveling.corner_unknowns);
-                    seam_offsets = std::move(leveling.offsets);
-                } else {
-                    auto seam = solve_patch_seam_leveling(mesh, patch_labels, patch_views, leveling, seam_colors);
-                    leveling.release_samples();
-                    seam_unknowns = std::move(seam.corner_unknowns);
-                    seam_offsets = std::move(seam.offsets);
-                    gains = std::move(seam.gains);
-                }
-                detail::parallel_for(patch_set.patches.size(), kSimplifyThreads, [&](const size_t p) {
-                    const auto& place = atlas.placements[p];
-                    const int32_t label = patch_set.patches[p].view;
-                    if (place.page < 0 || size_t(place.page) >= atlas.pages.size() || label < 0 ||
-                        size_t(label) >= patch_views.size())
-                        return;
-                    auto* page = mesh.pages[size_t(place.page)].data();
-                    if (!gains.empty())
-                        apply_patch_gain(page, side, place, &gains[3 * size_t(label)]);
-                    apply_patch_offsets(page, side, mesh, patch_set.patches[p], place, patch_views[size_t(label)], seam_unknowns,
-                                        seam_offsets);
-                });
-            }
-            // The mesh around the atlas: faces in page order, UVs of their patches, the leftover faces on the
-            // color pages. The bake read the mesh's own faces, so the layout follows it.
-            apply_patch_layout(mesh, patch_set, atlas, patch_views, color_pages);
-            detail::parallel_for(atlas.pages.size(), kSimplifyThreads, [&](const size_t p) {
-                finish_patch_page(mesh.pages[p].data(), side, atlas.pages[p], atlas.placements, 8);
-            });
-            mesh.charts = patch_set.patches.size();
-            mesh.texels = atlas.texels;
-            mesh.observed_texel_share = atlas.texels > 0 ? float(observed.load()) / float(atlas.texels) : 0.f;
-            LOG_INFO("Mesh: {} patches, {} pages, {:.1f}% of their texels seen by the patch's own view, {} s", patch_set.patches.size(), page_count,
-                     100.f * mesh.observed_texel_share, seconds_since(step));
+                out = {host_photo.data(), host_depth.data(), patch_views[v].width, patch_views[v].height};
+                return true;
+            };
+            auto textures = bake_patch_tiled_levels(levels, patch_views,
+                                                    {.page_size = max_page,
+                                                     .padding = 4,
+                                                     .texel_min = settings.texel_min,
+                                                     .base_tolerance = 2.5f * settings.voxel_size,
+                                                     .seam_leveling_mode = settings.seam_leveling_mode},
+                                                    photo_source,
+                                                    [&](const float value) { report(.15f + .85f * value); }, stop);
+            assemble_patch_tiled_mesh(levels, textures, mesh);
+            mesh.charts = mesh.tiled->combined.charts;
+            mesh.texels = mesh.tiled->combined.texels;
+            mesh.observed_texel_share = mesh.tiled->combined.observed_texel_share;
+            mesh.seconds_bake = seconds_since(step);
         }
         // The surface from the depth of the views: fused, cleaned up, colored at its vertices and reduced.
         void extract_surface(SplatMesh& mesh, core::SplatData& model, const std::span<core::Camera* const> views, const core::SplatMeshSettings& settings, cudaStream_t stream,
@@ -3414,11 +3347,15 @@ namespace lfs::training {
                 if (camera)
                     all_views.push_back(camera);
             if (resolved.texture_mode != 0) {
-                // The affine patch texture goes straight onto the mesh's own pages; the tile levels and their
-                // OSGB stay with the atlas path until the patch path grows them of its own.
-                bake_affine_texture(mesh, model, all_views, resolved, stream,
-                                    [&](const float value) { core::reportProgress(stop, progress, .5f + .5f * value, stage("mesh.stage_bake", "Baking texture")); }, appearance);
-                mesh.seconds_bake = seconds_since(step);
+                // The affine patch texture over the tile levels: the same LOD and OSGB the atlas path writes,
+                // baked from each patch's own photo.
+                core::reportProgress(stop, progress, .5f, stage("mesh.stage_unwrap", "Building tiles"));
+                bake_affine_tiled_texture(mesh, model, all_views, resolved, std::min(resolved.texture_size, kOsgbMaxPage),
+                                          std::clamp(resolved.lod_levels, 1, kOsgbMaxLevels), stream, stop,
+                                          [&](const float value) {
+                                              core::reportProgress(stop, progress, .5f + .5f * value, stage("mesh.stage_bake", "Baking texture"));
+                                          },
+                                          appearance);
             } else {
                 core::reportProgress(stop, progress, .5f, stage("mesh.stage_unwrap", "Unwrapping"));
                 const int levels = std::clamp(resolved.lod_levels, 1, kOsgbMaxLevels);
@@ -3697,7 +3634,11 @@ namespace lfs::training {
         }
         core::MeshData data(std::move(vertices), std::move(indices));
         data.normals = std::move(normals);
-        if (mesh.pages.empty()) {
+        // The affine path keeps the finest levels' pages in the tiled model, where OSGB writes them; only those the
+        // base mesh refers to are uploaded.
+        const auto& pages = mesh.pages_in_tiled && mesh.tiled ? mesh.tiled->combined.pages : mesh.pages;
+        const size_t page_count = mesh.page_first_face.empty() ? 0 : mesh.page_first_face.size() - 1;
+        if (pages.empty() || pages.size() < page_count) {
             data.colors = std::move(colors);
             return data;
         }
@@ -3708,12 +3649,12 @@ namespace lfs::training {
         std::array<uint8_t, 256> to_linear{};
         for (int i = 0; i < 256; ++i)
             to_linear[size_t(i)] = static_cast<uint8_t>(std::lround(255.f * linear(uint8_t(i))));
-        for (size_t p = 0; p < mesh.pages.size(); ++p) {
+        for (size_t p = 0; p < page_count; ++p) {
             core::TextureImage image;
-            image.width = image.height = mesh.page_size;
+            image.width = image.height = mesh.page_side(p);
             image.channels = 3;
-            image.pixels.resize(mesh.pages[p].size());
-            std::ranges::transform(mesh.pages[p], image.pixels.begin(), [&](const uint8_t value) { return to_linear[value]; });
+            image.pixels.resize(pages[p].size());
+            std::ranges::transform(pages[p], image.pixels.begin(), [&](const uint8_t value) { return to_linear[value]; });
             data.texture_images.push_back(std::move(image));
             core::Material material;
             material.name = std::format("page_{}", p);
