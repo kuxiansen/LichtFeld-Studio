@@ -2963,6 +2963,9 @@ namespace lfs::training {
             mesh.texels = mesh.tiled->combined.texels;
             mesh.observed_texel_share = mesh.tiled->combined.observed_texel_share;
             mesh.seconds_bake = seconds_since(step);
+            LOG_INFO("Mesh: {} pages, {} texels over {} tile levels, {:.1f}% seen by a view",
+                     mesh.tiled->combined.pages.size(), mesh.tiled->combined.texels, levels.size(),
+                     100.f * mesh.observed_texel_share);
         }
         // The surface from the depth of the views: fused, cleaned up, colored at its vertices and reduced.
         void extract_surface(SplatMesh& mesh, core::SplatData& model, const std::span<core::Camera* const> views, const core::SplatMeshSettings& settings, cudaStream_t stream,
