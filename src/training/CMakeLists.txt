@@ -128,6 +128,8 @@ set(TRAINING_NEW_SOURCES
         progress.cpp
         splat_mesh.cpp
         splat_mesh_texture.cpp
+        splat_mesh_patch.cpp
+        splat_mesh_pack.cpp
         splat_mesh_tiles.cpp
         splat_mesh_osgb.cpp
         ${CMAKE_SOURCE_DIR}/external/xatlas/xatlas.cpp

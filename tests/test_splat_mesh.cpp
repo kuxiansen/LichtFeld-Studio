@@ -5,6 +5,7 @@
 #include "core/tensor.hpp"
 #include "rasterization/gsplat/TsdfFusion.h"
 #include "splat_mesh.hpp"
+#include "splat_mesh_patch.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -659,6 +660,117 @@ TEST(SplatMesh, PlyStaysConnectedAcrossChartSeams) {
     std::filesystem::remove_all(folder);
     EXPECT_NE(ply.find("element vertex 4\n"), std::string::npos);
     EXPECT_NE(ply.find("element face 2\n"), std::string::npos);
+}
+
+namespace {
+    // A flat grid in the plane z = distance, as wide as two half_widths, facing a camera at the origin.
+    SplatMesh grid_plane_mesh(const float half_width, const int side, const float distance) {
+        SplatMesh mesh;
+        for (int y = 0; y <= side; ++y)
+            for (int x = 0; x <= side; ++x)
+                mesh.vertices.push_back({half_width * (2.f * float(x) / float(side) - 1.f),
+                                         half_width * (2.f * float(y) / float(side) - 1.f), distance});
+        for (int y = 0; y < side; ++y)
+            for (int x = 0; x < side; ++x) {
+                const auto a = int32_t(y * (side + 1) + x), b = a + 1, c = a + int32_t(side + 1), d = c + 1;
+                mesh.faces.push_back({a, c, b});
+                mesh.faces.push_back({b, c, d});
+            }
+        return mesh;
+    }
+
+    // A camera at the origin looking along +z, onto a square photo; model 0 pinhole, 2 opencv fisheye.
+    lfs::training::PatchView origin_patch_view(const int side, const float focal, const int model) {
+        lfs::training::PatchView view;
+        view.world_to_camera = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        view.fx = view.fy = focal;
+        view.cx = view.cy = float(side) / 2.f;
+        view.width = view.height = side;
+        view.model = model;
+        return view;
+    }
+} // namespace
+
+TEST(SplatMesh, PatchProjectionFollowsThePinholeAndFisheyeModels) {
+    float pixel[2];
+    const auto fisheye = origin_patch_view(1000, 400.f, 2);
+    const std::array<float, 3> diagonal{1.f, 0.f, 1.f}; // 45 degrees off the axis
+    ASSERT_TRUE(lfs::training::project_patch_point(fisheye, diagonal.data(), pixel));
+    EXPECT_NEAR(pixel[0], 500.f + 400.f * float(std::numbers::pi) / 4.f, .01f);
+    EXPECT_NEAR(pixel[1], 500.f, .01f);
+    const auto pinhole = origin_patch_view(1000, 400.f, 0);
+    const std::array<float, 3> oblique{1.f, 0.f, 2.f};
+    ASSERT_TRUE(lfs::training::project_patch_point(pinhole, oblique.data(), pixel));
+    EXPECT_NEAR(pixel[0], 700.f, .01f);
+    const std::array<float, 3> behind{0.f, 0.f, -1.f};
+    EXPECT_FALSE(lfs::training::project_patch_point(pinhole, behind.data(), pixel));
+}
+
+TEST(SplatMesh, APatchOfAFrontalPlaneCopiesThePhotosPixels) {
+    auto mesh = grid_plane_mesh(.5f, 16, 2.f);
+    const std::vector<int32_t> labels(mesh.faces.size(), 0);
+    const std::vector<lfs::training::PatchView> views{origin_patch_view(640, 500.f, 0)};
+    const auto set = lfs::training::build_mesh_patches(mesh, labels, views);
+    ASSERT_EQ(set.patches.size(), 1u);
+    EXPECT_FALSE(set.patches[0].warp);
+    EXPECT_EQ(set.patches[0].view, 0);
+    EXPECT_EQ(set.patches[0].faces.size(), mesh.faces.size());
+    EXPECT_LT(set.patches[0].residual, .25f);
+    // 1 m at 2 m through 500 pixels is 250 pixels.
+    EXPECT_NEAR(set.patches[0].high[0] - set.patches[0].low[0], 250.f, 1.f);
+    EXPECT_NEAR(set.patches[0].high[1] - set.patches[0].low[1], 250.f, 1.f);
+    EXPECT_EQ(set.faces_dropped, 0u);
+    for (const auto index : set.face_patch)
+        EXPECT_EQ(index, 0);
+}
+
+TEST(SplatMesh, PatchesThatOutgrowThePhotoAreCutDown) {
+    // 10 m at 2 m through 500 pixels is 2500 across, which no page takes in one piece.
+    auto mesh = grid_plane_mesh(5.f, 24, 2.f);
+    const std::vector<int32_t> labels(mesh.faces.size(), 0);
+    const std::vector<lfs::training::PatchView> views{origin_patch_view(640, 500.f, 0)};
+    const auto set = lfs::training::build_mesh_patches(mesh, labels, views);
+    EXPECT_GT(set.patches.size(), 1u);
+    EXPECT_EQ(set.faces_dropped, 0u);
+    size_t faces = 0;
+    for (const auto& patch : set.patches) {
+        EXPECT_FALSE(patch.warp);
+        EXPECT_LE(patch.high[0] - patch.low[0], 513.f);
+        EXPECT_LE(patch.high[1] - patch.low[1], 513.f);
+        faces += patch.faces.size();
+    }
+    EXPECT_EQ(faces, mesh.faces.size());
+}
+
+TEST(SplatMesh, FisheyePatchesAreCutUntilTheirFitHoldsToAQuarterPixel) {
+    // A fisheye bends a plane: at 5 m the 2 m wide grid spreads 0.2 rad off the axis, which is no affine map.
+    auto mesh = grid_plane_mesh(1.f, 16, 5.f);
+    const std::vector<int32_t> labels(mesh.faces.size(), 0);
+    const std::vector<lfs::training::PatchView> views{origin_patch_view(1280, 300.f, 2)};
+    const auto set = lfs::training::build_mesh_patches(mesh, labels, views);
+    EXPECT_GT(set.patches.size(), 1u);
+    EXPECT_EQ(set.faces_dropped, 0u);
+    size_t faces = 0;
+    for (const auto& patch : set.patches) {
+        EXPECT_FALSE(patch.warp);
+        EXPECT_LE(patch.residual, .25f);
+        EXPECT_GE(std::max(patch.high[0] - patch.low[0], patch.high[1] - patch.low[1]), 32.f);
+        faces += patch.faces.size();
+    }
+    EXPECT_EQ(faces, mesh.faces.size());
+}
+
+TEST(SplatMesh, PatchesUnderTheSmallestSpanKeepTheVertexColors) {
+    SplatMesh mesh;
+    mesh.vertices = {{-.01f, -.01f, 2.f}, {.01f, -.01f, 2.f}, {0.f, .01f, 2.f}};
+    mesh.faces = {{0, 1, 2}};
+    const std::vector<int32_t> labels{0};
+    const std::vector<lfs::training::PatchView> views{origin_patch_view(640, 100.f, 0)};
+    const auto set = lfs::training::build_mesh_patches(mesh, labels, views);
+    // 2 cm at 2 m through 100 pixels is a pixel across.
+    EXPECT_TRUE(set.patches.empty());
+    EXPECT_EQ(set.faces_dropped, 1u);
+    EXPECT_EQ(set.face_patch[0], -1);
 }
 
 namespace {

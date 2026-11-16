@@ -2,7 +2,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #define NOMINMAX
 #include "splat_mesh.hpp"
+#include "splat_mesh_pack.hpp"
 #include "splat_mesh_parallel.hpp"
+#include "splat_mesh_patch.hpp"
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -2515,6 +2517,35 @@ namespace lfs::training {
                 used.erase(std::unique(used.begin(), used.end()), used.end());
                 LOG_INFO("Mesh: {} views set the detail of {} of {} faces", used.size(), chosen, face_views.size());
             }
+            // Affine patches, kept beside the atlas path: how many faces one photo per patch can paint, and what their
+            // rects would take. The bake takes them over once it lands.
+            if (settings.texture_mode == 1) {
+                std::vector<int32_t> remap(views.size(), -1);
+                std::vector<PatchView> patch_views;
+                for (size_t i = 0; i < views.size(); ++i) {
+                    PatchView patch_view;
+                    if (!views[i]->has_image() || !make_patch_view(*views[i], patch_view))
+                        continue;
+                    remap[i] = static_cast<int32_t>(patch_views.size());
+                    patch_views.push_back(patch_view);
+                }
+                std::vector<int32_t> patch_labels(face_views.size(), -1);
+                for (size_t f = 0; f < face_views.size(); ++f)
+                    if (face_views[f] >= 0)
+                        patch_labels[f] = remap[size_t(face_views[f])];
+                const auto patch_set = build_mesh_patches(mesh, patch_labels, patch_views);
+                const auto patch_atlas = pack_mesh_patches(mesh, patch_set, patch_views,
+                                                           {.page_size = std::min(settings.texture_size, 8192),
+                                                            .padding = 4,
+                                                            .texel_size = settings.texel_size,
+                                                            .texel_min = settings.texel_min});
+                size_t covered = 0;
+                for (const auto patch : patch_set.face_patch)
+                    covered += patch >= 0 ? 1 : 0;
+                LOG_INFO("Mesh: affine patches paint {} of {} faces ({:.1f} %) over {:.2f} M texels of {} pages", covered, face_views.size(),
+                         face_views.empty() ? 0. : 100. * double(covered) / double(face_views.size()), double(patch_atlas.texels) / 1e6,
+                         patch_atlas.pages.size());
+            }
             // A batch needs the views chosen for its faces, and those nearly as good, which fill in what a chosen view cannot
             // see. A fisheye sees most of a room, so leaving out the rest saves most of the reads.
             constexpr size_t kCandidates = FaceViewCandidates::kPerFace;
@@ -3221,10 +3252,10 @@ namespace lfs::training {
         }
         auto step = Clock::now();
         if (settings.texel_size > 0.f) {
-            // Two texturing paths, kept side by side for comparison. Only the atlas one is wired up so far;
-            // the affine patch path takes over here once its builder lands.
+            // Two texturing paths, kept side by side for comparison. The atlas one bakes; the affine patch path reports
+            // what its patches and pages would take until the bake takes them over.
             if (resolved.texture_mode != 0)
-                LOG_WARN("Mesh: texture mode {} is not built yet; baking with the xatlas atlas", resolved.texture_mode);
+                LOG_INFO("Mesh: affine patch texture mode {}: patches are built and packed for their cost; the bake is the atlas one", resolved.texture_mode);
             texture_ram_preflight(mesh, settings);
             step = Clock::now();
             core::reportProgress(stop, progress, .5f, stage("mesh.stage_unwrap", "Unwrapping"));
