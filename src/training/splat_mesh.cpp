@@ -2937,6 +2937,17 @@ namespace lfs::training {
                 patches_of_view[size_t(patch_set.patches[p].view)].push_back(static_cast<uint32_t>(p));
             const float base_tolerance = 2.5f * settings.voxel_size;
             const float* face_error = mesh.face_error.empty() ? nullptr : mesh.face_error.data();
+            // The seams the views share are leveled once every view is baked: the photos' colors at the points two
+            // views both see, read with each view's own depth.
+            auto leveling = plan_color_leveling(mesh, patch_labels);
+            const size_t seam_samples = leveling.sample_labels.size();
+            std::vector<std::vector<uint32_t>> seams_of_view(patch_views.size());
+            for (size_t s = 0; s < seam_samples; ++s) {
+                const int32_t label = leveling.sample_labels[s];
+                if (label >= 0 && size_t(label) < seams_of_view.size())
+                    seams_of_view[size_t(label)].push_back(static_cast<uint32_t>(s));
+            }
+            std::vector<float> seam_colors(seam_samples * 3, -1.f);
             MaskCache masks;
             size_t done = 0, total_patches = 0;
             for (const auto& list : patches_of_view)
@@ -2963,6 +2974,9 @@ namespace lfs::training {
                 LFS_CUDA_CHECK(cudaMemcpyAsync(host_depth.data(), depth.ptr<float>(), depth.numel() * sizeof(float), cudaMemcpyDeviceToHost, stream));
                 LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh patch photo");
                 const PatchBakePhoto bake_photo{host_photo.data(), host_depth.data(), patch_views[v].width, patch_views[v].height};
+                if (!seams_of_view[v].empty())
+                    sample_patch_seam_colors(leveling, seams_of_view[v], static_cast<int32_t>(v), patch_views[v], bake_photo, face_error,
+                                             base_tolerance, seam_colors);
                 detail::parallel_for(patches_of_view[v].size(), kSimplifyThreads, [&](const size_t k) {
                     const size_t p = patches_of_view[v][k];
                     auto rect = bake_patch_texture(mesh, patch_set.patches[p], atlas.placements[p], patch_views[v], bake_photo, face_error,
@@ -2974,6 +2988,36 @@ namespace lfs::training {
                     apply_patch_texture(mesh.pages[atlas.placements[p].page].data(), side, atlas.placements[p], rect);
                 });
                 done += patches_of_view[v].size();
+            }
+            // The seams take up their steps on the pages, before the mesh is laid out around them: the atlas path's
+            // per-corner offsets, or OpenMVS's view gains with offsets kept to a band along the seams.
+            if (seam_samples > 0) {
+                std::vector<uint32_t> seam_unknowns;
+                std::vector<float> seam_offsets, gains;
+                if (settings.seam_leveling_mode == 0) {
+                    solve_color_leveling(leveling, mesh, seam_colors);
+                    leveling.release_samples();
+                    seam_unknowns = std::move(leveling.corner_unknowns);
+                    seam_offsets = std::move(leveling.offsets);
+                } else {
+                    auto seam = solve_patch_seam_leveling(mesh, patch_labels, patch_views, leveling, seam_colors);
+                    leveling.release_samples();
+                    seam_unknowns = std::move(seam.corner_unknowns);
+                    seam_offsets = std::move(seam.offsets);
+                    gains = std::move(seam.gains);
+                }
+                detail::parallel_for(patch_set.patches.size(), kSimplifyThreads, [&](const size_t p) {
+                    const auto& place = atlas.placements[p];
+                    const int32_t label = patch_set.patches[p].view;
+                    if (place.page < 0 || size_t(place.page) >= atlas.pages.size() || label < 0 ||
+                        size_t(label) >= patch_views.size())
+                        return;
+                    auto* page = mesh.pages[size_t(place.page)].data();
+                    if (!gains.empty())
+                        apply_patch_gain(page, side, place, &gains[3 * size_t(label)]);
+                    apply_patch_offsets(page, side, mesh, patch_set.patches[p], place, patch_views[size_t(label)], seam_unknowns,
+                                        seam_offsets);
+                });
             }
             // The mesh around the atlas: faces in page order, UVs of their patches, the leftover faces on the
             // color pages. The bake read the mesh's own faces, so the layout follows it.

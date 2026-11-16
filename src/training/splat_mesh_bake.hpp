@@ -42,6 +42,40 @@ namespace lfs::training {
     // Writes a filled rect into its page, at its placement.
     void apply_patch_texture(uint8_t* page, int side, const PatchPlacement& place, const PatchBakeRect& rect);
 
+    // Reads the colors the views give at the seam samples planned for the mesh: the photo blurred around the pixel
+    // each sample projects to, with the pixels whose depth lies on the same surface, so that grain and
+    // misregistration do not read as an exposure step. sample_indices lists the samples whose label is label;
+    // colors holds 3 per sample, 0..1 sRGB, and keeps -1 where the view does not vouch for the sample.
+    void sample_patch_seam_colors(const ColorLeveling& plan, std::span<const uint32_t> sample_indices, int32_t label,
+                                  const PatchView& view, const PatchBakePhoto& photo, const float* face_error, float base_tolerance,
+                                  std::span<float> colors);
+
+    // OpenMVS's seam leveling, the second of the two the setting switches between: one gain per view, from the
+    // steps between views at the seam samples, and then an offset per corner solved only within band_pixels of a
+    // seam and held at zero outside it. Each view keeps its own colors away from the seams, the two sides meet
+    // across the band, and the band itself is what OpenMVS's local Poisson solves for. Applied to the baked pages
+    // as apply_patch_gain then apply_patch_offsets; the atlas path's plan/solve keeps the other mode.
+    struct PatchSeamLeveling {
+        static constexpr uint32_t kNoOffset = ~uint32_t{0};
+        std::vector<uint32_t> corner_unknowns; // 3 per face, kNoOffset away from the seams
+        std::vector<float> offsets;            // 3 per unknown, 0..1
+        std::vector<float> gains;              // 3 per view label
+        size_t band_faces = 0;
+        size_t iterations = 0;
+    };
+    [[nodiscard]] PatchSeamLeveling solve_patch_seam_leveling(const SplatMesh& mesh, std::span<const int32_t> face_labels,
+                                                              std::span<const PatchView> views, const ColorLeveling& plan,
+                                                              std::span<const float> colors, int band_pixels = 16);
+
+    // Scales the texels of a patch's rect by its view's gain: the global half of OpenMVS's seam leveling.
+    void apply_patch_gain(uint8_t* page, int side, const PatchPlacement& place, const float* gain);
+
+    // Adds the leveling offsets to a patch's texels, interpolated over each face's corners as the atlas path does.
+    // Corners with no unknown (at or beyond the band's edge) contribute nothing. Runs after the page is baked and
+    // before the mesh is laid out around it.
+    void apply_patch_offsets(uint8_t* page, int side, const SplatMesh& mesh, const MeshPatch& patch, const PatchPlacement& place,
+                             const PatchView& view, std::span<const uint32_t> corner_unknowns, std::span<const float> offsets);
+
     // A page's patches leave gaps between their rects: filled outward from them for this many rings, so that
     // bilinear samples and reductions reach no background, and what the rings do not reach keeps the page's
     // own fill. The color pages need no rings: their cells are painted whole.
