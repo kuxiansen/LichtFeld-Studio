@@ -245,6 +245,18 @@ namespace lfs::training {
                 ++atlas.shrunk;
             }
             placement.texel = planned[i].texel;
+            // What one photo pixel takes on the rect: on a copied patch the photo's own pixels are the texture,
+            // texel for texel; on a resampled one the rect's own grid is the photo's window under this scale,
+            // which the shrink above cuts with the rect it fits. The bake and the mesh's UVs both read it here,
+            // so that a texel and its texture stay the same point of the surface.
+            if (patch.warp) {
+                const float scale_x = planned[i].wide > 1 ? float(planned[i].wide - 1) / std::max(span_x, 1e-6f) : 1e9f;
+                const float scale_y = planned[i].tall > 1 ? float(planned[i].tall - 1) / std::max(span_y, 1e-6f) : 1e9f;
+                placement.scale = std::min(scale_x, scale_y);
+                if (!(placement.scale > 0.f) || !std::isfinite(placement.scale))
+                    placement.scale = 1.f;
+            } else
+                placement.scale = 1.f;
             (patch.warp ? resampled_texels : copied_texels).push_back(planned[i].texel);
         }
 

@@ -15,6 +15,8 @@ namespace lfs::training {
         int x = 0, y = 0, width = 0, height = 0; // texels on the page
         int source_x = 0, source_y = 0;          // the photo pixel the copied rect starts at
         float texel = 0.f;                       // scene units per texel
+        float scale = 1.f;                       // rect texels per photo pixel: 1 on a copied patch, and what the
+                                                // rect takes on a resampled one, cut down with the rect it fits
         bool warp = false;                       // false: the photo's pixels are copied texel for texel
     };
 
