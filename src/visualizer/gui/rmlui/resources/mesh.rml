@@ -51,6 +51,21 @@
     </div>
     <div class="separator"></div>
 
+    <div class="ep-section">
+      <span class="ep-section-title text-accent">@tr:mesh.section_output</span>
+      <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.output_format">
+        <span class="setting-row__label-col">@tr:mesh.output_format</span>
+        <div class="setting-row__control-col setting-row__control-col--fill">
+          <select data-value="mesh_output_format">
+            <option value="0">@tr:mesh.format.ply</option>
+            <option value="1">@tr:mesh.format.glb</option>
+            <option value="2">@tr:mesh.format.ply_glb</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="separator"></div>
+
     <div data-if="mesh_notice == ''" class="text-muted">{{mesh_output}}</div>
     <div data-if="mesh_notice != ''" class="text-error">{{mesh_notice}}</div>
     <div data-if="mesh_active">

@@ -2555,8 +2555,8 @@ namespace lfs::app {
             });
         registry.register_tool(
             McpTool{.name = "scene.generate_mesh",
-                    .description = "Mesh exactly one selected loaded splat from the scene's cameras into a PLY and a new undoable mesh node, and with texel_size also an OSGB model folder beside it; from_mesh bakes that PLY instead of extracting a surface and needs texel_size; observe collision.main",
-                    .input_schema = {.type = "object", .properties = json{{"path", {{"type", "string"}}}, {"voxel_size", {{"type", "number"}, {"description", "Voxel edge in scene units; 0 derives it from the model's median splat spacing"}}}, {"view_stride", {{"type", "integer"}}}, {"full_weight_range", {{"type", "number"}}}, {"min_views", {{"type", "integer"}}}, {"simplify_error", {{"type", "number"}}}, {"trunc_gradient", {{"type", "number"}, {"description", "Widen the TSDF band by this factor of the local depth step; 0 keeps the fixed band"}}}, {"trunc_cap", {{"type", "number"}, {"description", "Upper bound of the widened band in scene units; 0 derives it as 4x the truncation"}}}, {"max_range", {{"type", "number"}}}, {"texel_size", {{"type", "number"}}}, {"from_mesh", {{"type", "string"}}}}, .required = {"path"}},
+                    .description = "Mesh exactly one selected loaded splat from the scene's cameras into a geometry file and a new undoable mesh node, and with texel_size also an OSGB model folder beside it; output_format 0 writes a PLY, 1 a GLB that embeds the texture pages, 2 both; from_mesh bakes that PLY instead of extracting a surface and needs texel_size; observe collision.main",
+                    .input_schema = {.type = "object", .properties = json{{"path", {{"type", "string"}}}, {"voxel_size", {{"type", "number"}, {"description", "Voxel edge in scene units; 0 derives it from the model's median splat spacing"}}}, {"view_stride", {{"type", "integer"}}}, {"full_weight_range", {{"type", "number"}}}, {"min_views", {{"type", "integer"}}}, {"simplify_error", {{"type", "number"}}}, {"trunc_gradient", {{"type", "number"}, {"description", "Widen the TSDF band by this factor of the local depth step; 0 keeps the fixed band"}}}, {"trunc_cap", {{"type", "number"}, {"description", "Upper bound of the widened band in scene units; 0 derives it as 4x the truncation"}}}, {"max_range", {{"type", "number"}}}, {"texel_size", {{"type", "number"}}}, {"from_mesh", {{"type", "string"}}}, {"output_format", {{"type", "integer"}, {"minimum", 0}, {"maximum", 2}, {"description", "0 PLY, 1 GLB with embedded textures, 2 both"}}}}, .required = {"path"}},
                     .metadata = {.category = "scene", .kind = "mutation", .runtime = "gui", .thread_affinity = "gui_thread", .long_running = true, .user_visible = true}},
             [viewer, viewer_impl](const json& args) -> json {
                 return post_and_wait(viewer, [viewer_impl, args]() -> json {
@@ -2573,6 +2573,7 @@ namespace lfs::app {
                     settings.view_stride = args.value("view_stride", settings.view_stride);
                     settings.full_weight_range = args.value("full_weight_range", settings.full_weight_range);
                     settings.min_views = args.value("min_views", settings.min_views);
+                    settings.file_format = static_cast<core::MeshFileFormat>(std::clamp(args.value("output_format", 0), 0, 2));
                     viewer_impl->getGuiManager()->asyncTasks().startSplatMesh(settings, core::utf8_to_path(args.at("path").get<std::string>()));
                     return json{{"job_id", "collision.main"}};
                 });

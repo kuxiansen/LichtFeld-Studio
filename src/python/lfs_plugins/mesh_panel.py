@@ -13,6 +13,8 @@ from .types import Panel
 __lfs_panel_classes__ = ["MeshPanel"]
 __lfs_panel_ids__ = ["lfs.mesh"]
 
+PLY, GLB, PLY_AND_GLB = 0, 1, 2
+
 SPECS = {
     "voxel_size": ScrubFieldSpec(0, 10, .001, "%.4g"),
     "view_stride": ScrubFieldSpec(1, 64, 1, "%.0f"),
@@ -77,7 +79,7 @@ class MeshPanel(Panel):
                            max_range=0., texel_size=0.,
                            texel_min=.0, texture_mode=0, seam_leveling_mode=0,
                            texture_size=4096, texture_sharpen=.5, lod_levels=4,
-                           use_file=False, file="", error="")
+                           output_format=PLY, use_file=False, file="", error="")
         self.state = {}
         self.close_when_done = False
         self.scrubs = ScrubFieldController(
@@ -99,7 +101,15 @@ class MeshPanel(Panel):
         return ""
 
     def output(self):
-        return lf.ui.tr("mesh.output_osgb" if self.textured() else "mesh.output_ply")
+        fmt = self.values["output_format"]
+        if self.textured():
+            if self.values["use_file"]:
+                key = "mesh.output_osgb_from_file" if fmt == PLY else "mesh.output_osgb_from_file_glb"
+            else:
+                key = {PLY: "mesh.output_osgb", GLB: "mesh.output_osgb_glb",
+                       PLY_AND_GLB: "mesh.output_osgb_ply_glb"}[fmt]
+            return lf.ui.tr(key)
+        return lf.ui.tr({PLY: "mesh.output_ply", GLB: "mesh.output_glb", PLY_AND_GLB: "mesh.output_ply_glb"}[fmt])
 
     def ready(self):
         if self.values["use_file"] and not self.values["file"]:
@@ -121,10 +131,14 @@ class MeshPanel(Panel):
     def generate(self, *_):
         if not self.ready():
             return
-        name = Path(self.values["file"]).stem + "_baked" if self.values["use_file"] else self.state.get("source_name", "") + "_mesh"
-        path = lf.ui.save_ply_file_dialog(name)
-        if not path:
-            return
+        if self.values["use_file"] and self.textured():
+            # The surface is already on disk, so there is nothing to name: the bake lands beside the picked file.
+            path = self.values["file"]
+        else:
+            name = Path(self.values["file"]).stem + "_baked" if self.values["use_file"] else self.state.get("source_name", "") + "_mesh"
+            path = lf.ui.save_glb_file_dialog(name) if self.values["output_format"] == GLB else lf.ui.save_ply_file_dialog(name)
+            if not path:
+                return
         self.values["error"] = ""
         try:
             lf.generate_mesh(path, self.values["voxel_size"], int(self.values["view_stride"]),
@@ -144,7 +158,8 @@ class MeshPanel(Panel):
                              int(self.values["lod_levels"]),
                              int(self.values["texture_mode"]),
                              self.values["texel_min"],
-                             int(self.values["seam_leveling_mode"]))
+                             int(self.values["seam_leveling_mode"]),
+                             output_format=int(self.values["output_format"]))
             self.close_when_done = True
         except (RuntimeError, TypeError, ValueError) as exc:
             key = getattr(exc, "message_key", "")
@@ -186,6 +201,8 @@ class MeshPanel(Panel):
                    lambda value: self.set_value("texture_mode", int(value or 0)))
         model.bind("mesh_seam_leveling", lambda: str(self.values["seam_leveling_mode"]),
                    lambda value: self.set_value("seam_leveling_mode", int(value or 0)))
+        model.bind("mesh_output_format", lambda: str(self.values["output_format"]),
+                   lambda value: self.set_value("output_format", int(value or 0)))
         model.bind_event("mesh_choose_file", self.choose_file)
         model.bind_event("mesh_generate", self.generate)
         model.bind_event("mesh_cancel", self.cancel)

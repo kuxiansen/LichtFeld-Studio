@@ -4441,10 +4441,32 @@ namespace lfs::vis::gui {
             for (const auto& camera : cameras)
                 views.push_back(camera.get());
             const auto mesh = training::extract_splat_mesh(*model, views, settings, stop, progress, appearance.get());
-            training::write_splat_mesh_ply(mesh, path);
+            // A surface read from a file is already on disk, so baking it writes no second copy: the OSGB goes beside
+            // the file the user picked. A surface extracted here still writes its own geometry first.
+            const bool from_file = !settings.from_mesh.empty();
+            // A .glb path asks for GLB even when the caller left the format at its PLY default.
+            auto format = settings.file_format;
+            {
+                auto extension = core::path_to_utf8(path.extension());
+                std::ranges::transform(extension, extension.begin(),
+                                       [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (extension == ".glb" && format == core::MeshFileFormat::Ply)
+                    format = core::MeshFileFormat::Glb;
+            }
+            auto stem = from_file ? core::utf8_to_path(settings.from_mesh) : path;
+            stem.replace_extension();
+            if (format != core::MeshFileFormat::Glb && (!from_file || !mesh.tiled)) {
+                auto ply_path = stem;
+                ply_path += ".ply";
+                training::write_splat_mesh_ply(mesh, ply_path);
+            }
+            if (format != core::MeshFileFormat::Ply) {
+                auto glb_path = stem;
+                glb_path += ".glb";
+                training::write_splat_mesh_glb(mesh, glb_path);
+            }
             if (mesh.tiled) {
-                auto folder = path;
-                folder.replace_extension();
+                auto folder = stem;
                 folder += "_osgb";
                 training::write_splat_mesh_osgb(*mesh.tiled, folder, progress, stop);
             }

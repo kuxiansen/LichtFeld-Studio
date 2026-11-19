@@ -34,6 +34,7 @@ namespace lfs::training {
         std::vector<int32_t> uv_source; // per vertex, one number per point of the surface, whichever charts repeat it
         std::vector<size_t> page_first_face;
         std::vector<int> page_sizes;             // per page, when pages differ; else every page is page_size
+        std::vector<float> page_texels;          // per page, when the texels differ; else every page is the level's texel
         std::vector<float> face_error;           // how far each face may lie from the surface, when faces differ
         std::vector<std::vector<uint8_t>> pages; // RGB, sRGB as in the photos
         int page_size = 0;
@@ -120,13 +121,20 @@ namespace lfs::training {
     // Orders mesh.faces so that each returned range is a compact piece of space of at most max_faces faces
     // and max_extent scene units along each axis.
     [[nodiscard]] std::vector<std::pair<size_t, size_t>> split_mesh_into_pieces(SplatMesh& mesh, size_t max_faces, float max_extent, int threads);
+    // The same, over a run of mesh.faces: the other faces stay where they are.
+    [[nodiscard]] std::vector<std::pair<size_t, size_t>> split_mesh_range_into_pieces(SplatMesh& mesh, size_t first, size_t last, size_t max_faces, float max_extent, int threads);
 
-    // Gives the mesh charts packed onto pages of page_size texels of texel_size scene units each, repeating the
-    // vertices on chart seams and dropping faces without area. Works on pieces no chart of which can outgrow a page,
-    // of at most piece_faces. Neighboring pieces of up to group_faces in all share pages, packed apart from the others:
-    // packing runs on one thread and slows with the charts and pages it holds, and took over 50 minutes on an outdoor
-    // scene as one group. Each group's last page is partly empty. Sets uvs, page_first_face, page_size and charts.
-    void unwrap_splat_mesh(SplatMesh& mesh, float texel_size, int page_size, std::stop_token stop = {}, size_t piece_faces = 40'000, size_t group_faces = 1'000'000);
+    // Gives the mesh charts packed onto pages of texel_size scene units per texel, repeating the vertices on chart
+    // seams and dropping faces without area. No page is larger than max_page texels along a side. Works on pieces no
+    // chart of which can outgrow a page, of at most piece_faces. Neighboring pieces of up to group_faces in all share
+    // pages, packed apart from the others: packing runs on one thread and slows with the charts and pages it holds, and
+    // took over 50 minutes on an outdoor scene as one group. Each group's last page is partly empty.
+    // vertex_gsd, when given, is per vertex of mesh what one photo pixel covers there. The faces then fall into half
+    // octaves of that detail, and each octave unwraps at its own texel, rounded down it: a small sign keeps the photos'
+    // pixels while the far ground around it pays for no more. level doubles that texel, so a reduced level carries a
+    // coarser copy of the same detail. Sets uvs, page_first_face, page_size, page_sizes, page_texels and charts.
+    void unwrap_splat_mesh(SplatMesh& mesh, float texel_size, int max_page, std::stop_token stop = {}, size_t piece_faces = 40'000,
+                           size_t group_faces = 1'000'000, std::span<const float> vertex_gsd = {}, int level = 0);
 
     // The texels of a page that faces cover, and those within reach of a bilinear sample of them.
     struct MeshTexels {
@@ -187,6 +195,9 @@ namespace lfs::training {
 
     // The surface alone, connected across chart seams: the same geometry with a texture as without.
     void write_splat_mesh_ply(const SplatMesh& mesh, const std::filesystem::path& path);
+    // The surface as a self-contained glTF binary, y up. With pages, each becomes a primitive with its UVs and
+    // an embedded JPEG; without, the vertex colors are written and converted to linear, as glTF expects.
+    void write_splat_mesh_glb(const SplatMesh& mesh, const std::filesystem::path& path);
 
     // One level of detail of one tile: a span of the vertices and pages of TiledMesh::combined.
     struct TileLevel {
@@ -215,10 +226,12 @@ namespace lfs::training {
     // Splits the mesh into tiles of at most tile_faces, whose charts fit a page of max_page, and reduces each to up to
     // max_levels of detail: each allows 4 times the surface deviation of the last and doubles the texel. Vertices that tiles
     // share stay put on every level, so no cracks open between tiles. Reorders base.faces. Unwraps every level; baking remains.
-    [[nodiscard]] TiledMesh build_tiled_mesh(SplatMesh& base, float texel_size, int max_page, int max_levels, float finest_error, std::stop_token stop = {}, size_t tile_faces = 150'000);
+    // vertex_gsd, when given, is per vertex of base what one photo pixel covers there: a tile's texel then follows the
+    // tenth of its vertices the photos hold the sharpest, clamped, instead of the size asked for.
+    [[nodiscard]] TiledMesh build_tiled_mesh(SplatMesh& base, float texel_size, int max_page, int max_levels, float finest_error, std::stop_token stop = {}, size_t tile_faces = 150'000, std::span<const float> vertex_gsd = {});
     // The tiles and levels build_tiled_mesh would unwrap, without unwrapping: geometry only, each level's faces
     // carrying its own error. Reorders base.faces as build_tiled_mesh does.
-    [[nodiscard]] std::vector<TiledLevelGeometry> build_tiled_level_geometry(SplatMesh& base, float texel_size, int max_page, int max_levels, float finest_error, std::stop_token stop = {}, size_t tile_faces = 150'000);
+    [[nodiscard]] std::vector<TiledLevelGeometry> build_tiled_level_geometry(SplatMesh& base, float texel_size, int max_page, int max_levels, float finest_error, std::stop_token stop = {}, size_t tile_faces = 150'000, std::span<const float> vertex_gsd = {});
     // Writes a model DasViewer opens: folder/metadata.xml and folder/Data/<tile>/<tile>.osgb, the coarsest level of a tile, with
     // the next finer one paged in as the tile fills the screen.
     // A mesh from a PLY file, binary or text; polygons become fans. To bake a mesh made earlier or edited elsewhere.

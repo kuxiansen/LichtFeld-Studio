@@ -371,6 +371,64 @@ namespace lfs::training {
             return view;
         }
 
+        // The parts of a camera the ground sample distance reads: where it stands, how it turns, and how it puts an
+        // angle on the photo.
+        struct GsdLens {
+            std::array<float, 16> world_to_camera{}; // row major, from the world
+            std::array<float, 3> center{};           // the camera's own position in the world
+            float focal = 0.f;                       // pixels, the coarser axis
+            bool fisheye = false;
+            float radial[4] = {}; // k1..k4, the fisheye polynomial's
+        };
+
+        [[nodiscard]] std::vector<GsdLens> gsd_lenses(const std::span<core::Camera* const> views) {
+            std::vector<GsdLens> lenses(views.size());
+            for (size_t i = 0; i < views.size(); ++i) {
+                if (!views[i]->has_image())
+                    continue;
+                const auto view = make_view(*views[i]);
+                GsdLens& lens = lenses[i];
+                std::copy(std::begin(view.viewmat), std::end(view.viewmat), lens.world_to_camera.begin());
+                const float* m = view.viewmat; // its transpose rotates a direction back to the world
+                lens.center = {-(m[0] * m[3] + m[4] * m[7] + m[8] * m[11]),
+                               -(m[1] * m[3] + m[5] * m[7] + m[9] * m[11]),
+                               -(m[2] * m[3] + m[6] * m[7] + m[10] * m[11])};
+                lens.focal = std::min(view.fx, view.fy);
+                lens.fisheye = view.model == CameraModelType::FISHEYE || view.model == CameraModelType::THIN_PRISM_FISHEYE;
+                std::copy(std::begin(view.radial), std::begin(view.radial) + 4, lens.radial);
+            }
+            return lenses;
+        }
+
+        // What one photo pixel covers on a face, in metres: range / (pixels per radian * cosine), the cosine between the
+        // surface and the ray. Zero where the view says nothing about the face's detail. Pixels per radian is the
+        // fisheye polynomial's slope, or the pinhole's tangent that stretches with the square of the angle.
+        [[nodiscard]] double face_gsd(const GsdLens& lens, const float* middle, const double* normal, const double twice) {
+            if (!(lens.focal > 0.f))
+                return 0.;
+            const auto& center = lens.center;
+            const double ray[3] = {middle[0] - center[0], middle[1] - center[1], middle[2] - center[2]};
+            const double range = std::sqrt(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
+            if (!(range > 1e-3))
+                return 0.;
+            const double cosine = std::abs(normal[0] * ray[0] + normal[1] * ray[1] + normal[2] * ray[2]) / (twice * range);
+            if (cosine < .2) // past 78 degrees the footprint says nothing about detail
+                return 0.;
+            const float* m = lens.world_to_camera.data();
+            // How far off the lens axis the ray is, and how much the projection stretches there.
+            const double axis_angle = std::atan2(std::hypot(m[0] * middle[0] + m[1] * middle[1] + m[2] * middle[2] + m[3],
+                                                            m[4] * middle[0] + m[5] * middle[1] + m[6] * middle[2] + m[7]),
+                                                 double(m[8] * middle[0] + m[9] * middle[1] + m[10] * middle[2] + m[11]));
+            const double square = axis_angle * axis_angle;
+            // d(radius) / d(angle), in pixels per radian: the fisheye polynomial's slope, or the pinhole's tangent.
+            const double per_radian = lens.fisheye
+                ? double(lens.focal) * (1. + square * (3. * lens.radial[0] + square * (5. * lens.radial[1] + square * (7. * lens.radial[2] + 9. * square * lens.radial[3]))))
+                : double(lens.focal) / (std::cos(axis_angle) * std::cos(axis_angle));
+            if (!(per_radian > 0.))
+                return 0.;
+            return range / (per_radian * cosine);
+        }
+
         void camera_rays(const gsplat_lfs::TsdfView& view, float* rays, cudaStream_t stream) {
             const float K[9] = {view.fx, 0.f, view.cx, 0.f, view.fy, view.cy, 0.f, 0.f, 1.f};
             auto K_device = Tensor::from_vector(std::vector<float>(K, K + 9), {9}, Device::CUDA);
@@ -539,6 +597,15 @@ namespace lfs::training {
             std::unordered_map<const core::Camera*, Entry> entries;
             DeviceArray<uint32_t> device;
         };
+
+        // This camera's mask bits on the device, or null when it has none or they could not be used. They hold
+        // until the next view's depth is rendered, which is all a bake does between one view and its texels.
+        [[nodiscard]] const uint32_t* mask_bits(MaskCache& masks, const core::Camera& camera) {
+            if (!camera.has_mask())
+                return nullptr;
+            const auto found = masks.entries.find(&camera);
+            return found != masks.entries.end() && found->second.usable ? masks.device.data() : nullptr;
+        }
 
         // Renders a view's median depth, masked. The result stays valid until the next render.
         [[nodiscard]] Tensor render_median_depth(core::Camera& camera, core::SplatData& model,
@@ -2394,9 +2461,14 @@ namespace lfs::training {
     } // namespace
 
     std::vector<std::pair<size_t, size_t>> split_mesh_into_pieces(SplatMesh& mesh, const size_t max_faces, const float max_extent, const int threads) {
+        return split_mesh_range_into_pieces(mesh, 0, mesh.faces.size(), max_faces, max_extent, threads);
+    }
+
+    std::vector<std::pair<size_t, size_t>> split_mesh_range_into_pieces(SplatMesh& mesh, const size_t first, const size_t last, const size_t max_faces,
+                                                                         const float max_extent, const int threads) {
         std::vector<std::pair<size_t, size_t>> ranges;
         std::mutex ranges_mutex;
-        split_faces(mesh, 0, mesh.faces.size(), max_faces, max_extent, std::clamp(int(std::thread::hardware_concurrency()), 1, threads), ranges, ranges_mutex);
+        split_faces(mesh, first, last, max_faces, max_extent, std::clamp(int(std::thread::hardware_concurrency()), 1, threads), ranges, ranges_mutex);
         std::ranges::sort(ranges);
         return ranges;
     }
@@ -2496,6 +2568,69 @@ namespace lfs::training {
             return {.labels = std::move(face_views), .candidates = std::move(candidates)};
         }
 
+        // Per vertex, what one photo pixel covers on the faces around it, area weighted, from the view that sets each
+        // face's detail: the bake takes that view's pixel, so its footprint is the finest the face can show whatever a
+        // sharper but unlabeled view could give. Falls back to the best view where none labels the face.
+        // Infinite where no view sees the vertex.
+        [[nodiscard]] std::vector<float> vertex_gsd(const SplatMesh& mesh, const FaceViewCandidates& candidates,
+                                                    const std::span<const int32_t> face_views,
+                                                    const std::span<core::Camera* const> views, const std::stop_token stop) {
+            const auto lenses = gsd_lenses(views);
+            const size_t face_count = mesh.faces.size();
+            std::vector<float> faces(face_count, 0.f);
+            std::vector<double> areas(face_count, 0.);
+            detail::parallel_for(face_count, kSimplifyThreads, [&](const size_t f) {
+                if (stop.stop_requested())
+                    return;
+                const auto& a = mesh.vertices[size_t(mesh.faces[f][0])];
+                const auto& b = mesh.vertices[size_t(mesh.faces[f][1])];
+                const auto& c = mesh.vertices[size_t(mesh.faces[f][2])];
+                const double u[3] = {double(b[0]) - a[0], double(b[1]) - a[1], double(b[2]) - a[2]};
+                const double v[3] = {double(c[0]) - a[0], double(c[1]) - a[1], double(c[2]) - a[2]};
+                const double n[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+                const double twice = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                if (!(twice > 0.))
+                    return;
+                const float middle[3] = {(a[0] + b[0] + c[0]) / 3.f, (a[1] + b[1] + c[1]) / 3.f, (a[2] + b[2] + c[2]) / 3.f};
+                constexpr size_t kSlots = FaceViewCandidates::kPerFace;
+                size_t slot = 0, last = kSlots;
+                if (const int32_t chosen = f < face_views.size() ? face_views[f] : -1; chosen >= 0) {
+                    for (size_t s = 0; s < kSlots; ++s)
+                        if (candidates.views[f * kSlots + s] == chosen) {
+                            slot = s;
+                            last = s + 1;
+                            break;
+                        }
+                }
+                double best = INFINITY;
+                for (; slot < last && candidates.scores[f * kSlots + slot] > 0.f; ++slot) {
+                    const auto index = size_t(candidates.views[f * kSlots + slot]);
+                    if (const double gsd = face_gsd(lenses[index], middle, n, twice); gsd > 0.)
+                        best = std::min(best, gsd);
+                }
+                if (best < INFINITY) {
+                    faces[f] = float(best);
+                    areas[f] = .5 * twice;
+                }
+            });
+            if (stop.stop_requested())
+                throw core::OperationCancelled();
+            std::vector<double> sum(mesh.vertices.size(), 0.), weight(mesh.vertices.size(), 0.);
+            for (size_t f = 0; f < face_count; ++f) {
+                if (!(faces[f] > 0.f))
+                    continue;
+                for (const auto vertex : mesh.faces[f]) {
+                    sum[size_t(vertex)] += double(faces[f]) * areas[f];
+                    weight[size_t(vertex)] += areas[f];
+                }
+            }
+            std::vector<float> gsd(mesh.vertices.size(), INFINITY);
+            for (size_t v = 0; v < gsd.size(); ++v)
+                if (weight[v] > 0.)
+                    gsd[v] = float(sum[v] / weight[v]);
+            return gsd;
+        }
+
         // Takes each page's colors from the photos, through the same appearance inverse as the vertex colors. Uses every
         // photo: a surface's best view is one or two photos out of hundreds, and a stride leaves it out by chance, which
         // took lettering from 7 m instead of 2.5 m.
@@ -2560,28 +2695,8 @@ namespace lfs::training {
             // Chosen against best says whether a coarser view was taken; chosen against the texel size says whether
             // a finer texel could add anything at all.
             if (const char* diag = std::getenv("LFS_MESH_TEX_DIAG"); diag != nullptr && *diag != '\0') {
-                struct Lens {
-                    std::array<float, 16> world_to_camera{}; // row major, from the world
-                    std::array<float, 3> center{};           // the camera's own position in the world
-                    float focal = 0.f;                       // pixels, the coarser axis
-                    bool fisheye = false;
-                    float radial[4] = {};                    // k1..k4, the fisheye polynomial's
-                };
-                std::vector<Lens> lenses(views.size());
-                for (size_t i = 0; i < views.size(); ++i) {
-                    if (!views[i]->has_image())
-                        continue;
-                    const auto view = make_view(*views[i]);
-                    Lens& lens = lenses[i];
-                    std::copy(std::begin(view.viewmat), std::end(view.viewmat), lens.world_to_camera.begin());
-                    const float* m = view.viewmat; // its transpose rotates a direction back to the world
-                    lens.center = {-(m[0] * m[3] + m[4] * m[7] + m[8] * m[11]),
-                                   -(m[1] * m[3] + m[5] * m[7] + m[9] * m[11]),
-                                   -(m[2] * m[3] + m[6] * m[7] + m[10] * m[11])};
-                    lens.focal = std::min(view.fx, view.fy);
-                    lens.fisheye = view.model == CameraModelType::FISHEYE || view.model == CameraModelType::THIN_PRISM_FISHEYE;
-                    std::copy(std::begin(view.radial), std::begin(view.radial) + 4, lens.radial);
-                }
+                const auto lenses = gsd_lenses(views);
+
                 // Area weighted, in halvings: a few bins answer quantiles without sorting.
                 struct Bins {
                     double lo = 0., hi = 1., total = 0.;
@@ -2620,29 +2735,9 @@ namespace lfs::training {
                     double best = INFINITY, picked = 0.;
                     for (size_t slot = 0; slot < kCandidates && candidates.scores[f * kCandidates + slot] > 0.f; ++slot) {
                         const auto index = size_t(candidates.views[f * kCandidates + slot]);
-                        const auto& lens = lenses[index];
-                        if (!(lens.focal > 0.f))
+                        const double gsd = face_gsd(lenses[index], middle, n, twice);
+                        if (!(gsd > 0.))
                             continue;
-                        const auto& center = lens.center;
-                        const double ray[3] = {middle[0] - center[0], middle[1] - center[1], middle[2] - center[2]};
-                        const double range = std::sqrt(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
-                        if (!(range > 1e-3))
-                            continue;
-                        // How squarely the surface meets the ray, and how far off the lens axis the ray is.
-                        const double cosine = std::abs(n[0] * ray[0] + n[1] * ray[1] + n[2] * ray[2]) / (twice * range);
-                        if (cosine < .2) // past 78 degrees the footprint says nothing about detail
-                            continue;
-                        const float* m = lens.world_to_camera.data();
-                        const double axis_angle = std::atan2(std::hypot(m[0] * middle[0] + m[1] * middle[1] + m[2] * middle[2] + m[3],
-                                                                       m[4] * middle[0] + m[5] * middle[1] + m[6] * middle[2] + m[7]),
-                                                             double(m[8] * middle[0] + m[9] * middle[1] + m[10] * middle[2] + m[11]));
-                        const double square = axis_angle * axis_angle;
-                        // d(radius) / d(angle), in pixels per radian: the fisheye polynomial's slope, or the
-                        // pinhole's tangent that stretches with the square of the angle.
-                        const double per_radian = lens.fisheye
-                            ? double(lens.focal) * (1. + square * (3. * lens.radial[0] + square * (5. * lens.radial[1] + square * (7. * lens.radial[2] + 9. * square * lens.radial[3]))))
-                            : double(lens.focal) / (std::cos(axis_angle) * std::cos(axis_angle));
-                        const double gsd = range / (per_radian * cosine);
                         best = std::min(best, gsd);
                         if (static_cast<int32_t>(index) == face_views[f])
                             picked = gsd;
@@ -2765,7 +2860,7 @@ namespace lfs::training {
                 batch_views_total += views.size();
             }
 
-            size_t observed = 0, total = 0, batch_views_done = 0;
+            size_t observed = 0, direct = 0, total = 0, batch_views_done = 0;
             for (size_t b = 0; b < batches.size(); ++b) {
                 const auto& batch = batches[b];
                 const bool with_seams = b == 0 && sample_count > 0;
@@ -2815,10 +2910,10 @@ namespace lfs::training {
                     // Blurred, so that misregistration and grain do not read as a step.
                     if (with_seams)
                         gsplat_lfs::mesh_texture_accumulate(seams.positions.data(), sample_count, view, static_cast<int32_t>(i), seams.labels.data(), depth.ptr<float>(), low.data(), low.data(), seams.tolerances.data(),
-                                                            seams.sum.data(), seams.weight.data(), seams.high.data(), seams.best.data(), stream);
+                                                            mask_bits(masks, camera), seams.sum.data(), seams.weight.data(), seams.high.data(), seams.best.data(), stream);
                     if (batch.uses_view[i])
                         gsplat_lfs::mesh_texture_accumulate(positions.data(), static_cast<uint32_t>(count), view, static_cast<int32_t>(i), labels.data(), depth.ptr<float>(), photo.ptr<float>(), low.data(), tolerances.data(),
-                                                            low_sum.data(), low_weight.data(), high.data(), best_weight.data(), stream);
+                                                            mask_bits(masks, camera), low_sum.data(), low_weight.data(), high.data(), best_weight.data(), stream);
                     LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture");
                 }
                 // The batch's sums stay on the GPU while the leveling is solved, and come down a few pages at a time.
@@ -2829,6 +2924,7 @@ namespace lfs::training {
                     page_offsets[p + 1] = page_offsets[p] + covered[batch.first_page + p];
                 std::vector<float> sums, sum_weights, highs, bests;
                 std::atomic<size_t> seen_here{0};
+                std::atomic<size_t> direct_here{0};
                 for (size_t first = 0; first < pages_here;) {
                     size_t last = first + 1;
                     while (last < pages_here && page_offsets[last + 1] - page_offsets[first] <= kComposeChunkTexels)
@@ -2862,6 +2958,8 @@ namespace lfs::training {
                             float level[3];
                             leveling.offset_at(mesh, texels[p].faces[t], &texels[p].positions[3 * t], level);
                             const bool direct = std::isinf(bests[at]);
+                            if (direct)
+                                direct_here.fetch_add(1, std::memory_order_relaxed);
                             for (size_t c = 0; c < 3; ++c)
                                 colors[3 * t + c] = std::max((direct ? 0.f : sums[3 * at + c] / sum_weights[at]) + highs[3 * at + c] + level[c], 0.f);
                         }
@@ -2875,11 +2973,13 @@ namespace lfs::training {
                     first = last;
                 }
                 observed += seen_here;
+                direct += direct_here;
                 total += count;
             }
             mesh.texels = total;
             mesh.observed_texel_share = total > 0 ? float(observed) / float(total) : 0.f;
-            LOG_INFO("Mesh: {} pages, {} texels, {:.1f}% seen by a view", page_count, total, 100.f * mesh.observed_texel_share);
+            LOG_INFO("Mesh: {} pages, {} texels, {:.1f}% seen by a view, {:.1f}% of those take the face's own pixel",
+                     page_count, total, 100.f * mesh.observed_texel_share, 100. * double(direct) / double(std::max<size_t>(observed, 1)));
         }
 
         // The affine patch texture over the tile levels: one pass chooses every level's views, one pass over the
@@ -3265,6 +3365,11 @@ namespace lfs::training {
                      settings.ear_cut_holes > 0 ? std::format("ear cut under {} edges, fan for the rest", settings.ear_cut_holes) : "fan",
                      second_topology, post_clean,
                      isolated_dropped > 0 ? std::format(", {} from small isolated components", isolated_dropped) : std::string{});
+            // The passes above delete faces the simplifier had counted, so the area it measured is stale.
+            // The RAM preflight reads it; recomputing here keeps that estimate on the surface that is left.
+            sub = Clock::now();
+            compute_splat_mesh_normals(mesh);
+            LOG_INFO("Mesh: surface after cleanup is {:.0f} m2, normals in {:.2f}s", mesh.area, seconds_since(sub));
             // No topology clean after the final hole fill. A full clean would collapse coincident
             // vertices and split non-manifold ones, which can reopen holes the fills just closed.
             // The non-manifold-only pass already happens before that final fill so its light touch
@@ -3362,7 +3467,15 @@ namespace lfs::training {
             } else {
                 core::reportProgress(stop, progress, .5f, stage("mesh.stage_unwrap", "Unwrapping"));
                 const int levels = std::clamp(resolved.lod_levels, 1, kOsgbMaxLevels);
-                mesh.tiled = std::make_shared<TiledMesh>(build_tiled_mesh(mesh, resolved.texel_size, std::min(resolved.texture_size, kOsgbMaxPage), levels, resolved.simplify_error, stop));
+                // A tile's texel follows the photos that see it, so the choice needs them first: the view that sets each
+                // face's detail, then what one pixel of it covers there.
+                std::vector<float> gsd;
+                {
+                    auto choice = choose_mesh_face_views(mesh, model, all_views, resolved, stream,
+                                                         [&](const float value) { core::reportProgress(stop, progress, .5f + .07f * value, stage("mesh.stage_unwrap", "Reading the photos")); });
+                    gsd = vertex_gsd(mesh, choice.candidates, choice.labels, all_views, stop);
+                }
+                mesh.tiled = std::make_shared<TiledMesh>(build_tiled_mesh(mesh, resolved.texel_size, std::min(resolved.texture_size, kOsgbMaxPage), levels, resolved.simplify_error, stop, 150'000, gsd));
                 mesh.seconds_unwrap = seconds_since(step);
                 step = Clock::now();
                 // The levels of a tile stay together, and tiles come in the order of the splits: neighbors in the list are neighbors in space.

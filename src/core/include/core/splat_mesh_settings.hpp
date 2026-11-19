@@ -7,6 +7,14 @@
 
 namespace lfs::core {
 
+    // What the mesh is written as beside the OSGB model: a vertex-colored PLY, a GLB that embeds the texture
+    // pages as JPEGs when the mesh has them, or both.
+    enum class MeshFileFormat {
+        Ply = 0,
+        Glb = 1,
+        PlyAndGlb = 2,
+    };
+
     // Distances are in scene units. The defaults are tuned on metric indoor scans.
     struct SplatMeshSettings {
         float voxel_size = .0f; // 0 derives the voxel as 0.75x the model's median splat spacing
@@ -69,6 +77,7 @@ namespace lfs::core {
         int seam_leveling_mode = 0;
         int texture_width = 0;         // render and photo width limit when baking; 0 = the photos' own
         std::string from_mesh;         // a PLY to bake instead of extracting the surface, UTF-8
+        MeshFileFormat file_format = MeshFileFormat::Ply;
         bool invert_mask = false;
         float mask_threshold = .5f;
 

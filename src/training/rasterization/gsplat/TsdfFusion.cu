@@ -19,6 +19,11 @@ namespace gsplat_lfs {
         // Keep a view that sees a vertex at all from dropping to nothing, and depth noise on a
         // very close view from taking over.
         constexpr float kColorMinDistance = 0.5f;
+        // How far past a surface a depth may lie and still be taken for it, as a multiple of the
+        // depth band. A depth in front is an occluder and says nothing about the surface; a depth
+        // behind is the mesh and the splats disagreeing about where the surface is, and the photo
+        // still holds its color. The multiple keeps a hole in the splats from taking the background.
+        constexpr float kBehindTolerance = 2.f;
 
         // Calls body once with this view's camera model.
         template <class Body>
@@ -512,7 +517,7 @@ namespace gsplat_lfs {
         }
 
         __global__ void texture_kernel(const float* texels, const uint32_t count, const TsdfView view, const int32_t view_label, const int32_t* labels, const float* depth, const float* photo,
-                                       const float* low_photo, const float* tolerances,
+                                       const float* low_photo, const float* tolerances, const uint32_t* mask,
                                        float* low_sum, float* low_weight, float* high, float* best_weight) {
             const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) * kVerticesPerThread;
             if (first >= count)
@@ -533,22 +538,61 @@ namespace gsplat_lfs {
                     if (fx0 < 0.f || fy0 < 0.f || fx0 + 1.f >= static_cast<float>(view.width) || fy0 + 1.f >= static_cast<float>(view.height))
                         continue;
                     const uint32_t at = static_cast<uint32_t>(fy0) * width + static_cast<uint32_t>(fx0);
-                    // A texel next to an occluding edge or a mask has no clean color in this view.
-                    const float corners[4] = {depth[at], depth[at + 1], depth[at + width], depth[at + width + 1]};
+                    // A texel next to an occluding edge has no clean color in this view. Only a depth in front of
+                    // the surface hides it; one behind is the mesh and the splats disagreeing about the surface,
+                    // which the photo still colors correctly. Refusing those used to blank almost half the texels,
+                    // which then took a blend of the other views and lost the sharpness of lettering.
+                    const bool chosen = labels[t] == view_label;
                     bool clean = true;
-                    for (const float measured : corners)
-                        clean = clean && measured > 0.f && fabsf(measured - pixel.range) < tolerances[t];
+                    for (int k = 0; k < 4; ++k) {
+                        const uint32_t corner = at + uint32_t(k >> 1) * width + uint32_t(k & 1);
+                        // A masked pixel has no depth either, but the photo there holds the object the mask took
+                        // out, so it must not color the surface even for the view that owns the texel. The bits
+                        // mark the pixels that are kept, as mesh_apply_mask reads them.
+                        if (mask != nullptr && ((mask[corner >> 5] >> (corner & 31)) & 1u) == 0u) {
+                            clean = false;
+                            break;
+                        }
+                        // A hole in the splats is not an occluder. The face-level score already vouched that the
+                        // view that owns this texel sees the face, and demanding a depth at every corner of it
+                        // blanked most thin lettering, which the blend then washed out. The other views have no
+                        // such voucher and keep the strict test, so their detail is not taken from a hole.
+                        const float measured = depth[corner];
+                        if (chosen) {
+                            // The face's own view was vouched for by the face-level score, seven points of which had
+                            // to lie on the surface. A 5 mm texel is finer than the depth map can resolve, so letting
+                            // the four corners veto it turned most of the lettering into the blurred blend of the
+                            // other views. The patch path copies these pixels without asking the depth at all.
+                            continue;
+                        }
+                        if (measured <= 0.f) {
+                            clean = false;
+                            continue;
+                        }
+                        clean = clean && measured >= pixel.range - tolerances[t] &&
+                                measured <= pixel.range + kBehindTolerance * tolerances[t];
+                    }
                     if (!clean)
                         continue;
                     const float w = 1.f / fmaxf(glm::length(center - point), kColorMinDistance);
+                    // The view chosen for the face owns this texel: take its pixel whole. A texel here is usually
+                    // finer than one photo pixel, and bilinear then blends the four pixels around it, which is exactly
+                    // what washes lettering out; the patch path copies the pixel and stays sharp.
                     float color[3], low[3];
-                    sample_bilinear(photo, pixels, at, width, sx - fx0, sy - fy0, color);
+                    if (chosen) {
+                        const uint32_t nx = min(static_cast<uint32_t>(max(sx + .5f, 0.f)), width - 1);
+                        const uint32_t ny = min(static_cast<uint32_t>(max(sy + .5f, 0.f)), view.height - 1);
+                        const uint64_t nearest = static_cast<uint64_t>(ny) * width + nx;
+                        for (uint32_t c = 0; c < 3; ++c)
+                            color[c] = photo[c * static_cast<uint64_t>(pixels) + nearest];
+                    } else {
+                        sample_bilinear(photo, pixels, at, width, sx - fx0, sy - fy0, color);
+                    }
                     sample_bilinear(low_photo, pixels, at, width, sx - fx0, sy - fy0, low);
                     for (uint32_t c = 0; c < 3; ++c)
                         low_sum[3 * static_cast<uint64_t>(t) + c] += w * low[c];
                     low_weight[t] += w;
                     // The chosen view keeps its whole color, and another view only its detail, over the levels of all.
-                    const bool chosen = labels[t] == view_label;
                     const float rank = chosen ? INFINITY : w;
                     if (rank > best_weight[t]) {
                         best_weight[t] = rank;
@@ -721,10 +765,10 @@ namespace gsplat_lfs {
     }
 
     void mesh_texture_accumulate(const float* texels, const uint32_t count, const TsdfView& view, const int32_t view_label, const int32_t* labels, const float* depth, const float* photo,
-                                 const float* low_photo, const float* tolerances, float* low_sum, float* low_weight,
+                                 const float* low_photo, const float* tolerances, const uint32_t* mask, float* low_sum, float* low_weight,
                                  float* high, float* best_weight, cudaStream_t stream) {
         const uint64_t threads = (static_cast<uint64_t>(count) + kVerticesPerThread - 1) / kVerticesPerThread;
-        texture_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(texels, count, view, view_label, labels, depth, photo, low_photo, tolerances, low_sum, low_weight, high, best_weight);
+        texture_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(texels, count, view, view_label, labels, depth, photo, low_photo, tolerances, mask, low_sum, low_weight, high, best_weight);
         LFS_CUDA_LAUNCH_CHECK(stream, "mesh.texture");
     }
 

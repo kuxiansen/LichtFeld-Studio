@@ -134,6 +134,7 @@ set(TRAINING_NEW_SOURCES
         splat_mesh_patch_tiles.cpp
         splat_mesh_tiles.cpp
         splat_mesh_osgb.cpp
+        splat_mesh_glb.cpp
         ${CMAKE_SOURCE_DIR}/external/xatlas/xatlas.cpp
         training_cropbox_mask.cpp
         trainer.cpp

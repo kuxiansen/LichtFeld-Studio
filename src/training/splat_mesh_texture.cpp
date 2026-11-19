@@ -5,10 +5,12 @@
 #include "splat_mesh.hpp"
 #include "splat_mesh_parallel.hpp"
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <span>
@@ -25,6 +27,13 @@ namespace lfs::training {
         // Reaches what bilinear sampling reads from the edge of a chart.
         constexpr double kCoverageMarginTexels = .75;
         constexpr int kFillRings = 8;
+        constexpr int kMinPageSize = 256;
+        // Chart padding and packing waste, on top of the texels a chunk's area asks for.
+        constexpr double kPagePackingSlack = 1.8;
+        // The bounds of the photos' own detail: a finer texel would hold less than a photo pixel, a coarser one loses
+        // what the photos do hold. Same bounds as a tile's texel.
+        constexpr float kPhotoTexelMin = .002f;
+        constexpr float kPhotoTexelMax = .064f;
 
         struct AtlasDeleter {
             void operator()(xatlas::Atlas* atlas) const { xatlas::Destroy(atlas); }
@@ -32,6 +41,25 @@ namespace lfs::training {
 
         bool keep_going(xatlas::ProgressCategory, int, void* user) {
             return !static_cast<const std::stop_token*>(user)->stop_requested();
+        }
+
+        // A face's octave of photo detail, as twice the binary exponent of what one photo pixel covers there: the
+        // octaves over the photos' range are 2, 2.8, 4 ... 64 mm. An octave rounds down, so its texel is never coarser
+        // than the photos and at most 1.4 times finer.
+        [[nodiscard]] int texel_octave(const float gsd, const float fallback) {
+            const float detail = std::isfinite(gsd) && gsd > 0.f ? gsd : fallback;
+            return static_cast<int>(std::floor(std::log2(std::clamp(detail, kPhotoTexelMin, kPhotoTexelMax)) * 2.f));
+        }
+
+        [[nodiscard]] float octave_texel(const int octave) {
+            return std::clamp(std::exp2(.5f * float(octave)), kPhotoTexelMin, kPhotoTexelMax);
+        }
+
+        // The page side, rounded up to a power of two, that this many texels need.
+        [[nodiscard]] int page_side_for_texels(const double texels, const int max_page) {
+            const double side = std::sqrt(kPagePackingSlack * texels);
+            const auto power = std::bit_ceil(static_cast<uint32_t>(std::max(side, double(kMinPageSize))));
+            return std::min(static_cast<int>(power), max_page);
         }
     } // namespace
 
@@ -125,21 +153,94 @@ namespace lfs::training {
         }
     } // namespace
 
-    void unwrap_splat_mesh(SplatMesh& mesh, const float texel_size, const int page_size, const std::stop_token stop, const size_t piece_faces, const size_t group_faces) {
-        const float max_extent = kPieceShareOfPage * float(page_size) * texel_size;
-        const auto ranges = split_mesh_into_pieces(mesh, piece_faces, max_extent, kUnwrapThreads);
+    void unwrap_splat_mesh(SplatMesh& mesh, const float texel_size, const int max_page, const std::stop_token stop, const size_t piece_faces,
+                           const size_t group_faces, const std::span<const float> vertex_gsd, const int level) {
+        // A run of faces unwrapped at one texel, and the pages one or more such runs pack onto together.
+        struct Piece {
+            size_t first = 0, last = 0;
+            float texel = 0.f;
+        };
+        struct Job {
+            std::vector<std::pair<size_t, size_t>> ranges;
+            float texel = 0.f;
+            int page_size = 0;
+        };
+        const auto area_of = [&mesh](const size_t first, const size_t last) {
+            double area = 0.;
+            for (size_t f = first; f < last; ++f) {
+                const auto& a = mesh.vertices[size_t(mesh.faces[f][0])];
+                const auto& b = mesh.vertices[size_t(mesh.faces[f][1])];
+                const auto& c = mesh.vertices[size_t(mesh.faces[f][2])];
+                const double u[3] = {double(b[0]) - a[0], double(b[1]) - a[1], double(b[2]) - a[2]};
+                const double v[3] = {double(c[0]) - a[0], double(c[1]) - a[1], double(c[2]) - a[2]};
+                area += .5 * std::hypot(u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]);
+            }
+            return area;
+        };
 
-        // The pieces come in the order of the splits, so neighbors in the list are neighbors in space.
-        std::vector<std::span<const std::pair<size_t, size_t>>> group_ranges;
-        for (size_t first = 0; first < ranges.size();) {
+        std::vector<Piece> pieces;
+        const size_t input_faces = mesh.faces.size();
+        // A reduced level keeps the photos' detail at twice the texel per level it sits above the finest.
+        const float texel_scale = std::exp2(float(level));
+        if (vertex_gsd.size() == mesh.vertices.size() && !mesh.faces.empty()) {
+            // Faces of one octave of photo detail run together, so that each octave packs apart from the others.
+            std::vector<int> octaves(mesh.faces.size());
+            std::map<int, size_t> counts, starts, next;
+            for (size_t f = 0; f < mesh.faces.size(); ++f) {
+                float gsd = INFINITY;
+                for (const auto vertex : mesh.faces[f])
+                    gsd = std::min(gsd, vertex_gsd[size_t(vertex)]);
+                octaves[f] = texel_octave(gsd, texel_size);
+                ++counts[octaves[f]];
+            }
+            size_t at = 0;
+            for (const auto& [octave, count] : counts) {
+                starts[octave] = at;
+                next[octave] = at;
+                at += count;
+            }
+            std::vector<std::array<int32_t, 3>> ordered(mesh.faces.size());
+            std::vector<float> ordered_errors(mesh.face_error.size());
+            for (size_t f = 0; f < mesh.faces.size(); ++f) {
+                const auto slot = next[octaves[f]]++;
+                ordered[slot] = mesh.faces[f];
+                if (!ordered_errors.empty())
+                    ordered_errors[slot] = mesh.face_error[f];
+            }
+            mesh.faces = std::move(ordered);
+            mesh.face_error = std::move(ordered_errors);
+            for (const auto& [octave, count] : counts) {
+                const size_t first = starts[octave], last = first + count;
+                const float texel = octave_texel(octave) * texel_scale;
+                const int side = page_side_for_texels(area_of(first, last) / (double(texel) * texel), max_page);
+                const float max_extent = kPieceShareOfPage * float(side) * texel;
+                for (const auto& [piece_first, piece_last] : split_mesh_range_into_pieces(mesh, first, last, piece_faces, max_extent, kUnwrapThreads))
+                    pieces.push_back({piece_first, piece_last, texel});
+            }
+        } else {
+            const int side = page_side_for_texels(area_of(0, mesh.faces.size()) / (double(texel_size) * texel_size), max_page);
+            const float max_extent = kPieceShareOfPage * float(side) * texel_size;
+            for (const auto& [first, last] : split_mesh_into_pieces(mesh, piece_faces, max_extent, kUnwrapThreads))
+                pieces.push_back({first, last, texel_size});
+        }
+
+        // The pieces come in the order of the splits, so neighbors in the list are neighbors in space, and pieces at
+        // one texel share pages.
+        std::vector<Job> jobs;
+        for (size_t first = 0; first < pieces.size();) {
             size_t last = first + 1;
-            while (last < ranges.size() && ranges[last].second - ranges[first].first <= group_faces)
+            while (last < pieces.size() && pieces[last].texel == pieces[first].texel && pieces[last].last - pieces[first].first <= group_faces)
                 ++last;
-            group_ranges.emplace_back(ranges.data() + first, last - first);
+            Job job;
+            job.texel = pieces[first].texel;
+            for (size_t p = first; p < last; ++p)
+                job.ranges.emplace_back(pieces[p].first, pieces[p].last);
+            job.page_size = page_side_for_texels(area_of(pieces[first].first, pieces[last - 1].last) / (double(job.texel) * job.texel), max_page);
+            jobs.push_back(std::move(job));
             first = last;
         }
-        std::vector<UnwrappedGroup> groups(group_ranges.size());
-        detail::parallel_for(groups.size(), kUnwrapThreads, [&](const size_t g) { groups[g] = unwrap_group(mesh, group_ranges[g], texel_size, page_size, stop); });
+        std::vector<UnwrappedGroup> groups(jobs.size());
+        detail::parallel_for(groups.size(), kUnwrapThreads, [&](const size_t g) { groups[g] = unwrap_group(mesh, jobs[g].ranges, jobs[g].texel, jobs[g].page_size, stop); });
 
         size_t vertex_count = 0, face_count = 0, charts = 0;
         double seconds_charts = 0., seconds_packing = 0.;
@@ -165,7 +266,10 @@ namespace lfs::training {
         uvs.reserve(vertex_count);
         faces.reserve(face_count);
         std::vector<size_t> page_first_face{0};
-        for (auto& group : groups) {
+        std::vector<int> page_sizes;
+        std::vector<float> page_texels;
+        for (size_t g = 0; g < groups.size(); ++g) {
+            auto& group = groups[g];
             const auto base = static_cast<int32_t>(vertices.size());
             for (const auto source : group.sources) {
                 uv_source.push_back(source);
@@ -180,11 +284,13 @@ namespace lfs::training {
                 for (const auto& face : page)
                     faces.push_back({base + face[0], base + face[1], base + face[2]});
                 page_first_face.push_back(faces.size());
+                page_sizes.push_back(jobs[g].page_size);
+                page_texels.push_back(jobs[g].texel);
             }
             group = {};
         }
         LOG_INFO("Mesh: {} faces in {} charts on {} pages from {} groups; {:.1f} s of charts, {:.1f} s of packing over all groups; {} faces without area left out", faces.size(), charts,
-                 page_first_face.size() - 1, groups.size(), seconds_charts, seconds_packing, mesh.faces.size() - faces.size());
+                 page_first_face.size() - 1, groups.size(), seconds_charts, seconds_packing, input_faces - faces.size());
         mesh.vertices = std::move(vertices);
         mesh.normals = std::move(normals);
         mesh.colors = std::move(colors);
@@ -192,7 +298,9 @@ namespace lfs::training {
         mesh.uvs = std::move(uvs);
         mesh.uv_source = std::move(uv_source);
         mesh.page_first_face = std::move(page_first_face);
-        mesh.page_size = page_size;
+        mesh.page_size = page_sizes.empty() ? max_page : *std::max_element(page_sizes.begin(), page_sizes.end());
+        mesh.page_sizes = std::move(page_sizes);
+        mesh.page_texels = std::move(page_texels);
         mesh.charts = charts;
     }
 
