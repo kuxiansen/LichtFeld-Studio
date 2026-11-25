@@ -51,6 +51,11 @@ set(TENSOR_SOURCES
         nn/weight_file.cpp
         nn/weight_file_open.cpp
         nn/activation_arena.cpp
+        nn/models/bert_text.cpp
+        nn/models/swin_tiny.cpp
+        nn/models/llmdet_encoder.cpp
+        nn/models/llmdet_decoder.cpp
+        nn/models/llmdet.cpp
         nn/models/moge2.cpp
         nn/models/sam2.cpp
         nn/models/sam2_video.cpp
@@ -64,6 +69,7 @@ set(CORE_SOURCES
         crash_handler.cpp
         cuda_error.cpp
         cuda_error_typed.cpp
+        cuda_vulkan_device_identity.cpp
         device_fault.cpp
         error.cpp
         error_bus.cpp
@@ -82,6 +88,7 @@ set(CORE_SOURCES
         animatable_property.cpp
         argument_parser.cpp
         camera.cpp
+        camera_views.cpp
         collision_volume.cpp
         collision_walk.cpp
         collision_voxelization.cpp
@@ -156,7 +163,7 @@ target_link_libraries(lfs_core
         CUDA::curand
         spdlog::spdlog
     PRIVATE
-        lfs_core_cuda
+        $<LINK_LIBRARY:WHOLE_ARCHIVE,lfs_core_cuda>
         lfs_tensor_kernels
         lfs_nn_kernels
         taywee::args

@@ -5,7 +5,7 @@
 #pragma once
 
 #include "Common.h"
-#include "FreeSpace.h"
+#include "Ops.h"
 #include "TileBatch.h"
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -27,6 +27,9 @@ namespace gsplat_lfs {
         const float* backgrounds, // [C, CDIM] optional (can be nullptr) - solid color
         const float* bg_images,   // [C, CDIM, H, W] optional (can be nullptr) - per-pixel background
         const bool* masks,        // [C, tile_height, tile_width] optional
+        // [C, N] mip filter: opacity factor and world variance added to every squared scale (nullptr: off)
+        const float* compensations,
+        const float* dilations,
         // dimensions
         uint32_t C,
         uint32_t N,
@@ -52,7 +55,7 @@ namespace gsplat_lfs {
         float* alphas,     // [C, image_height, image_width, 1]
         int32_t* last_ids, // [C, image_height, image_width]
         cudaStream_t stream = nullptr, TileRange tiles = {},
-        const FreeSpaceRender& free_space = {},
+        float* median_depth = nullptr,
         const ScreenFootprint& footprint = {}); // lets the micro-tile forward cull sub-tiles
 
     /////////////////////////////////////////////////
@@ -70,6 +73,9 @@ namespace gsplat_lfs {
         const float* backgrounds, // [C, CDIM] optional - solid color
         const float* bg_images,   // [C, CDIM, H, W] optional - per-pixel background
         const bool* masks,        // optional
+        // [C, N] mip filter: opacity factor and world variance added to every squared scale (nullptr: off)
+        const float* compensations,
+        const float* dilations,
         // dimensions
         uint32_t C,
         uint32_t N,
@@ -108,8 +114,9 @@ namespace gsplat_lfs {
         const float* edge_weight_map,         // [H, W] or nullptr
         float* edge_score_out,                // [N] or nullptr
         cudaStream_t stream = nullptr, TileRange tiles = {},
-        const FreeSpaceRender& free_space = {},
-        const ScreenFootprint& footprint = {}); // lets the per-splat backward cull sub-tiles
+        const ScreenFootprint& footprint = {}, // lets the per-splat backward cull sub-tiles
+        const ColorVarianceRender& color_variance = {},
+        float* blend_peak_out = nullptr);
 
     /////////////////////////////////////////////////
     // rasterize_to_indices_3dgs

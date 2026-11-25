@@ -37,6 +37,8 @@ namespace gsplat_lfs {
         const float* backgrounds,
         const float* bg_images,
         const bool* masks,
+        const float* compensations,
+        const float* dilations,
         uint32_t C,
         uint32_t N,
         uint32_t n_isects,
@@ -59,7 +61,7 @@ namespace gsplat_lfs {
         float* alphas,
         int32_t* last_ids,
         cudaStream_t stream, TileRange tiles,
-        const FreeSpaceRender& free_space,
+        float* median_depth,
         const ScreenFootprint& footprint) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
@@ -74,13 +76,14 @@ namespace gsplat_lfs {
     case CDIM:                                                       \
         launch_rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM>( \
             means, quats, scales, colors, opacities,                 \
-            backgrounds, bg_images, masks, C, N, n_isects,           \
+            backgrounds, bg_images, masks, compensations, dilations, \
+            C, N, n_isects,                                          \
             image_width, image_height, tile_size,                    \
             viewmats0, viewmats1, Ks, camera_model,                  \
             ut_params, rs_type,                                      \
             radial_coeffs, tangential_coeffs, thin_prism_coeffs,     \
             tile_offsets, flatten_ids,                               \
-            renders, alphas, last_ids, stream, tiles, free_space,    \
+            renders, alphas, last_ids, stream, tiles, median_depth,  \
             footprint);                                              \
         break;
 
@@ -124,6 +127,8 @@ namespace gsplat_lfs {
         const float* backgrounds,
         const float* bg_images,
         const bool* masks,
+        const float* compensations,
+        const float* dilations,
         uint32_t C,
         uint32_t N,
         uint32_t n_isects,
@@ -157,8 +162,9 @@ namespace gsplat_lfs {
         const float* edge_weight_map,
         float* edge_score_out,
         cudaStream_t stream, TileRange tiles,
-        const FreeSpaceRender& free_space,
-        const ScreenFootprint& footprint) {
+        const ScreenFootprint& footprint,
+        const ColorVarianceRender& color_variance,
+        float* blend_peak_out) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
         gsplat_lfs::debug_validate_cuda_pointer(scales, "scales");
@@ -179,7 +185,8 @@ namespace gsplat_lfs {
     case CDIM:                                                       \
         launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel<CDIM>( \
             means, quats, scales, colors, opacities,                 \
-            backgrounds, bg_images, masks, C, N, n_isects,           \
+            backgrounds, bg_images, masks, compensations, dilations, \
+            C, N, n_isects,                                          \
             image_width, image_height, tile_size,                    \
             viewmats0, viewmats1, Ks, camera_model,                  \
             ut_params, rs_type,                                      \
@@ -188,7 +195,10 @@ namespace gsplat_lfs {
             render_alphas, last_ids,                                 \
             v_render_colors, v_render_alphas,                        \
             v_means, v_quats, v_scales, v_colors, v_opacities,       \
-            densification_weight, densification_error,                           densification_error_map,                                             edge_weight_map, edge_score_out, stream, tiles,                      free_space, footprint);                                          break;
+            densification_weight, densification_error, densification_error_map,    \
+            edge_weight_map, edge_score_out, stream, tiles, footprint,             \
+            color_variance, blend_peak_out);                                      \
+        break;
 
         switch (channels) {
             __LAUNCH_KERNEL__(1)
@@ -258,7 +268,7 @@ namespace gsplat_lfs {
         RasterizeWithSHResult& result,
         cudaStream_t stream,
         const float* reference_viewmats,
-        const FreeSpaceRender& free_space,
+        float* median_depth,
         const uint32_t* tile_sub_masks) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
@@ -294,7 +304,7 @@ namespace gsplat_lfs {
             ut_params, rs_type,
             radial_coeffs, tangential_coeffs, thin_prism_coeffs,
             result.radii, result.means2d, result.depths, result.conics,
-            result.compensations, stream);
+            result.compensations, result.dilations, stream);
 
         // Step 2: Compute viewing directions and evaluate SH. Nothing here needs the tile
         // pairs, so it is queued before the intersection waits on the host for their count.
@@ -304,11 +314,11 @@ namespace gsplat_lfs {
             }
             spherical_harmonics_streamed_fwd(
                 sh_degree, sh_layout_degree, sh_degree > 0 ? result.dirs : nullptr,
-                sh0, shN, C, N, result.colors, channels, stream);
+                sh0, shN, C, N, result.colors, channels, stream, result.radii);
         }
-        if (channels != 3) {
+        if (channels == 8) {
             geometry_features_fwd(means, quats, scales, reference, result.colors,
-                                  N, C, channels, camera_model, stream);
+                                  N, C, channels, camera_model, stream, result.radii);
         }
 
         const float* render_backgrounds = (render_mode == 1 || render_mode == 2) ? nullptr : backgrounds;
@@ -324,7 +334,7 @@ namespace gsplat_lfs {
             const uint32_t raster_n_isects = static_cast<uint32_t>(batch.n_sort);
             rasterize_to_pixels_from_world_3dgs_fwd(
                 means, quats, scaled_scales, result.colors, opacities,
-                render_backgrounds, render_bg_images, masks,
+                render_backgrounds, render_bg_images, masks, result.compensations, result.dilations,
                 C, N, raster_n_isects, channels,
                 image_width, image_height, tile_size,
                 viewmats0, viewmats1, Ks, camera_model,
@@ -332,7 +342,7 @@ namespace gsplat_lfs {
                 radial_coeffs, tangential_coeffs, thin_prism_coeffs,
                 result.tile_offsets, result.flatten_ids,
                 result.render_colors, result.render_alphas, result.last_ids,
-                stream, tiles, free_space,
+                stream, tiles, median_depth,
                 ScreenFootprint{.means2d = result.means2d, .conics = result.conics, .radii = result.radii,
                                 .tile_keys = batch.sub_tile_masks ? batch.isect_ids : nullptr,
                                 .prune_tile_keys = prune ? batch.isect_ids : nullptr});
@@ -432,6 +442,7 @@ namespace gsplat_lfs {
         const float* means2d,
         const float* depths,
         const float* compensations,
+        const float* dilations,
         const float* v_render_colors,
         const float* v_render_alphas,
         float* v_means,
@@ -448,10 +459,12 @@ namespace gsplat_lfs {
         cudaStream_t stream,
         const std::vector<TileBatch>& batches, int32_t* tiles_per_gauss,
         const float* reference_viewmats,
-        const FreeSpaceRender& free_space,
         const float* conics,
         const int64_t* tile_keys,
-        const uint32_t* tile_sub_masks) {
+        const uint32_t* tile_sub_masks,
+        const ColorVarianceRender& color_variance,
+        float* blend_peak_out,
+        float* color_grad_workspace) {
         // Determine output channels
         uint32_t channels = 3;
         if (render_mode == 1 || render_mode == 2) {
@@ -472,9 +485,9 @@ namespace gsplat_lfs {
             static_cast<size_t>(channels), "gsplat backward color elements");
         const size_t color_bytes = checked_bytes(
             color_values, sizeof(float), "gsplat backward color gradients");
-        // Grow-only TLS high-water — replaces per-backward cudaMallocAsync/Free.
-        float* const v_colors =
-            static_cast<float*>(ensure_gsplat_color_grad_workspace(color_bytes, stream));
+        float* const v_colors = color_grad_workspace
+                                    ? color_grad_workspace
+                                    : static_cast<float*>(ensure_gsplat_color_grad_workspace(color_bytes, stream));
         LFS_CUDA_CHECK_MSG(
             cudaMemsetAsync(v_colors, 0, color_bytes, stream),
             "gsplat backward color-gradient initialization");
@@ -482,7 +495,7 @@ namespace gsplat_lfs {
         auto render_backward = [&](TileRange tiles) {
             rasterize_to_pixels_from_world_3dgs_bwd(
                 means, quats, scales, colors, opacities,
-                render_backgrounds, render_bg_images, masks,
+                render_backgrounds, render_bg_images, masks, compensations, dilations,
                 C, N, n_isects, channels,
                 image_width, image_height, tile_size,
                 viewmats0, viewmats1, Ks, camera_model,
@@ -494,8 +507,9 @@ namespace gsplat_lfs {
                 v_means, v_quats, v_scales, v_colors, v_opacities,
                 densification_weight, densification_error, densification_error_map,
                 edge_weight_map, edge_score_out,
-                stream, tiles, free_space,
-                ScreenFootprint{.means2d = means2d, .conics = conics, .radii = radii, .tile_keys = tile_keys});
+                stream, tiles,
+                ScreenFootprint{.means2d = means2d, .conics = conics, .radii = radii, .tile_keys = tile_keys},
+                color_variance, blend_peak_out);
         };
         if (batches.empty()) {
             render_backward({});
@@ -517,7 +531,7 @@ namespace gsplat_lfs {
             }
         }
 
-        if (channels != 3) {
+        if (channels == 8) {
             geometry_features_bwd(means, quats, scales, reference, v_colors, v_means, v_quats,
                                   N, C, channels, camera_model, stream);
         }

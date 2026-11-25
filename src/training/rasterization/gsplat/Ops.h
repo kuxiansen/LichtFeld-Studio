@@ -5,7 +5,6 @@
 #pragma once
 
 #include "Common.h"
-#include "FreeSpace.h"
 #include "TileBatch.h"
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -78,7 +77,8 @@ namespace gsplat_lfs {
         uint32_t N,
         float* colors, // [C, N, color_stride]
         uint32_t color_stride,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        const int32_t* radii = nullptr); // [C, N, 2] optional: skip invisible elements
 
     // Adds dL/d(sh0) and the swizzled dL/d(shN) straight into the optimizer's gradient
     // buffers, summing the C cameras. One thread per splat; v_shN may be null.
@@ -226,6 +226,7 @@ namespace gsplat_lfs {
         float* depths,        // [C, N]
         float* conics,        // [C, N, 3]
         float* compensations, // [C, N] optional
+        float* dilations,     // [C, N] optional, mip filter
         cudaStream_t stream = nullptr);
 
     //=========================================================================
@@ -242,6 +243,9 @@ namespace gsplat_lfs {
         const float* backgrounds, // [C, channels] (can be nullptr) - solid color
         const float* bg_images,   // [C, channels, H, W] (can be nullptr) - per-pixel background
         const bool* masks,        // [C, tile_height, tile_width] (can be nullptr)
+        // [C, N] mip filter: opacity factor and world variance added to every squared scale (nullptr: off)
+        const float* compensations,
+        const float* dilations,
         // dimensions
         uint32_t C,
         uint32_t N,
@@ -268,12 +272,25 @@ namespace gsplat_lfs {
         float* alphas,     // [C, image_height, image_width, 1]
         int32_t* last_ids, // [C, image_height, image_width]
         cudaStream_t stream = nullptr, TileRange tiles = {},
-        const FreeSpaceRender& free_space = {},
+        float* median_depth = nullptr,
         const ScreenFootprint& footprint = {}); // lets the micro-tile forward cull sub-tiles
 
     //=========================================================================
     // Rasterization - Backward
     //=========================================================================
+
+    struct ColorVarianceRender {
+        const float* render_colors = nullptr;    // [C, channels, H, W] forward render output
+        const float* pixel_weight = nullptr;     // [C, H, W] (or [H, W] when C == 1)
+        const float* pixel_weight_sum = nullptr; // [1] device scalar sum(pixel_weight)
+        float* loss_out = nullptr;               // [1] optional device scalar loss
+        float weight = 0.0f;
+
+#ifdef __CUDACC__
+        __host__ __device__
+#endif
+        [[nodiscard]] bool enabled() const { return weight > 0.0f && render_colors != nullptr; }
+    };
 
     void rasterize_to_pixels_from_world_3dgs_bwd(
         // Gaussian parameters
@@ -285,6 +302,9 @@ namespace gsplat_lfs {
         const float* backgrounds, // [C, channels] optional - solid color
         const float* bg_images,   // [C, channels, H, W] optional - per-pixel background
         const bool* masks,        // optional
+        // [C, N] mip filter: opacity factor and world variance added to every squared scale (nullptr: off)
+        const float* compensations,
+        const float* dilations,
         // dimensions
         uint32_t C,
         uint32_t N,
@@ -324,8 +344,9 @@ namespace gsplat_lfs {
         const float* edge_weight_map,         // [H, W] or nullptr
         float* edge_score_out,                // [N] or nullptr
         cudaStream_t stream = nullptr, TileRange tiles = {},
-        const FreeSpaceRender& free_space = {},
-        const ScreenFootprint& footprint = {});
+        const ScreenFootprint& footprint = {},
+        const ColorVarianceRender& color_variance = {},
+        float* blend_peak_out = nullptr);
 
     //=========================================================================
     // High-level API: Fully fused rasterization with SH evaluation
@@ -345,6 +366,7 @@ namespace gsplat_lfs {
         int32_t* tile_offsets;    // [C, tile_height, tile_width]
         int32_t* last_ids;        // [C, H, W]
         float* compensations;     // [C, N] optional (can be nullptr)
+        float* dilations;         // [C, N] optional (can be nullptr)
         // Borrowed from TLS high-water isect cache — do NOT cudaFree.
         int64_t* isect_ids;   // [n_isects]
         int32_t* flatten_ids; // [n_sort]
@@ -398,7 +420,7 @@ namespace gsplat_lfs {
         // Rolling shutter: the reference camera for view directions and per-splat
         // depth/normal features. nullptr uses viewmats0.
         const float* reference_viewmats = nullptr,
-        const FreeSpaceRender& free_space = {},
+        float* median_depth = nullptr,
         // [C, tile_height, tile_width] live sub-tile bits; pairs only reach those sub-tiles.
         const uint32_t* tile_sub_masks = nullptr);
 
@@ -449,6 +471,7 @@ namespace gsplat_lfs {
         const float* means2d,       // [C, N, 2]
         const float* depths,        // [C, N]
         const float* compensations, // [C, N]
+        const float* dilations,     // [C, N]
         // gradients of outputs
         const float* v_render_colors, // [C, H, W, channels]
         const float* v_render_alphas, // [C, H, W, 1]
@@ -467,9 +490,11 @@ namespace gsplat_lfs {
         cudaStream_t stream = nullptr,
         const std::vector<TileBatch>& batches = {}, int32_t* tiles_per_gauss = nullptr,
         const float* reference_viewmats = nullptr, // as in the forward
-        const FreeSpaceRender& free_space = {},
         const float* conics = nullptr,             // [C, N, 3] the forward's, so tile batches re-cull alike
         const int64_t* tile_keys = nullptr,        // the forward's keys when they hold sub-tile masks
-        const uint32_t* tile_sub_masks = nullptr); // the forward's, so tile batches re-cull alike
+        const uint32_t* tile_sub_masks = nullptr,  // the forward's, so tile batches re-cull alike
+        const ColorVarianceRender& color_variance = {},
+        float* blend_peak_out = nullptr,
+        float* color_grad_workspace = nullptr); // [C, N, channels]
 
 } // namespace gsplat_lfs

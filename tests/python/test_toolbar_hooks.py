@@ -12,6 +12,8 @@ import sys
 
 import pytest
 
+from rcss_test_support import rule_body
+
 
 def _install_stub_modules(monkeypatch):
     hook_calls = []
@@ -19,6 +21,8 @@ def _install_stub_modules(monkeypatch):
 
     lf_stub = ModuleType("lichtfeld")
     lf_stub.get_collision_state = lambda: {"has_collision": False}
+    lf_stub.get_render_mode_controls_open = lambda: False
+    lf_stub.set_render_mode_controls_open = lambda _open: None
     lf_stub.ui = SimpleNamespace(
         PanelSpace=SimpleNamespace(FLOATING="FLOATING", BOTTOM_DOCK="BOTTOM_DOCK"),
         add_hook=lambda panel, section, callback, position="append": hook_calls.append(
@@ -240,6 +244,7 @@ def toolbar_module(monkeypatch):
 
     sys.modules.pop("lfs_plugins", None)
     sys.modules.pop("lfs_plugins.toolbar", None)
+    sys.modules.pop("lfs_plugins.depth_view_controls", None)
     sys.modules.pop("lfs_plugins.selection_controls", None)
     sys.modules.pop("lfs_plugins.transform_controls", None)
     sys.modules.pop("lfs_plugins.viewport_export_controls", None)
@@ -2016,7 +2021,6 @@ def test_viewport_toolbar_uses_theme_glass_without_backdrop_filter():
 
     for token in (
         "viewport.toolbar_glass_decor",
-        "viewport.toolbar_border",
         "viewport.toolbar_shadow",
         "viewport.toolbar_text",
         "viewport.toolbar_selected_decor",
@@ -2029,24 +2033,18 @@ def test_viewport_toolbar_uses_theme_glass_without_backdrop_filter():
         assert f"@{{{token}}}" in theme_rcss
         assert f'{{"{token}"' in resolver
 
-    centered_toolbar_start = theme_rcss.index(".toolbar-hcenter .toolbar-container {")
-    centered_toolbar_end = theme_rcss.index("\n}", centered_toolbar_start)
-    centered_toolbar_rule = theme_rcss[centered_toolbar_start:centered_toolbar_end]
+    centered_toolbar_rule = rule_body(theme_rcss, ".toolbar-hcenter .toolbar-container")
     assert "@{viewport.toolbar_glass_decor};" in centered_toolbar_rule
-    assert "border-color: @{viewport.toolbar_border};" in centered_toolbar_rule
+    assert "border-color: @{border};" in centered_toolbar_rule
     assert "box-shadow: @{viewport.toolbar_shadow};" in centered_toolbar_rule
 
-    tool_panel_start = theme_rcss.index(".viewport-transform-panel {")
-    tool_panel_end = theme_rcss.index("\n}", tool_panel_start)
-    tool_panel_rule = theme_rcss[tool_panel_start:tool_panel_end]
+    tool_panel_rule = rule_body(theme_rcss, ".viewport-transform-panel")
     assert "@{viewport.toolbar_glass_decor};" in tool_panel_rule
     assert "color: @{viewport.toolbar_text};" in tool_panel_rule
-    assert "border-color: @{viewport.toolbar_border};" in tool_panel_rule
+    assert "border-color: @{border};" in tool_panel_rule
     assert "box-shadow: @{viewport.toolbar_shadow};" in tool_panel_rule
 
-    centered_selected_start = theme_rcss.index(".toolbar-hcenter .icon-btn.selected {")
-    centered_selected_end = theme_rcss.index("\n}", centered_selected_start)
-    centered_selected_rule = theme_rcss[centered_selected_start:centered_selected_end]
+    centered_selected_rule = rule_body(theme_rcss, ".toolbar-hcenter .icon-btn.selected")
     assert "@{viewport.toolbar_selected_decor};" in centered_selected_rule
     assert ".toolbar-hcenter .icon-btn.selected img" in theme_rcss
     assert ".viewport-transform-panel .icon-btn.selected img" in theme_rcss
@@ -2220,13 +2218,8 @@ def test_right_panel_tabs_keep_stable_boundaries_without_transparent_shell():
     assert "margin-left: 0;" in active_geometry
     assert "border-right-width: 0;" in active_geometry
 
-    for token in (
-        "right_panel.tab_border",
-        "right_panel.tab_active_border",
-        "right_panel.tab_focus_border",
-    ):
-        assert f"@{{{token}}}" in right_panel_theme
-        assert f'"{token}"' in resolver
+    assert "border-color: @{border};" in rule_body(right_panel_theme, ".tab")
+    assert "border-color: @{primary};" in rule_body(right_panel_theme, ".tab:focus-visible")
 
     for shared_token in (
         "right_panel.tab_active_bg",
@@ -2235,17 +2228,13 @@ def test_right_panel_tabs_keep_stable_boundaries_without_transparent_shell():
         assert f"@{{{shared_token}}}" in panel_tabs_theme
         assert f'{{"{shared_token}"' in resolver
 
-    hover_start = right_panel_theme.index(".tab:hover {")
-    hover_end = right_panel_theme.index("\n}", hover_start)
-    hover_rule = right_panel_theme[hover_start:hover_end]
+    hover_rule = rule_body(right_panel_theme, ".tab:hover")
     assert "border-color:" not in hover_rule
     assert "border-bottom-color:" not in hover_rule
 
-    active_start = right_panel_theme.index(".tab.active {")
-    active_end = right_panel_theme.index("\n}", active_start)
-    active_rule = right_panel_theme[active_start:active_end]
+    active_rule = rule_body(right_panel_theme, ".tab.active")
     assert "background-color: transparent;" in active_rule
-    assert "border-color: @{right_panel.tab_active_border};" in active_rule
+    assert "border-color: @{primary};" in active_rule
 
     assert "@{panel.body_decor};" in shell_theme
     assert "@{panel.host_body_decor};" in panel_host_theme
@@ -2256,9 +2245,10 @@ def test_right_panel_tabs_keep_stable_boundaries_without_transparent_shell():
     scene_body_rule = scene_tree_rcss[scene_body_start:scene_body_end]
     assert "box-sizing: border-box;" in scene_body_rule
     assert "border-width: 1dp;" in scene_body_rule
-    assert "border-radius: 5dp;" in scene_body_rule
+    assert "border-radius:" not in scene_body_rule
     assert "overflow: hidden;" in scene_body_rule
-    assert "border-color: @{right_panel.border};" in scene_tree_theme
+    assert "border-radius: 5dp;" in rule_body(scene_tree_theme, "body")
+    assert "border-color: @{border};" in rule_body(scene_tree_theme, "body")
 
 
 def test_viewport_toolbar_update_syncs_utility_records(toolbar_module, monkeypatch):
@@ -2281,7 +2271,7 @@ def test_viewport_toolbar_update_syncs_utility_records(toolbar_module, monkeypat
     lf_stub.get_render_mode = lambda: lf_stub.RenderMode.SPLATS
     lf_stub.is_fullscreen = lambda: False
     lf_stub.is_orthographic = lambda: False
-    lf_stub.get_depth_view = lambda: False
+    lf_stub.get_render_mode_controls_open = lambda: False
     lf_stub.get_selected_node_names = lambda: []
     monkeypatch.setattr(lf_stub.ui, "context", lambda: SimpleNamespace(), raising=False)
     monkeypatch.setattr(lf_stub.ui, "get_active_tool", lambda: "", raising=False)
@@ -2411,9 +2401,9 @@ def test_viewport_toolbar_update_syncs_utility_records(toolbar_module, monkeypat
 
     # Overlay availability changes must invalidate cached crop toolbar records.
     normal_signature = controller._toolbar_signature(None)
-    monkeypatch.setattr(lf_stub, "get_depth_view", lambda: True)
+    monkeypatch.setattr(lf_stub, "get_render_mode_controls_open", lambda: True)
     assert controller._toolbar_signature(None) != normal_signature
-    monkeypatch.setattr(lf_stub, "get_depth_view", lambda: False)
+    monkeypatch.setattr(lf_stub, "get_render_mode_controls_open", lambda: False)
     monkeypatch.setattr(lf_stub.ui, "get_split_view_mode", lambda: "gt_comparison")
     assert controller._toolbar_signature(None) != normal_signature
 
@@ -2436,7 +2426,7 @@ def test_viewport_export_toolbar_action_shows_overlay_immediately(toolbar_module
     lf_stub.get_render_mode = lambda: lf_stub.RenderMode.SPLATS
     lf_stub.is_fullscreen = lambda: False
     lf_stub.is_orthographic = lambda: False
-    lf_stub.get_depth_view = lambda: False
+    lf_stub.get_render_mode_controls_open = lambda: False
     lf_stub.get_selected_node_names = lambda: []
     monkeypatch.setattr(lf_stub.ui, "context", lambda: SimpleNamespace(has_scene=True), raising=False)
     monkeypatch.setattr(lf_stub.ui, "get_active_tool", lambda: "", raising=False)
@@ -2482,7 +2472,7 @@ def test_viewport_export_close_action_hides_overlay_immediately(toolbar_module, 
     lf_stub.get_render_mode = lambda: lf_stub.RenderMode.SPLATS
     lf_stub.is_fullscreen = lambda: False
     lf_stub.is_orthographic = lambda: False
-    lf_stub.get_depth_view = lambda: False
+    lf_stub.get_render_mode_controls_open = lambda: False
     lf_stub.get_selected_node_names = lambda: []
     monkeypatch.setattr(lf_stub.ui, "context", lambda: SimpleNamespace(has_scene=True), raising=False)
     monkeypatch.setattr(lf_stub.ui, "get_active_tool", lambda: "", raising=False)
@@ -2611,7 +2601,7 @@ def test_toolbar_tool_action_refreshes_button_records_immediately(toolbar_module
     lf_stub.get_render_mode = lambda: lf_stub.RenderMode.SPLATS
     lf_stub.is_fullscreen = lambda: False
     lf_stub.is_orthographic = lambda: False
-    lf_stub.get_depth_view = lambda: False
+    lf_stub.get_render_mode_controls_open = lambda: False
     monkeypatch.setattr(lf_stub.ui, "context", lambda: SimpleNamespace(), raising=False)
     monkeypatch.setattr(lf_stub.ui, "get_active_tool", lambda: state.active_tool, raising=False)
     monkeypatch.setattr(lf_stub.ui, "get_active_submode", lambda: "", raising=False)
@@ -2670,6 +2660,61 @@ def test_toolbar_tool_action_refreshes_button_records_immediately(toolbar_module
         if button["value"] == "builtin.rotate"
     )
     assert rotate_button["selected"] is True
+
+
+@pytest.mark.parametrize("tool_id", [
+    "builtin.select", "builtin.cropbox",
+])
+@pytest.mark.parametrize("already_active", [False, True])
+def test_tool_click_replaces_render_selector_with_tool_controls(toolbar_module, monkeypatch, tool_id, already_active):
+    module, _hook_calls, _remove_calls = toolbar_module
+    lf_stub = sys.modules["lichtfeld"]
+    state = SimpleNamespace(active_tool=tool_id if already_active else "", selector_open=True)
+    controller = module._ViewportToolbarController()
+    doc = _DocumentStub()
+    controller._current_doc = doc
+    doc.elements["depth-view-block"].set_class("hidden", False)
+
+    lf_stub.get_render_mode_controls_open = lambda: state.selector_open
+    lf_stub.set_render_mode_controls_open = lambda value: setattr(state, "selector_open", value)
+    lf_stub.get_viewport_display_mode = lambda: "normal"
+    lf_stub.get_num_gaussians = lambda: 1
+    lf_stub.set_viewport_display_mode = lambda _mode: pytest.fail("Tool selection must preserve the render mode")
+    lf_stub.ui.get_active_tool = lambda: state.active_tool
+    monkeypatch.setattr(module.ToolRegistry, "get", lambda _id: SimpleNamespace(can_activate=lambda _ctx: True))
+    monkeypatch.setattr(module.ToolRegistry, "set_active", lambda value: setattr(state, "active_tool", value))
+    monkeypatch.setattr(module.ToolRegistry, "clear_active", lambda: setattr(state, "active_tool", ""))
+    monkeypatch.setattr(controller._gizmo, "_activate_crop_tool", lambda _operation: setattr(state, "active_tool", tool_id))
+    monkeypatch.setattr(controller, "_sync_toolbar_state", lambda: None)
+    monkeypatch.setattr(controller._gt_compare_controls, "update", lambda _doc: None)
+    monkeypatch.setattr(controller._viewport_export_controls, "update", lambda _doc: None)
+    selection_update = MagicMock()
+    transform_update = MagicMock()
+    monkeypatch.setattr(controller._selection_controls, "update", selection_update)
+    monkeypatch.setattr(controller._transform_controls, "update", transform_update)
+
+    controller._on_toolbar_action(None, None, ["tool", tool_id])
+
+    assert state.selector_open is False
+    assert state.active_tool == tool_id
+    assert "hidden" in doc.elements["depth-view-block"].classes
+    selection_update.assert_called_once_with(doc)
+    transform_update.assert_called_once_with(doc)
+
+
+def test_selection_mode_click_closes_render_selector(toolbar_module, monkeypatch):
+    module, _hook_calls, _remove_calls = toolbar_module
+    lf_stub = sys.modules["lichtfeld"]
+    state = SimpleNamespace(selector_open=True, submode="centers")
+    lf_stub.ui.get_active_tool = lambda: "builtin.select"
+    lf_stub.ui.set_selection_mode = lambda value: setattr(state, "submode", value)
+    lf_stub.set_render_mode_controls_open = lambda value: setattr(state, "selector_open", value)
+    monkeypatch.setattr(module.ToolRegistry, "get", lambda _id: SimpleNamespace(can_activate=lambda _ctx: True))
+
+    module._GizmoToolbarController().dispatch("selection_mode", "lasso")
+
+    assert state.selector_open is False
+    assert state.submode == "lasso"
 
 
 def test_align_toolbar_signature_tracks_can_apply(toolbar_module):

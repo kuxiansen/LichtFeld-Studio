@@ -529,9 +529,9 @@ def set_camera_training_enabled(name: str, enabled: bool) -> None:
 def remove_disabled_cameras(camera_group_id: int) -> int:
     """Remove disabled direct camera children and return their count"""
 
-def camera_selection_start(operation: str, camera_group_id: int, percentage: float = 25.0, every_n: int = 2, overlap: float = 65.0, coverage: float = 40.0, cropbox_id: int = 0) -> dict:
+def camera_selection_start(operation: str, camera_group_id: int, percentage: float = 25.0, every_n: int = 2, overlap: float = 65.0, coverage: float = 40.0, cropbox_id: int = 0, sharpness_threshold: float = 10.0) -> dict:
     """
-    Start a cancellable camera-group selection job. Returns its runtime id and opaque handle; no training selection changes until it finishes.
+    Start a cancellable camera-group selection job. Blurry selects enabled cameras visually without changing training flags; other operations update training selection on completion.
     """
 
 def camera_selection_status() -> dict:
@@ -658,6 +658,9 @@ def reset_camera() -> None:
 def set_vr_active(active: bool) -> None:
     """Enter or exit VR viewing"""
 
+def detect_vr() -> None:
+    """Look again for a VR headset that was connected after startup"""
+
 def recenter_vr() -> None:
     """Put the VR view back at the desktop camera"""
 
@@ -757,6 +760,18 @@ def set_render_mode(mode: RenderMode) -> None:
 
 def is_orthographic() -> bool:
     """Check if orthographic projection is active"""
+
+def get_viewport_display_mode() -> str:
+    """Get viewport display mode: rgb, depth, or normal"""
+
+def set_viewport_display_mode(mode: str) -> None:
+    """Set viewport display mode independently of the selector visibility"""
+
+def get_render_mode_controls_open() -> bool:
+    """Return whether the viewport render-mode selector is open."""
+
+def set_render_mode_controls_open(open: bool) -> None:
+    """Open or close the render-mode selector without changing the view"""
 
 def get_depth_view() -> bool:
     """Check if depth-map view is active"""
@@ -875,12 +890,12 @@ class Tensor:
 
     @overload
     @staticmethod
-    def arange(end: float) -> Tensor:
+    def arange(end: int | float, *, device: str = 'cuda', dtype: str = 'float32') -> Tensor:
         """Create 1D tensor with values from 0 to end"""
 
     @overload
     @staticmethod
-    def arange(start: float, end: float, step: float = 1.0, device: str = 'cuda', dtype: str = 'float32') -> Tensor:
+    def arange(start: int | float, end: int | float, step: int | float = 1, device: str = 'cuda', dtype: str = 'float32') -> Tensor:
         """Create 1D tensor with values from start to end"""
 
     @staticmethod
@@ -2139,6 +2154,9 @@ class OptimizationParams:
     def builtin_default(self, name: str) -> object:
         """Get the built-in default for the active method and step scaling"""
 
+    def set_scaled_iterations(self, target: int) -> None:
+        """Set the iteration limit and rescale its schedule together"""
+
     def set(self, name: str, value: object) -> None:
         """Set property value by name"""
 
@@ -2312,6 +2330,15 @@ class OptimizationParams:
 
     @eval_flip.setter
     def eval_flip(self, arg: bool, /) -> None: ...
+
+    @property
+    def eval_green_infill(self) -> bool:
+        """
+        Also score with opaque green filling the inside of a mesh, so a see-through surface loses score
+        """
+
+    @eval_green_infill.setter
+    def eval_green_infill(self, arg: bool, /) -> None: ...
 
     @property
     def eval_mask(self) -> str:
@@ -2521,6 +2548,24 @@ class OptimizationParams:
     def mip_filter(self, arg: bool, /) -> None: ...
 
     @property
+    def pose_opt(self) -> bool:
+        """
+        Refine the training camera poses during training; the refined poses replace the cameras' own
+        """
+
+    @pose_opt.setter
+    def pose_opt(self, arg: bool, /) -> None: ...
+
+    @property
+    def calibration_correction(self) -> bool:
+        """
+        Fits a small, smooth warp to every training photo that absorbs what the calibration missed (rolling shutter, stabilization, focus breathing, a slightly wrong pose), so photos that disagree by a pixel no longer blur the scene. Starts at step 1000, scaled with the step count; evaluation scores each held-out view as rendered and, in addition, after aligning the render to the photo.
+        """
+
+    @calibration_correction.setter
+    def calibration_correction(self, arg: bool, /) -> None: ...
+
+    @property
     def ppisp(self) -> bool:
         """Enable per-pixel image signal processing"""
 
@@ -2644,7 +2689,7 @@ class OptimizationParams:
     @property
     def depth_loss_mode(self) -> str:
         """
-        Depth prior convention: 'ssi' (auto-detect), 'ssi-disparity', 'ssi-depth', or 'metric' (absolute depth, 16-bit in mm)
+        Depth prior convention: 'ssi' (auto-detect), 'ssi-disparity', or 'ssi-depth'
         """
 
     @depth_loss_mode.setter
@@ -2688,15 +2733,6 @@ class OptimizationParams:
 
     @normal_consistency_weight.setter
     def normal_consistency_weight(self, arg: float, /) -> None: ...
-
-    @property
-    def depth_distortion_weight(self) -> float:
-        """
-        Weight for the spread of depth along each ray, which thins layered surfaces (--gut)
-        """
-
-    @depth_distortion_weight.setter
-    def depth_distortion_weight(self, arg: float, /) -> None: ...
 
     @property
     def normal_flatten_weight(self) -> float:

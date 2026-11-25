@@ -20,7 +20,8 @@ namespace lfs::core::param {
         PropertyGroupBuilder<OptimizationParameters>("optimization", "Optimization")
             // Training control
             .size_prop(&OptimizationParameters::iterations,
-                       "iterations", "Max Iterations", d.iterations, 1, 1000000,
+                       "iterations", "Max Iterations", d.iterations, 1,
+                       static_cast<size_t>(std::numeric_limits<int>::max()),
                        "Maximum number of training iterations")
             .json_required()
             .locale("training_params.iterations")
@@ -34,7 +35,7 @@ namespace lfs::core::param {
             .json_required()
             .all_strategies()
             .size_prop(&OptimizationParameters::sh_degree_interval,
-                       "sh_degree_interval", "SH Interval", d.sh_degree_interval, 100, 10000,
+                       "sh_degree_interval", "SH Interval", d.sh_degree_interval, 1, 10000,
                        "Iterations between SH degree increases")
             .locale("training.refinement.sh_upgrade_every")
             .tooltip("training.tooltip.sh_upgrade_every")
@@ -68,6 +69,14 @@ namespace lfs::core::param {
             .tooltip("training.tooltip.means_lr_end")
             .precision(8)
             .ui_step(1e-8)
+            .flags(PROP_LIVE_UPDATE | PROP_ADVANCED)
+            .strategies({"mrnf"})
+            .all_strategies()
+            .float_prop(&OptimizationParameters::ray_depth_lr,
+                        "ray_depth_lr", "Ray Depth LR", d.ray_depth_lr, 0.0f, 0.1f,
+                        "Lets splats far from the cameras slide along the viewing ray to the depth the views agree on, growing in proportion; largest step as a fraction of the distance, decays with the position LR; 0 turns it off")
+            .precision(4)
+            .ui_step(0.001)
             .flags(PROP_LIVE_UPDATE | PROP_ADVANCED)
             .strategies({"mrnf"})
             .all_strategies()
@@ -231,6 +240,7 @@ namespace lfs::core::param {
             .flags(PROP_ADVANCED)
             .precision(4)
             .ui_step(0.001)
+            .strategies({"mrnf"})
             .float_prop(&OptimizationParameters::sh_rest_reg,
                         "sh_rest_reg", "View-Dependent Color Penalty", d.sh_rest_reg, 0.0f, 1.0f,
                         "Keeps the angle-dependent part of each color small so splats cannot fake detail by changing color with the view; 0 turns it off")
@@ -404,40 +414,13 @@ namespace lfs::core::param {
             .all_strategies()
             .string_prop(&OptimizationParameters::depth_loss_mode,
                          "depth_loss_mode", "Depth Loss Mode", d.depth_loss_mode,
-                         "Depth prior convention: ssi (auto-detect), ssi-disparity, ssi-depth, or metric (absolute depth, 16-bit in mm)")
+                         "Depth prior convention: ssi (auto-detect), ssi-disparity, or ssi-depth")
             .all_strategies()
             .bool_prop(&OptimizationParameters::depth_auto_generate,
                        "depth_auto_generate", "Auto-generate Depth", d.depth_auto_generate,
                        "Generate missing or size-mismatched depth maps with MoGe-2 from the full-resolution images/ folder")
             .locale("training_params.depth_auto_generate")
             .tooltip("training.tooltip.depth_auto_generate")
-            .all_strategies()
-            .float_prop(&OptimizationParameters::free_space_weight,
-                        "free_space_weight", "Free Space Weight", d.free_space_weight, 0.0f, 1.0f,
-                        "With metric depth maps and --gut, removes opacity in front of the depth map surface; 0 turns it off, 0.05 works well")
-            .locale("training.losses.free_space_weight")
-            .tooltip("training.tooltip.free_space_weight")
-            .flags(PROP_ADVANCED)
-            .precision(3)
-            .ui_step(0.01)
-            .all_strategies()
-            .float_prop(&OptimizationParameters::free_space_margin,
-                        "free_space_margin", "Free Space Margin", d.free_space_margin, 0.0f, 10.0f,
-                        "Metres in front of the depth map surface where opacity stays allowed")
-            .locale("training.losses.free_space_margin")
-            .tooltip("training.tooltip.free_space_margin")
-            .flags(PROP_ADVANCED)
-            .precision(2)
-            .ui_step(0.01)
-            .all_strategies()
-            .float_prop(&OptimizationParameters::free_space_margin_rel,
-                        "free_space_margin_rel", "Free Space Relative Margin", d.free_space_margin_rel, 0.0f, 1.0f,
-                        "Fraction of the depth used as margin where it is larger than the margin in metres")
-            .locale("training.losses.free_space_margin_rel")
-            .tooltip("training.tooltip.free_space_margin_rel")
-            .flags(PROP_ADVANCED)
-            .precision(3)
-            .ui_step(0.005)
             .all_strategies()
             .bool_prop(&OptimizationParameters::use_normal_loss,
                        "use_normal_loss", "Use Normal Loss", d.use_normal_loss,
@@ -464,22 +447,6 @@ namespace lfs::core::param {
                         "Weight for depth-normal consistency")
             .locale("training_params.normal_consistency_weight")
             .tooltip("training.tooltip.normal_consistency_weight")
-            .precision(3)
-            .ui_step(0.01)
-            .all_strategies()
-            .float_prop(&OptimizationParameters::depth_distortion_weight,
-                        "depth_distortion_weight", "Depth Distortion Weight", d.depth_distortion_weight, 0.0f, 100.0f,
-                        "Weight for the spread of depth along each ray, which thins layered surfaces (--gut)")
-            .locale("training_params.depth_distortion_weight")
-            .tooltip("training.tooltip.depth_distortion_weight")
-            .precision(3)
-            .ui_step(0.01)
-            .all_strategies()
-            .float_prop(&OptimizationParameters::normal_prior_depth_weight,
-                        "normal_prior_depth_weight", "Normal Prior Depth Weight", d.normal_prior_depth_weight, -1.0f, 100.0f,
-                        "Weight for the prior normal against the normal of the rendered depth, which moves surfaces; -1 uses the normal loss weight")
-            .locale("training_params.normal_prior_depth_weight")
-            .tooltip("training.tooltip.normal_prior_depth_weight")
             .precision(3)
             .ui_step(0.01)
             .all_strategies()
@@ -618,16 +585,6 @@ namespace lfs::core::param {
             .strategies({"igs+"})
             // MRNF strategy parameters
             .all_strategies()
-            .float_prop(&OptimizationParameters::growth_grad_threshold,
-                        "growth_grad_threshold", "Growth Grad Threshold", d.growth_grad_threshold, 0.0f, 1.0f,
-                        "Min refine weight for growth candidacy (MRNF)")
-            .locale("training.advanced.growth_grad_threshold")
-            .tooltip("training.tooltip.growth_grad_threshold")
-            .precision(4)
-            .ui_step(0.0001)
-            .flags(PROP_ADVANCED)
-            .strategies({"mrnf"})
-            .all_strategies()
             .float_prop(&OptimizationParameters::grow_fraction,
                         "grow_fraction", "Grow Fraction", d.grow_fraction, 0.0f, 1.0f,
                         "Fraction of above-threshold splats to grow (MRNF)")
@@ -645,14 +602,6 @@ namespace lfs::core::param {
             .tooltip("training.tooltip.grow_until_iter")
             .precision(0)
             .ui_step(1000)
-            .strategies({"mrnf"})
-            .all_strategies()
-            .bool_prop(&OptimizationParameters::growth_exchange,
-                       "growth_exchange", "Growth Exchange", d.growth_exchange,
-                       "Keeps error-guided growth working at the splat cap by freeing the splats whose removal changes the image least (MRNF)")
-            .locale("training.advanced.growth_exchange")
-            .tooltip("training.tooltip.growth_exchange")
-            .flags(PROP_ADVANCED)
             .strategies({"mrnf"})
             .all_strategies()
             .float_prop(&OptimizationParameters::opacity_decay,
@@ -746,6 +695,23 @@ namespace lfs::core::param {
                        "Enable mip filtering (anti-aliasing)")
             .locale("training_params.mip_filter")
             .tooltip("training.tooltip.mip_filter")
+            .all_strategies()
+            .bool_prop(&OptimizationParameters::pose_opt,
+                       "pose_opt", "Pose Refinement", d.pose_opt,
+                       "Refine the training camera poses during training; the refined poses replace the cameras' own")
+            .locale("training_params.pose_opt")
+            .tooltip("training.tooltip.pose_opt")
+            .all_strategies()
+            .bool_prop(&OptimizationParameters::calibration_correction,
+                       "calibration_correction", "Calibration Correction", d.calibration_correction,
+                       "Fits a small, smooth warp to every training photo that absorbs what the calibration missed "
+                       "(rolling shutter, stabilization, focus breathing, a slightly wrong pose), so photos that "
+                       "disagree by a pixel no longer blur the scene. Starts at step 1000, scaled with the step "
+                       "count; evaluation scores each held-out view as rendered and, in addition, after aligning the render "
+                       "to the photo.")
+            .locale("training_params.calibration_correction")
+            .tooltip("training.tooltip.calibration_correction")
+            .flags(PROP_ADVANCED)
             .all_strategies()
             .bool_prop(&OptimizationParameters::use_ppisp,
                        "ppisp", "PPISP", d.use_ppisp,

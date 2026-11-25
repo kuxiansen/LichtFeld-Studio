@@ -426,6 +426,16 @@ def get_panel_names(space: PanelSpace = PanelSpace.FLOATING) -> list[str]:
 def set_panel_enabled(panel_id: str, enabled: bool) -> None:
     """Enable or disable a panel by id"""
 
+def get_panel_always_on_top(panel_id: str) -> bool | None:
+    """
+    Get the session pin choice, or None if the panel has no desktop window or pinning is unavailable.
+    """
+
+def set_panel_always_on_top(panel_id: str, enabled: bool) -> bool:
+    """
+    Pin a desktop panel above other windows for this session. Return whether the change succeeded.
+    """
+
 def save_startup_sidebar() -> bool:
     """
     Save the right sidebar as a startup default; saved .licht workspaces take precedence.
@@ -2496,9 +2506,9 @@ def on_open_image_preview(callback: object, include_sequence: bool = False) -> N
     Register the preview callback for extracted images; optionally receive extraction-run metadata as a third argument.
     """
 
-def sam_preview_submit(path: str, revision: str, mtime_ns: int, size_bytes: int, points: Sequence[Sequence[float]], box: Sequence[float] | None = None, refine_request: int = 0, refine_candidate: int = -1, weights: str = '', export_candidate: int = -1, exclude: bool = False, sequence: object | None = None) -> int:
+def sam_preview_submit(path: str, revision: str, mtime_ns: int, size_bytes: int, points: Sequence[Sequence[float]], box: Sequence[float] | None = None, refine_request: int = 0, refine_candidate: int = -1, weights: str = '', export_candidate: int = -1, exclude: bool = False, sequence: object | None = None, semantic: object | None = None) -> int:
     """
-    UI thread: queue native SAM inference, sequence tracking/inspection, or render a selected original-resolution mask. Apply is a separate explicit action.
+    UI thread: queue native SAM inference, bounded text/category detection, sequence tracking/inspection, or render a selected original-resolution mask. Semantic descriptions are BERT token ID lists; the shared cache downloads the verified native LLMDet Tiny archive. Apply is a separate explicit action.
     """
 
 def sam_preview_sequence_frames(run: str, first: int = 0, count: int = 64) -> list:
@@ -3101,8 +3111,18 @@ def get_vr_state() -> dict:
 def get_vr_preferences() -> dict:
     """Get the VR preferences"""
 
-def set_vr_preferences(enabled: bool, resolution_scale: float, scene_units_per_meter: float, move_speed: float, persist: bool = True) -> None:
+def set_vr_preferences(enabled: bool, resolution_scale: float, scene_units_per_meter: float, move_speed: float, show_hands: bool = True, persist: bool = True) -> None:
     """Set the VR preferences; VR support takes effect after restart"""
+
+def get_vr_runtimes() -> dict:
+    """
+    Get the OpenXR runtimes installed on this computer, the name of the system's active one, and the manifest of the one chosen for VR (empty: the active one)
+    """
+
+def set_vr_runtime(manifest: str) -> None:
+    """
+    Choose the OpenXR runtime VR uses by its manifest path; empty follows the system's active runtime. Takes effect after restart
+    """
 
 def get_mcp_port_override() -> int | None:
     """Get the MCP port set on the command line for this session, or None"""

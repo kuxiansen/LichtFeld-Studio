@@ -57,6 +57,7 @@ void fast_lfs::rasterization::backward(
     float* grad_depth_helper,
     float3* grad_normal_helper,
     float4* grad_w2c,
+    float3* grad_cam_position,
     float* densification_weight,
     float* densification_error,
     const int n_primitives,
@@ -71,6 +72,7 @@ void fast_lfs::rasterization::backward(
     const float cx,
     const float cy,
     bool mip_filter,
+    float dilation_scale,
     DensificationType densification_type,
     FusedAdamSettings fused_adam,
     // model-truth shN-rest decode binds (independent of fused Adam
@@ -80,8 +82,6 @@ void fast_lfs::rasterization::backward(
     const uint shN_value_bits,
     const float* edge_weight_map,
     float* edge_score_out,
-    float* impact_sum_out,
-    float* impact_peak_out,
     cudaStream_t stream,
     const ColorVarianceLoss& color_variance) {
     const dim3 grid(div_round_up(width, config::tile_width), div_round_up(height, config::tile_height), 1);
@@ -101,8 +101,8 @@ void fast_lfs::rasterization::backward(
         const int warp_cull_mode = warp_cull_mode_for_testing();
 
         auto launch_blend_backward_typed =
-            [&]<DensificationType DENS_TYPE, bool NORMAL_CHANNEL, bool IMPACT_SCORE, int WARP_CULL_MODE, bool COLOR_VARIANCE>() {
-                kernels::backward::blend_backward_cu<DENS_TYPE, NORMAL_CHANNEL, IMPACT_SCORE, WARP_CULL_MODE, COLOR_VARIANCE>
+            [&]<DensificationType DENS_TYPE, bool NORMAL_CHANNEL, bool BLEND_PEAK, int WARP_CULL_MODE, bool COLOR_VARIANCE>() {
+                kernels::backward::blend_backward_cu<DENS_TYPE, NORMAL_CHANNEL, BLEND_PEAK, WARP_CULL_MODE, COLOR_VARIANCE>
                     <<<n_tiles, config::block_size_blend_backward, 0, stream>>>(
                         per_tile_buffers.instance_ranges,
                         sorted_primitive_indices,
@@ -130,8 +130,7 @@ void fast_lfs::rasterization::backward(
                         densification_error_map,
                         edge_weight_map,
                         edge_score_out,
-                        impact_sum_out,
-                        impact_peak_out,
+                        fused_adam.blend_peak,
                         primitive_touched,
                         fastgs_status,
                         static_cast<uint>(n_instances),
@@ -143,36 +142,28 @@ void fast_lfs::rasterization::backward(
                         color_variance);
                 LFS_CUDA_LAUNCH_CHECK(stream, "fastgs.backward.blend_backward");
             };
-        auto launch_blend = [&]<DensificationType DENS_TYPE, bool NORMAL_CHANNEL, bool IMPACT_SCORE, int WARP_CULL_MODE>() {
-            if (color_variance.weight > 0.0f)
-                launch_blend_backward_typed.template operator()<DENS_TYPE, NORMAL_CHANNEL, IMPACT_SCORE, WARP_CULL_MODE, true>();
+        // The peak blend weight is compiled in only for strategies that ask for it.
+        auto launch_blend = [&]<DensificationType DENS_TYPE, bool NORMAL_CHANNEL, int WARP_CULL_MODE>() {
+            const bool blend_peak = fused_adam.blend_peak != nullptr;
+            if (blend_peak && color_variance.weight > 0.0f)
+                launch_blend_backward_typed.template operator()<DENS_TYPE, NORMAL_CHANNEL, true, WARP_CULL_MODE, true>();
+            else if (blend_peak)
+                launch_blend_backward_typed.template operator()<DENS_TYPE, NORMAL_CHANNEL, true, WARP_CULL_MODE, false>();
+            else if (color_variance.weight > 0.0f)
+                launch_blend_backward_typed.template operator()<DENS_TYPE, NORMAL_CHANNEL, false, WARP_CULL_MODE, true>();
             else
-                launch_blend_backward_typed.template operator()<DENS_TYPE, NORMAL_CHANNEL, IMPACT_SCORE, WARP_CULL_MODE, false>();
+                launch_blend_backward_typed.template operator()<DENS_TYPE, NORMAL_CHANNEL, false, WARP_CULL_MODE, false>();
         };
         auto launch_production = [&]<DensificationType DENS_TYPE>() {
-            const bool impact_score = impact_sum_out != nullptr;
-            if (grad_normal != nullptr && grad_normal_helper != nullptr) {
-                if (impact_score)
-                    launch_blend.template operator()<DENS_TYPE, true, true, 0>();
-                else
-                    launch_blend.template operator()<DENS_TYPE, true, false, 0>();
-            } else {
-                if (impact_score)
-                    launch_blend.template operator()<DENS_TYPE, false, true, 0>();
-                else
-                    launch_blend.template operator()<DENS_TYPE, false, false, 0>();
-            }
+            if (grad_normal != nullptr && grad_normal_helper != nullptr)
+                launch_blend.template operator()<DENS_TYPE, true, 0>();
+            else
+                launch_blend.template operator()<DENS_TYPE, false, 0>();
         };
         if (warp_cull_mode == 1) {
-            if (impact_sum_out != nullptr)
-                launch_blend.template operator()<DensificationType::None, false, true, 1>();
-            else
-                launch_blend.template operator()<DensificationType::None, false, false, 1>();
+            launch_blend.template operator()<DensificationType::None, false, 1>();
         } else if (warp_cull_mode == 2) {
-            if (impact_sum_out != nullptr)
-                launch_blend.template operator()<DensificationType::None, false, true, 2>();
-            else
-                launch_blend.template operator()<DensificationType::None, false, false, 2>();
+            launch_blend.template operator()<DensificationType::None, false, 2>();
         } else if (densification_weight != nullptr && densification_error != nullptr &&
                    (densification_type == DensificationType::MRNF || densification_error_map != nullptr)) {
             // Both rows: the MRNF variant sums the weight and the (map-weighted) error.
@@ -195,8 +186,8 @@ void fast_lfs::rasterization::backward(
     float clip_left, clip_right, clip_top, clip_bottom;
     ewa_clip_bounds(w_f, h_f, fx, fy, cx, cy, clip_left, clip_right, clip_top, clip_bottom);
     if (n_primitives > 0) {
-        auto launch_preprocess_backward = [&]<bool MIP_FILTER, int ACTIVE_SH_BASES, bool DISABLED_FEATURES>() {
-            kernels::backward::preprocess_backward_cu<MIP_FILTER, ACTIVE_SH_BASES, DISABLED_FEATURES><<<div_round_up(n_primitives, config::block_size_preprocess_backward), config::block_size_preprocess_backward, 0, stream>>>(
+        auto launch_preprocess_backward = [&]<bool MIP_FILTER, int ACTIVE_SH_BASES, bool DISABLED_FEATURES, bool CAMERA_GRAD>() {
+            kernels::backward::preprocess_backward_cu<MIP_FILTER, ACTIVE_SH_BASES, DISABLED_FEATURES, CAMERA_GRAD><<<div_round_up(n_primitives, config::block_size_preprocess_backward), config::block_size_preprocess_backward, 0, stream>>>(
                 means,
                 scales_raw,
                 rotations_raw,
@@ -214,6 +205,7 @@ void fast_lfs::rasterization::backward(
                 grad_opacity_helper,
                 grad_color_helper,
                 grad_w2c,
+                grad_cam_position,
                 (densification_error_map == nullptr && densification_type == DensificationType::None) ? densification_weight : nullptr,
                 (densification_error_map == nullptr && densification_type == DensificationType::None) ? densification_error : nullptr,
                 n_primitives,
@@ -227,6 +219,7 @@ void fast_lfs::rasterization::backward(
                 clip_right,
                 clip_top,
                 clip_bottom,
+                dilation_scale,
                 sh_layout_slots,
                 fused_adam,
                 shN_value_bounds,
@@ -240,21 +233,24 @@ void fast_lfs::rasterization::backward(
                                        fused_adam.flatten_reg_weight <= 0.0f &&
                                        !fused_adam.scale_reg_log &&
                                        !fused_adam.per_splat_mean_step &&
-                                       fused_adam.rendered_count == nullptr;
-        auto launch_preprocess_backward_for_mip = [&]<int ACTIVE_SH_BASES, bool DISABLED_FEATURES>() {
+                                       fused_adam.ray_depth_state == nullptr &&
+                                       fused_adam.rendered_count == nullptr &&
+                                       !fused_adam.reg_rendered_only;
+        auto launch_preprocess_backward_for_mip = [&]<int ACTIVE_SH_BASES, bool DISABLED_FEATURES, bool CAMERA_GRAD>() {
             if (mip_filter) {
-                launch_preprocess_backward.template operator()<true, ACTIVE_SH_BASES, DISABLED_FEATURES>();
+                launch_preprocess_backward.template operator()<true, ACTIVE_SH_BASES, DISABLED_FEATURES, CAMERA_GRAD>();
             } else {
-                launch_preprocess_backward.template operator()<false, ACTIVE_SH_BASES, DISABLED_FEATURES>();
+                launch_preprocess_backward.template operator()<false, ACTIVE_SH_BASES, DISABLED_FEATURES, CAMERA_GRAD>();
             }
         };
         auto launch_specialized = [&]<int ACTIVE_SH_BASES>() {
-            if (force_generic_preprocess_for_testing()) {
-                launch_preprocess_backward_for_mip.template operator()<ACTIVE_SH_BASES, false>();
-            } else if (disabled_features) {
-                launch_preprocess_backward_for_mip.template operator()<ACTIVE_SH_BASES, true>();
+            if (grad_w2c != nullptr) {
+                // The camera gradient is only instantiated in the runtime-generic kernel.
+                launch_preprocess_backward_for_mip.template operator()<ACTIVE_SH_BASES, false, true>();
+            } else if (disabled_features && !force_generic_preprocess_for_testing()) {
+                launch_preprocess_backward_for_mip.template operator()<ACTIVE_SH_BASES, true, false>();
             } else {
-                launch_preprocess_backward_for_mip.template operator()<ACTIVE_SH_BASES, false>();
+                launch_preprocess_backward_for_mip.template operator()<ACTIVE_SH_BASES, false, false>();
             }
         };
         if (active_sh_bases <= 1) {

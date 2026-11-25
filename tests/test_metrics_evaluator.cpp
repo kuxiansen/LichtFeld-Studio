@@ -14,6 +14,7 @@
 #include "core/tensor/internal/cuda_stream_context.hpp"
 #include "core/tensor/internal/memory_pool.hpp"
 #include "io/cache_image_loader.hpp"
+#include "training/components/calibration_correction.hpp"
 #include "training/dataset.hpp"
 #include "training/metrics/eval_image_labels.hpp"
 #include "training/metrics/eval_mask.hpp"
@@ -30,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <gtest/gtest.h>
 #include <limits>
@@ -37,6 +39,7 @@
 #include <nlohmann/json.hpp>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <torch/torch.h>
@@ -223,8 +226,7 @@ namespace {
 
 TEST(EvalMetricsCsv, HeaderAppendsGeometryColumnsWithoutRenamingExisting) {
     EXPECT_EQ(EvalMetrics::to_csv_header(),
-              "iteration,psnr,ssim,lpips,time_per_image,num_gaussians,normal_angle_deg,depth_absrel,bias_r,bias_g,bias_b,bias_corr_r,bias_corr_g,bias_corr_b,flip,"
-              "depth_prior_err_median_mm,depth_prior_err_p90_mm,depth_prior_low_alpha");
+              "iteration,psnr,ssim,lpips,time_per_image,num_gaussians,normal_angle_deg,depth_absrel,bias_r,bias_g,bias_b,bias_corr_r,bias_corr_g,bias_corr_b,flip");
 
     EvalMetrics missing;
     missing.iteration = 200;
@@ -232,7 +234,7 @@ TEST(EvalMetricsCsv, HeaderAppendsGeometryColumnsWithoutRenamingExisting) {
     missing.ssim = 0.5f;
     missing.elapsed_time = 0.01f;
     missing.num_gaussians = 10;
-    EXPECT_EQ(missing.to_csv_row(), "200,1.000000,0.500000,,0.010000,10,,,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,,,,");
+    EXPECT_EQ(missing.to_csv_row(), "200,1.000000,0.500000,,0.010000,10,,,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,");
 
     EvalMetrics present = missing;
     present.normal_angle_deg = 12.5f;
@@ -241,10 +243,7 @@ TEST(EvalMetricsCsv, HeaderAppendsGeometryColumnsWithoutRenamingExisting) {
     present.bias_g = -0.002f;
     present.bias_b = 0.003f;
     present.flip = 0.125f;
-    present.depth_prior_err_median_mm = 12.5f;
-    present.depth_prior_err_p90_mm = 60.0f;
-    present.depth_prior_low_alpha = 0.25f;
-    EXPECT_EQ(present.to_csv_row(), "200,1.000000,0.500000,,0.010000,10,12.500000,0.250000,0.001000,-0.002000,0.003000,0.000000,0.000000,0.000000,0.125000,12.500000,60.000000,0.250000");
+    EXPECT_EQ(present.to_csv_row(), "200,1.000000,0.500000,,0.010000,10,12.500000,0.250000,0.001000,-0.002000,0.003000,0.000000,0.000000,0.000000,0.125000");
 }
 
 TEST(EvalMetricsEvent, ZeroLpipsRemainsPresent) {
@@ -432,44 +431,6 @@ TEST(GeomMetricHelpers, AbsRelDividesAccumulatedDepthByAlpha) {
     EXPECT_NEAR(*absrel, 0.0f, 1.0e-5f);
 }
 
-// Catches unnormalized depth, prior holes counted as error, too-transparent pixels scored, or those
-// pixels left out of the low-alpha share.
-TEST(GeomMetricHelpers, DepthPriorErrorScoresExpectedDepthOnPriorPixels) {
-    constexpr int kH = 4;
-    constexpr int kW = 5;
-    std::vector<float> prior(static_cast<size_t>(kH * kW), 2.0f);
-    std::vector<float> alpha(static_cast<size_t>(kH * kW), 1.0f);
-    std::vector<float> accumulated(static_cast<size_t>(kH * kW), 2.0f);
-    // Row 0: prior holes, whatever is rendered there.
-    for (int x = 0; x < kW; ++x) {
-        prior[static_cast<size_t>(x)] = 0.0f;
-        accumulated[static_cast<size_t>(x)] = 9.0f;
-    }
-    // Row 1: translucent but scorable (alpha 0.8, expected depth 2.1 m -> 0.1 m error).
-    for (int x = 0; x < kW; ++x) {
-        alpha[static_cast<size_t>(kW + x)] = 0.8f;
-        accumulated[static_cast<size_t>(kW + x)] = 0.8f * 2.1f;
-    }
-    // One pixel too transparent to score, with a wild depth.
-    alpha[static_cast<size_t>(2 * kW)] = 0.2f;
-    accumulated[static_cast<size_t>(2 * kW)] = 0.2f * 50.0f;
-
-    const auto error = lfs::training::depth_prior_error(
-        cpu_hw(accumulated, kH, kW), cpu_hw(alpha, kH, kW), cpu_hw(prior, kH, kW));
-    ASSERT_TRUE(error.has_value());
-    EXPECT_EQ(error->prior_pixels, static_cast<size_t>(3 * kW));
-    // 14 scored pixels: 9 exact, 5 off by 0.1 m.
-    EXPECT_NEAR(error->median_m, 0.0f, 1.0e-5f);
-    EXPECT_NEAR(error->p90_m, 0.1f, 1.0e-4f);
-    EXPECT_NEAR(error->low_alpha_fraction, 6.0f / 15.0f, 1.0e-6f);
-}
-
-TEST(GeomMetricHelpers, DepthPriorErrorNeedsMatchingShapes) {
-    const std::vector<float> a(12, 1.0f);
-    const std::vector<float> b(16, 1.0f);
-    EXPECT_FALSE(lfs::training::depth_prior_error(cpu_hw(a, 3, 4), cpu_hw(a, 3, 4), cpu_hw(b, 4, 4)).has_value());
-}
-
 TEST(MetricsEvaluatorGeom, MatchingRenderedAndPriorNormalIsNearZero) {
     if (!torch::cuda::is_available()) {
         GTEST_SKIP() << "CUDA not available";
@@ -506,8 +467,7 @@ TEST(MetricsEvaluatorGeom, MatchingRenderedAndPriorNormalIsNearZero) {
     ASSERT_TRUE(metrics.normal_angle_deg.has_value());
     EXPECT_NEAR(*metrics.normal_angle_deg, 0.0f, 2.0f);
     EXPECT_EQ(EvalMetrics::to_csv_header(),
-              "iteration,psnr,ssim,lpips,time_per_image,num_gaussians,normal_angle_deg,depth_absrel,bias_r,bias_g,bias_b,bias_corr_r,bias_corr_g,bias_corr_b,flip,"
-              "depth_prior_err_median_mm,depth_prior_err_p90_mm,depth_prior_low_alpha");
+              "iteration,psnr,ssim,lpips,time_per_image,num_gaussians,normal_angle_deg,depth_absrel,bias_r,bias_g,bias_b,bias_corr_r,bias_corr_g,bias_corr_b,flip");
 
     std::filesystem::remove_all(tmp);
 }
@@ -2251,5 +2211,342 @@ TEST(MetricsEvaluator, IgnoredPaintCannotChangeSidecarAlphaOrFolderScores) {
             EXPECT_EQ(psnrs[0], psnrs[1]);
         }
     }
+    std::filesystem::remove_all(tmp);
+}
+
+// SegmentAndIgnore treats only 255 pixels as keep, ignoring 128 sky/segment and 0 ignore pixels
+// consistently across sidecar masks, RGBA alpha and masks:<folder>.
+TEST(MetricsEvaluator, SegmentAndIgnoreScoresOnlyWhiteKeepPixelsAcrossSidecarAlphaAndFolder) {
+    if (!torch::cuda::is_available())
+        GTEST_SKIP() << "CUDA not available";
+    ensure_image_loader();
+    const auto tmp = std::filesystem::temp_directory_path() / "lfs_eval_sai_consistency";
+    std::filesystem::remove_all(tmp);
+    std::filesystem::create_directories(tmp / "masks");
+    constexpr int h = 48, w = 64;
+    constexpr float kExpectedKeepFraction = (16.0f * 16.0f) / static_cast<float>(h * w);
+
+    std::vector<float> sidecar_or_folder_psnr;
+    for (const int source : {0, 1, 2}) {
+        SCOPED_TRACE(::testing::Message() << "source=" << source);
+        std::vector<float> ssims;
+        std::vector<float> psnrs;
+        for (const bool painted : {false, true}) {
+            const auto stem = std::to_string(source) + "_" + std::to_string(painted);
+            const auto image_path = tmp / (stem + ".png");
+            const auto mask_path = tmp / "masks" / (stem + ".png");
+            const int channels = source == 1 ? 4 : 3;
+            std::vector<uint8_t> pixels(h * w * channels, 100), weights(h * w, 0);
+            for (int y = 0; y < h; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    const int p = y * w + x;
+                    const bool is_keep = (x >= 16 && x < 32 && y >= 16 && y < 32);
+                    const bool is_segment_sky = (x >= 32 && x < 48 && y >= 16 && y < 32);
+                    const uint8_t value = is_keep ? 255 : (is_segment_sky ? 128 : 0);
+                    weights[p] = value;
+                    if (channels == 4)
+                        pixels[p * channels + 3] = value;
+                    if (painted && !is_keep) {
+                        pixels[p * channels] = is_segment_sky ? 255 : 0;
+                        pixels[p * channels + 1] = is_segment_sky ? 0 : 255;
+                        pixels[p * channels + 2] = 0;
+                    }
+                }
+            }
+            ASSERT_TRUE(lfs::core::save_png(image_path, pixels.data(), w, h, channels, 8, 0));
+            ASSERT_TRUE(lfs::core::save_png(mask_path, weights.data(), w, h, 1, 8, 0));
+            auto cam = std::make_shared<Camera>(
+                Tensor::eye(3, Device::CUDA), Tensor::zeros({3}, Device::CUDA),
+                64.0f, 64.0f, 32.0f, 24.0f, Tensor{}, Tensor{}, CameraModelType::PINHOLE,
+                image_path.filename().string(), image_path,
+                source == 0 ? mask_path : std::filesystem::path{}, w, h, 0);
+            if (source == 1)
+                cam->set_has_alpha(true);
+            auto dataset = std::make_shared<CameraDataset>(std::vector<std::shared_ptr<Camera>>{cam},
+                                                           DatasetConfig{}, CameraDataset::Split::ALL);
+            auto params = make_eval_params(tmp / ("out_" + stem));
+            params.optimization.mask_mode = lfs::core::param::MaskMode::SegmentAndIgnore;
+            params.optimization.mask_threshold = 0.5f;
+            params.optimization.use_alpha_as_mask = source == 1;
+            if (source == 2)
+                params.optimization.eval_mask = "masks:" + (tmp / "masks").string();
+            std::filesystem::create_directories(params.dataset.output_path);
+            MetricsEvaluator evaluator(params);
+            if (source == 2)
+                ASSERT_TRUE(evaluator.install_eval_mask_source({0, 0, 0}).has_value());
+            const auto render = [](Camera&, Camera&, float) -> lfs::Result<lfs::training::EvaluationRenderResult> {
+                lfs::training::RenderOutput output;
+                output.image = Tensor::full({3, h, w}, 120.0f / 255.0f, Device::CUDA);
+                return lfs::training::EvaluationRenderResult{.output = std::move(output)};
+            };
+            const auto result = evaluator.evaluate_views(1, dataset, {.render = render}, Tensor::zeros({3}, Device::CUDA));
+            ASSERT_TRUE(result.valid);
+            ASSERT_EQ(result.views.size(), 1u);
+            ASSERT_TRUE(result.views[0].masked);
+            EXPECT_NEAR(result.views[0].evaluated_pixel_fraction, kExpectedKeepFraction, 1e-6f);
+            ASSERT_TRUE(std::isfinite(result.psnr));
+            ASSERT_TRUE(std::isfinite(result.ssim));
+            ssims.push_back(result.ssim);
+            psnrs.push_back(result.psnr);
+        }
+        EXPECT_NEAR(ssims[0], ssims[1], 1e-6f);
+        EXPECT_FLOAT_EQ(psnrs[0], psnrs[1]);
+        sidecar_or_folder_psnr.push_back(psnrs[0]);
+    }
+    ASSERT_EQ(sidecar_or_folder_psnr.size(), 3u);
+    EXPECT_FLOAT_EQ(sidecar_or_folder_psnr[0], sidecar_or_folder_psnr[1]);
+    EXPECT_FLOAT_EQ(sidecar_or_folder_psnr[0], sidecar_or_folder_psnr[2]);
+    std::filesystem::remove_all(tmp);
+}
+
+// Evaluation explicitly counts and reports cameras whose rolling-shutter readout is actually active.
+TEST(MetricsEvaluator, RecordsRollingShutterActiveCameraCount) {
+    if (!torch::cuda::is_available())
+        GTEST_SKIP() << "CUDA not available";
+    ensure_image_loader();
+
+    const auto tmp = std::filesystem::temp_directory_path() / "lfs_eval_rolling_shutter";
+    std::filesystem::remove_all(tmp);
+    std::filesystem::create_directories(tmp);
+    constexpr int kW = 32, kH = 24;
+    const auto img_a = tmp / "a.png";
+    const auto img_b = tmp / "b.png";
+    write_rgb_png(img_a, 100, 100, 100, kH, kW);
+    write_rgb_png(img_b, 100, 100, 100, kH, kW);
+
+    const lfs::core::RollingShutterMotion motion{
+        .readout_rows = true, .rotation = {0.01f, 0.0f, 0.0f}, .displacement = {0.0f, 0.0f, 0.0f}};
+
+    auto read_report = [](const std::filesystem::path& path) {
+        std::ifstream in(path);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    };
+
+    for (const bool gut : {true, false}) {
+        auto cam_a = std::make_shared<Camera>(
+            Tensor::eye(3, Device::CUDA), Tensor::zeros({3}, Device::CUDA),
+            32.0f, 32.0f, 16.0f, 12.0f, Tensor{}, Tensor{}, CameraModelType::FISHEYE,
+            "a.png", img_a, std::filesystem::path{}, kW, kH, 0);
+        cam_a->set_rolling_shutter(motion);
+        auto cam_b = std::make_shared<Camera>(
+            Tensor::eye(3, Device::CUDA), Tensor::zeros({3}, Device::CUDA),
+            32.0f, 32.0f, 16.0f, 12.0f, Tensor{}, Tensor{}, CameraModelType::FISHEYE,
+            "b.png", img_b, std::filesystem::path{}, kW, kH, 1);
+        auto dataset = std::make_shared<CameraDataset>(
+            std::vector<std::shared_ptr<Camera>>{cam_a, cam_b}, DatasetConfig{}, CameraDataset::Split::ALL);
+        auto params = make_eval_params(tmp / (gut ? "gut_on" : "gut_off"));
+        params.optimization.gut = gut;
+        std::filesystem::create_directories(params.dataset.output_path);
+        MetricsEvaluator evaluator(params);
+        const auto render = [](Camera&, Camera& render_cam, float) -> lfs::Result<lfs::training::EvaluationRenderResult> {
+            lfs::training::RenderOutput output;
+            output.image = Tensor::full({3, static_cast<size_t>(render_cam.image_height()),
+                                         static_cast<size_t>(render_cam.image_width())},
+                                        0.5f, Device::CUDA);
+            return lfs::training::EvaluationRenderResult{.output = std::move(output)};
+        };
+        const auto metrics = evaluator.evaluate_views(10, dataset, {.render = render}, Tensor::zeros({3}, Device::CUDA));
+        evaluator.save_report();
+        ASSERT_TRUE(metrics.valid);
+        EXPECT_EQ(metrics.evaluated_cameras, 2u);
+        EXPECT_EQ(metrics.rolling_shutter_cameras, gut ? 1u : 0u);
+        const std::string expected_token = gut ? "rolling_shutter_cameras: 1/2" : "rolling_shutter_cameras: 0/2";
+        EXPECT_NE(metrics.to_string().find(expected_token), std::string::npos);
+        const auto report_text = read_report(params.dataset.output_path / "metrics_report.txt");
+        const std::string expected_report = gut ? "Rolling shutter cameras: 1 / 2" : "Rolling shutter cameras: 0 / 2";
+        EXPECT_NE(report_text.find(expected_report), std::string::npos);
+    }
+
+    for (const auto space : {lfs::core::param::EvalSpace::Distorted, lfs::core::param::EvalSpace::Undistorted}) {
+        auto cam = make_distorted_eval_camera(img_a, {}, kW, kH);
+        cam->set_rolling_shutter(motion);
+        auto dataset = std::make_shared<CameraDataset>(
+            std::vector<std::shared_ptr<Camera>>{cam}, DatasetConfig{}, CameraDataset::Split::ALL);
+        auto params = make_eval_params(tmp / (space == lfs::core::param::EvalSpace::Distorted ? "native_gut" : "undistorted"));
+        params.optimization.gut = true;
+        params.optimization.undistort = true;
+        params.optimization.eval_space = space;
+        std::filesystem::create_directories(params.dataset.output_path);
+        MetricsEvaluator evaluator(params);
+        bool saw_rolling_shutter = false;
+        const auto render = [&saw_rolling_shutter](Camera&, Camera& render_cam, float) -> lfs::Result<lfs::training::EvaluationRenderResult> {
+            saw_rolling_shutter = render_cam.rolling_shutter().has_value();
+            lfs::training::RenderOutput output;
+            output.image = Tensor::full({3, static_cast<size_t>(render_cam.image_height()),
+                                         static_cast<size_t>(render_cam.image_width())},
+                                        0.5f, Device::CUDA);
+            return lfs::training::EvaluationRenderResult{.output = std::move(output)};
+        };
+        const auto metrics = evaluator.evaluate_views(20, dataset, {.render = render}, Tensor::zeros({3}, Device::CUDA));
+        ASSERT_TRUE(metrics.valid);
+        EXPECT_EQ(metrics.evaluated_cameras, 1u);
+        EXPECT_EQ(metrics.rolling_shutter_cameras, space == lfs::core::param::EvalSpace::Distorted ? 1u : 0u);
+        EXPECT_TRUE(saw_rolling_shutter);
+    }
+    std::filesystem::remove_all(tmp);
+}
+
+TEST(MetricsEvaluator, CalibrationCorrectionAddsAlignedScoresBesideThePlainOnes) {
+    ensure_image_loader();
+    const auto tmp = std::filesystem::temp_directory_path() / "lfs_eval_calibration_scoring";
+    std::filesystem::remove_all(tmp);
+    std::filesystem::create_directories(tmp);
+    constexpr int w = 128, h = 96;
+    const auto signal = [](int x, int y, int c) {
+        return uint8_t(std::lround(128 + 54 * std::sin(.17 * x + .04 * y + c) + 36 * std::cos(.06 * x - .14 * y + c)));
+    };
+    std::vector<uint8_t> reference(w * h * 3);
+    std::vector<float> prediction(w * h * 3), expected(w * h * 3);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            for (int c = 0; c < 3; ++c) {
+                const auto value = signal(x + 2, y, c);
+                reference[(y * w + x) * 3 + c] = value;
+                expected[(c * h + y) * w + x] = float(value) / 255.f;
+                // Off the 8-bit grid, so rounding the render twice would change the aligned scores.
+                prediction[(c * h + y) * w + x] = (float(signal(x, y, c)) + .45f * float(std::sin(.9 * x + 1.3 * y + c))) / 255.f;
+            }
+    const auto path = tmp / "frame.png";
+    ASSERT_TRUE(lfs::core::save_png(path, reference.data(), w, h, 3, 8, 0));
+    auto camera = make_eval_camera(path, {}, w, h);
+    auto dataset = std::make_shared<CameraDataset>(std::vector{camera}, DatasetConfig{}, CameraDataset::Split::ALL);
+    auto source = Tensor::from_vector(prediction, {3, h, w}, Device::CUDA);
+    auto target = Tensor::from_vector(expected, {3, h, w}, Device::CUDA);
+    const auto photo = lfs::training::image_for_metrics(target, 8);
+    const float nominal = lfs::training::PSNR{}.compute(lfs::training::image_for_metrics(source, 8), photo);
+    auto render = [&](Camera&, Camera&, float) -> lfs::Result<lfs::training::EvaluationRenderResult> {
+        return lfs::training::EvaluationRenderResult{.output = {.image = source}};
+    };
+    const auto read_text = [](const std::filesystem::path& file) {
+        std::ifstream in(file, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), {});
+    };
+    const auto csv_lines = [&](const std::filesystem::path& dir) {
+        std::vector<std::string> lines;
+        std::istringstream text(read_text(dir / "metrics.csv"));
+        for (std::string line; std::getline(text, line);)
+            lines.push_back(line);
+        return lines;
+    };
+    const auto fields = [](const std::string& line) {
+        std::vector<std::string> out;
+        std::istringstream text(line);
+        for (std::string field; std::getline(text, field, ',');)
+            out.push_back(field);
+        if (line.ends_with(','))
+            out.emplace_back();
+        return out;
+    };
+
+    std::array<EvalMetrics, 2> results;
+    for (const bool enabled : {false, true}) {
+        auto params = make_eval_params(tmp / (enabled ? "on" : "off"));
+        params.optimization.calibration_correction = enabled;
+        std::filesystem::create_directories(params.dataset.output_path);
+        MetricsEvaluator evaluator(params);
+        results[enabled] = evaluator.evaluate_views(1, dataset, {.render = render}, Tensor::zeros({3}, Device::CUDA));
+        evaluator.save_report();
+        ASSERT_TRUE(results[enabled].valid);
+        ASSERT_EQ(results[enabled].views.size(), 1u);
+        EXPECT_EQ(results[enabled].alignment_summary.empty(), !enabled);
+    }
+    const auto& off = results[0];
+    const auto& on = results[1];
+
+    // The headline scores are the plain ones, bit for bit.
+    EXPECT_FLOAT_EQ(off.psnr, nominal);
+    EXPECT_EQ(std::bit_cast<uint32_t>(on.psnr), std::bit_cast<uint32_t>(off.psnr));
+    EXPECT_EQ(std::bit_cast<uint32_t>(on.ssim), std::bit_cast<uint32_t>(off.ssim));
+    EXPECT_EQ(on.lpips, off.lpips);
+    EXPECT_EQ(on.views[0].psnr, off.views[0].psnr);
+    EXPECT_EQ(on.views[0].ssim, off.views[0].ssim);
+    EXPECT_FALSE(off.psnr_aligned || off.ssim_aligned || off.lpips_aligned);
+    EXPECT_FALSE(off.views[0].psnr_aligned || off.views[0].ssim_aligned);
+
+    // The aligned scores are those of the render as rendered, aligned onto the photograph and rounded onto its grid
+    // once; rounding before the alignment as well gives other scores.
+    const auto aligned_scores = [&](const Tensor& render_image) {
+        lfs::core::Tensor displacement;
+        const auto aligned = lfs::training::image_for_metrics(
+            lfs::training::CalibrationCorrection::align_for_scoring(render_image, photo, {}, displacement), 8);
+        return std::pair{lfs::training::PSNR{1.0f}.compute(aligned, photo),
+                         lfs::training::SSIM{true}.compute_evaluation(aligned, photo, {}, false, "frame.png")};
+    };
+    const auto [rounded_once_psnr, rounded_once_ssim] = aligned_scores(source);
+    const float rounded_twice_psnr = aligned_scores(lfs::training::image_for_metrics(source, 8)).first;
+    ASSERT_TRUE(on.psnr_aligned && on.ssim_aligned);
+    EXPECT_EQ(*on.psnr_aligned, rounded_once_psnr);
+    EXPECT_NE(*on.psnr_aligned, rounded_twice_psnr);
+    // The SSIM reduction is not bitwise reproducible across separately computed maps.
+    EXPECT_NEAR(*on.ssim_aligned, rounded_once_ssim, 2e-6f);
+    EXPECT_GT(*on.psnr_aligned, nominal + 10.f);
+    EXPECT_GT(*on.ssim_aligned, on.ssim);
+    EXPECT_EQ(on.views[0].psnr_aligned, on.psnr_aligned);
+    EXPECT_EQ(on.views[0].ssim_aligned, on.ssim_aligned);
+    EXPECT_NE(on.alignment_summary.find(std::format("PSNR: {:.4f}", *on.psnr_aligned)), std::string::npos);
+
+    // metrics.csv gains exactly the three aligned columns at its end.
+    const auto off_csv = csv_lines(tmp / "off");
+    const auto on_csv = csv_lines(tmp / "on");
+    ASSERT_EQ(off_csv.size(), 2u);
+    ASSERT_EQ(on_csv.size(), 2u);
+    EXPECT_EQ(off_csv[0], EvalMetrics::to_csv_header());
+    EXPECT_EQ(on_csv[0], off_csv[0] + ",psnr_aligned,ssim_aligned,lpips_aligned");
+    const auto off_row = fields(off_csv[1]);
+    const auto on_row = fields(on_csv[1]);
+    ASSERT_EQ(on_row.size(), off_row.size() + 3);
+    for (size_t i = 0; i < off_row.size(); ++i)
+        if (i != 4) // time_per_image
+            EXPECT_EQ(on_row[i], off_row[i]) << i;
+    EXPECT_EQ(on_row[off_row.size()], std::format("{:.6f}", *on.psnr_aligned));
+    EXPECT_EQ(on_row[off_row.size() + 1], std::format("{:.6f}", *on.ssim_aligned));
+
+    // The per-image record and the report carry them too; without the option nothing mentions them.
+    const auto on_json = nlohmann::json::parse(read_text(tmp / "on" / "per_image_metrics.json"));
+    const auto& evaluation = on_json.at("frame.png").at("evaluations").at(0);
+    EXPECT_FLOAT_EQ(evaluation.at("psnr").get<float>(), on.psnr);
+    EXPECT_FLOAT_EQ(evaluation.at("psnr_aligned").get<float>(), *on.psnr_aligned);
+    EXPECT_FLOAT_EQ(evaluation.at("ssim_aligned").get<float>(), *on.ssim_aligned);
+    EXPECT_TRUE(evaluation.contains("lpips_aligned"));
+    EXPECT_EQ(read_text(tmp / "off" / "per_image_metrics.json").find("aligned"), std::string::npos);
+    EXPECT_NE(read_text(tmp / "on" / "metrics_report.txt").find("Aligned PSNR: "), std::string::npos);
+    EXPECT_EQ(read_text(tmp / "off" / "metrics_report.txt").find("Aligned"), std::string::npos);
+
+    // With pixel sets, only the headline set gets aligned scores, and every set's plain scores, FLIP among them,
+    // are those of the plain render.
+    std::filesystem::create_directories(tmp / "masks");
+    std::vector<uint8_t> keep(w * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            keep[y * w + x] = x < 80 ? 255 : 0;
+    ASSERT_TRUE(lfs::core::save_png(tmp / "masks" / "frame.png", keep.data(), w, h, 1, 8, 0));
+    std::array<EvalMetrics, 2> sets;
+    for (const bool enabled : {false, true}) {
+        auto params = make_eval_params(tmp / (enabled ? "sets_on" : "sets_off"));
+        params.optimization.calibration_correction = enabled;
+        params.optimization.eval_flip = true;
+        params.optimization.eval_mask = "masks:" + (tmp / "masks").string();
+        params.optimization.eval_mask_report = "mask,unmasked,inverted";
+        std::filesystem::create_directories(params.dataset.output_path);
+        MetricsEvaluator evaluator(params);
+        ASSERT_TRUE(evaluator.install_eval_mask_source({0, 0, 0}).has_value());
+        sets[enabled] = evaluator.evaluate_views(1, dataset, {.render = render}, Tensor::zeros({3}, Device::CUDA));
+        ASSERT_TRUE(sets[enabled].valid);
+        ASSERT_EQ(sets[enabled].views.size(), 1u);
+    }
+    for (const auto set : lfs::core::param::kEvalPixelSets) {
+        SCOPED_TRACE(lfs::core::param::eval_pixel_set_name(set));
+        const auto& plain = sets[0].views[0].sets[set];
+        const auto& with_alignment = sets[1].views[0].sets[set];
+        ASSERT_TRUE(plain && with_alignment);
+        EXPECT_EQ(with_alignment->psnr, plain->psnr);
+        EXPECT_EQ(with_alignment->ssim, plain->ssim);
+        EXPECT_EQ(with_alignment->flip, plain->flip);
+        EXPECT_FALSE(plain->psnr_aligned);
+        EXPECT_EQ(with_alignment->psnr_aligned.has_value(), set == lfs::core::param::EvalPixelSet::Mask);
+        EXPECT_EQ(with_alignment->ssim_aligned.has_value(), set == lfs::core::param::EvalPixelSet::Mask);
+    }
+    ASSERT_TRUE(sets[1].views[0].psnr_aligned);
+    EXPECT_GT(*sets[1].views[0].psnr_aligned, *sets[1].views[0].psnr + 10.f);
     std::filesystem::remove_all(tmp);
 }

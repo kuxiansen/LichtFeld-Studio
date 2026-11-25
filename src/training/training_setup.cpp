@@ -27,6 +27,7 @@
 #include "lfs/training/sh_value_storage.hpp"
 #include "noise_infill.hpp"
 #include "normal_auto_generate.hpp"
+#include "roi_sidecar.hpp"
 #ifndef LFS_TRAINER_ONLY
 #include "rendering/mesh2splat.hpp"
 #endif
@@ -47,6 +48,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <unordered_set>
 #include <variant>
 
 namespace lfs::training {
@@ -634,7 +636,29 @@ namespace lfs::training {
                     ? data.point_cloud
                     : point_cloud;
             scene.setInitialPointCloud(initial_cloud);
-            scene.addPointCloud("PointCloud", point_cloud, dataset_id);
+            const lfs::core::NodeId pc_id = scene.addPointCloud("PointCloud", point_cloud, dataset_id);
+            if (pc_id != lfs::core::NULL_NODE && !params.no_roi && !params.cropbox &&
+                !params.resume_checkpoint && !params.resume_project && !params.dataset.data_path.empty()) {
+                auto roi = read_roi_sidecar(params.dataset.data_path);
+                if (!roi) {
+                    return lfs::Status::failure(roi.error());
+                }
+                if (*roi) {
+                    const auto placement = make_roi_crop_polygon(**roi, scene.getTrainingDataOrigin());
+                    const lfs::core::NodeId poly_id = scene.addCropPolygon(
+                        "Model_crop_polygon", pc_id, placement.data, placement.local_transform);
+                    if (poly_id == lfs::core::NULL_NODE) {
+                        return lfs::Status::failure(lfs::make_error(lfs::ErrorInit{
+                            .code = lfs::ErrorCode::Internal,
+                            .domain = lfs::ErrorDomain::Training,
+                            .user_message = "Failed to add dataset roi.json crop polygon to scene",
+                            .detection = LFS_SOURCE_SITE_CURRENT(),
+                        }));
+                    }
+                    LOG_INFO("Region of interest: loaded roi.json ({} vertices, z=[{:.2f}, {:.2f}], area={:.1f} m^2)",
+                             (*roi)->vertices_xy.size(), (*roi)->z_min, (*roi)->z_max, (*roi)->area_m2);
+                }
+            }
             return {};
         }
 
@@ -1279,6 +1303,15 @@ namespace lfs::training {
                     }
                 }
 
+                const std::unordered_set<int> disabled_uids(params.disabled_camera_uids.begin(),
+                                                            params.disabled_camera_uids.end());
+                for (const auto* node : scene.getNodes()) {
+                    if (node->type == lfs::core::NodeType::CAMERA && node->camera &&
+                        disabled_uids.contains(node->camera->uid())) {
+                        scene.setCameraTrainingEnabled(node->id, false);
+                    }
+                }
+
                 LOG_INFO("Loaded dataset '{}' into scene: {} train{} cameras{}",
                          dataset_name, train_count,
                          hold_out ? std::format(" + {} val", val_count) : "",
@@ -1895,14 +1928,16 @@ namespace lfs::training {
         // A metadata save can change PRMS after the last CKPT was captured.
         // Explicit command-line overrides still take precedence on resume.
         auto resumed_params = trainer->getParams();
+        // Retain the effective folder used to hydrate cameras and load sidecar masks.
+        resumed_params.dataset.images = params.dataset.images;
         if (!params.overrides.has_optimization_key("keep_all_checkpoints")) {
             auto retention = document.parameters().checkpoint_retention(
                 resumed_params.optimization.strategy, resumed_params.optimization.keep_all_checkpoints);
             if (!retention)
                 return std::unexpected(lfs::format_for_developer(retention.error()));
             resumed_params.optimization.keep_all_checkpoints = *retention;
-            trainer->setParams(resumed_params);
         }
+        trainer->setParams(resumed_params);
         const int restored_iteration = **restored;
         if (restored_iteration != expected_iteration ||
             trainer->get_current_iteration() !=

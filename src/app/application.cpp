@@ -42,6 +42,7 @@
 #include "app/mcp_gui_tools.hpp"
 #include "gui/gpu_memory_query.hpp"
 #include "io/loader.hpp"
+#include "io/loaders/missing_dataset_images.hpp"
 #include "io/video/video_encoder.hpp"
 #include "io/video/video_export_schedule.hpp"
 #include "mcp/mcp_http_server.hpp"
@@ -51,6 +52,7 @@
 #include "rendering/coordinate_conventions.hpp"
 #include "sequencer/timeline.hpp"
 #include "training/rasterization/fast_rasterizer.hpp"
+#include "training/rasterization/gsplat_rasterizer.hpp"
 #include "visualizer/gui/layout_state.hpp"
 #include "visualizer/gui/panels/python_scripts_panel.hpp"
 #include "visualizer/gui/video_widget_interface.hpp"
@@ -159,7 +161,8 @@ namespace lfs::app {
         [[nodiscard]] lfs::Error training_project_error(
             const lfs::ErrorCode code,
             std::string detail,
-            const lfs::core::SourceSite source) {
+            const lfs::core::SourceSite source,
+            lfs::SmallFields fields = {}) {
             return lfs::make_error(lfs::ErrorInit{
                 .code = code,
                 .domain = lfs::ErrorDomain::App,
@@ -167,6 +170,7 @@ namespace lfs::app {
                     "The training project could not be restored.",
                 .detail = std::move(detail),
                 .detection = source,
+                .fields = std::move(fields),
             });
         }
 
@@ -284,6 +288,16 @@ namespace lfs::app {
             io::project::adopt_project_training_parameters(
                 params, std::move(*snapshot), std::move(*dataset_root),
                 std::move(images_folder), document->references(), path.parent_path());
+            // The dataset load disables these cameras again, matched by uid
+            // as for a checkpoint's disabled cameras.
+            auto disabled = io::project::disabled_camera_uids(document->scene_graph());
+            if (!disabled) {
+                return lfs::Status::failure(
+                    std::move(disabled).error().with_context(
+                        "read training project cameras",
+                        LFS_SOURCE_SITE_CURRENT()));
+            }
+            params.disabled_camera_uids = std::move(*disabled);
             // dataset_project stays set: it is the save destination unless
             // -o redirects the result, exactly like --resume.
             LOG_INFO(
@@ -521,6 +535,8 @@ namespace lfs::app {
                 std::move(**parsed_params);
             const auto checkpoint_dataset_path =
                 checkpoint_params.dataset.data_path;
+            checkpoint_params.dataset.images = core::path_to_generic_utf8(core::path_from_source_format(
+                core::utf8_to_path(checkpoint_params.dataset.images), checkpoint_dataset_path));
             const auto checkpoint_images_folder =
                 checkpoint_params.dataset.images;
 
@@ -589,6 +605,8 @@ namespace lfs::app {
                 checkpoint_params.optimization.iterations =
                     cli_params.optimization.iterations;
             }
+            checkpoint_params.optimization.perf_bench = cli_params.optimization.perf_bench;
+            checkpoint_params.optimization.perf_bench_warmup = cli_params.optimization.perf_bench_warmup;
             checkpoint_params.optimization.headless =
                 cli_params.optimization.headless;
             checkpoint_params.optimization.auto_train =
@@ -648,16 +666,24 @@ namespace lfs::app {
             }
             if (images_folder_changed) {
                 scene.rebaseCameraAssetPaths(
-                    checkpoint_params.dataset.data_path / checkpoint_images_folder,
-                    checkpoint_params.dataset.data_path / checkpoint_params.dataset.images);
+                    checkpoint_params.dataset.data_path / core::utf8_to_path(checkpoint_images_folder),
+                    checkpoint_params.dataset.data_path / core::utf8_to_path(checkpoint_params.dataset.images));
             }
             if (dataset_root_changed || images_folder_changed) {
                 const auto missing_images = scene.revalidateCameraImagePresence();
                 if (!missing_images.empty()) {
+                    std::vector<std::string> missing_paths;
+                    for (const auto& camera : scene.getAllCameras()) {
+                        if (!camera->has_image() && !camera->image_path().empty())
+                            missing_paths.push_back(core::path_to_utf8(camera->image_path()));
+                    }
+                    lfs::SmallFields fields;
+                    fields.add("missing_count", static_cast<std::int64_t>(missing_images.size()));
+                    fields.add("examples", io::join_missing_dataset_image_examples(missing_paths));
                     return training_project_error(
                         lfs::ErrorCode::InvalidArgument,
                         "The supplied dataset is not compatible with the resumed project's cameras",
-                        LFS_SOURCE_SITE_CURRENT());
+                        LFS_SOURCE_SITE_CURRENT(), std::move(fields));
                 }
             }
             if (checkpoint_params.optimization.mask_mode != core::param::MaskMode::None) {
@@ -1453,7 +1479,11 @@ namespace lfs::app {
                     cfg.width, cfg.height,
                     frame);
 
-                auto render_output = training::fast_rasterize(camera, *model, background);
+                const bool mip_filter = params->optimization.mip_filter;
+                auto render_output = params->optimization.gut
+                                         ? training::gsplat_rasterize(camera, *model, background, 1.0f, mip_filter,
+                                                                      training::GsplatRenderMode::RGB, true)
+                                         : training::fast_rasterize(camera, *model, background, mip_filter);
                 auto image = render_output.image;
                 if (image.dtype() != core::DataType::Float32) {
                     image = image.to(core::DataType::Float32);

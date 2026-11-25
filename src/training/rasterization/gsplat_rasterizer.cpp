@@ -14,6 +14,8 @@
 #include "gsplat/GeometryFeatures.h"
 #include "gsplat/Intersect.h"
 #include "gsplat/Ops.h"
+#include "lfs/training/splat_dilation.hpp"
+#include "phase_arena.hpp"
 #include "training/components/rolling_shutter.hpp"
 #include "training/kernels/densification_kernels.hpp"
 #include "training/kernels/grad_alpha.hpp"
@@ -117,12 +119,12 @@ namespace lfs::training {
         int tile_width,
         int tile_height,
         float scaling_modifier,
-        bool antialiased,
+        bool mip_filter,
         GsplatRenderMode render_mode,
         bool use_gut,
         const core::Tensor& bg_image,
-        const gsplat_lfs::FreeSpaceRender& free_space_in,
-        const core::Tensor& pixel_weights) {
+        const core::Tensor& pixel_weights,
+        float* median_depth_in) {
 
         // Begin arena frame for memory allocation
         auto& arena = core::GlobalArenaManager::instance().get_arena();
@@ -260,12 +262,12 @@ namespace lfs::training {
             }
 
             // Settings
-            constexpr float eps2d = 0.3f;
+            const float eps2d = mip_filter ? kMipFilterDilation : kSplatDilation;
             constexpr float near_plane = 0.01f;
             constexpr float far_plane = 10000.0f;
             constexpr float radius_clip = 0.0f;
             constexpr uint32_t tile_size = 16;
-            const bool calc_compensations = antialiased;
+            const bool calc_compensations = mip_filter;
             const float* K_ptr = K_tensor.ptr<float>();
 
             // Distortion coefficients. CPU tensors are uploaded through the
@@ -425,12 +427,11 @@ namespace lfs::training {
                 channels = 8;
             }
 
-            // The free-space test and the median depth need the splat depth channel and the whole image.
-            gsplat_lfs::FreeSpaceRender free_space;
-            if ((free_space_in.enabled() || free_space_in.median_depth != nullptr) && channels != 3 && tile_width == 0 && tile_height == 0) {
-                free_space = free_space_in;
-                free_space.depth_channel = channels == 1 ? 0 : 3;
-            }
+            // Median depth needs the splat depth channel and the whole image.
+            float* const median_depth =
+                (median_depth_in != nullptr && channels != 3 && tile_width == 0 && tile_height == 0)
+                    ? median_depth_in
+                    : nullptr;
 
             // Weighted pixels decide which sub-tiles get pairs; only whole-frame renders.
             core::Tensor tile_sub_masks;
@@ -489,7 +490,8 @@ namespace lfs::training {
             const size_t depths_size = align(C * N * sizeof(float));
             const size_t dirs_size = (sh_degree > 0) ? align(C * N * 3 * sizeof(float)) : 0;
             const size_t conics_size = align(C * N * 3 * sizeof(float));
-            const size_t compensations_size = calc_compensations ? align(C * N * sizeof(float)) : 0;
+            // The mip filter writes the compensations and, after them, the dilations.
+            const size_t compensations_size = calc_compensations ? align(2 * C * N * sizeof(float)) : 0;
             const size_t tiles_per_gauss_size = align(C * N * sizeof(int32_t));
             const size_t tile_offsets_size =
                 align((C * num_tiles_y * num_tiles_x + 1u) * sizeof(int32_t));
@@ -525,8 +527,10 @@ namespace lfs::training {
             auto* conics_ptr_out = reinterpret_cast<float*>(ptr);
             ptr += conics_size;
             float* compensations_ptr_out = nullptr;
+            float* dilations_ptr_out = nullptr;
             if (calc_compensations) {
                 compensations_ptr_out = reinterpret_cast<float*>(ptr);
+                dilations_ptr_out = compensations_ptr_out + C * N;
                 ptr += compensations_size;
             }
             auto* tiles_per_gauss_ptr = reinterpret_cast<int32_t*>(ptr);
@@ -572,6 +576,7 @@ namespace lfs::training {
                 .tile_offsets = tile_offsets_ptr_out,
                 .last_ids = last_ids_ptr_out,
                 .compensations = compensations_ptr_out,
+                .dilations = dilations_ptr_out,
                 .isect_ids = nullptr,
                 .flatten_ids = nullptr,
                 .n_isects = 0};
@@ -614,7 +619,7 @@ namespace lfs::training {
                 result,
                 fwd_stream,
                 viewmat_ptr,
-                free_space,
+                median_depth,
                 tile_sub_masks_ptr);
             // isect_ids / flatten_ids are borrowed from the TLS VMM cache —
             // never transfer ownership or free on error paths.
@@ -642,7 +647,6 @@ namespace lfs::training {
             }
             case GsplatRenderMode::RGB_D_N:
                 render_output.normal = cached_image_chw.slice(0, 4, 7);
-                render_output.depth_sq = cached_image_chw.slice(0, 7, 8);
                 [[fallthrough]];
             case GsplatRenderMode::RGB_D:
                 render_output.image = cached_image_chw.slice(0, 0, 3);
@@ -686,6 +690,7 @@ namespace lfs::training {
             ctx.tile_offsets_ptr = tile_offsets_ptr_out;
             ctx.last_ids_ptr = last_ids_ptr_out;
             ctx.compensations_ptr = compensations_ptr_out;
+            ctx.dilations_ptr = dilations_ptr_out;
 
             // Borrowed TLS VMM pointers (valid through backward; do not free)
             ctx.isect_ids_ptr = result.isect_ids;
@@ -707,6 +712,7 @@ namespace lfs::training {
 
             // Store camera pointers
             ctx.viewmat_ptr = viewmat_ptr;
+            ctx.cam_position_ptr = viewpoint_camera.cam_position_ptr();
             ctx.K_ptr = K_ptr;
             ctx.K_tensor = K_tensor;
             ctx.shutter_viewmats_ptr = shutter_viewmats_ptr;
@@ -748,7 +754,6 @@ namespace lfs::training {
             ctx.render_tile_y_offset = tile_y_offset;
             ctx.render_tile_width = tile_width;
             ctx.render_tile_height = tile_height;
-            ctx.free_space = free_space;
             ctx.tile_sub_masks = tile_sub_masks;
 
             return std::pair{render_output, ctx};
@@ -769,6 +774,14 @@ namespace lfs::training {
         }
     }
 
+    std::function<char*(size_t)> begin_gsplat_loss_phase(GsplatRasterizeContext& ctx) {
+        auto& arena = core::GlobalArenaManager::instance().get_arena();
+        ctx.phase_arena = std::make_shared<RasterizerPhaseArena>(
+            arena.get_allocator(ctx.frame_id, "gsplat.loss_backward"), ctx.stream);
+        ctx.phase_arena->begin_phase(RasterizerPhaseArena::Phase::Loss, 0);
+        return ctx.phase_arena->allocator(RasterizerPhaseArena::Phase::Loss);
+    }
+
     void gsplat_rasterize_backward(
         const GsplatRasterizeContext& ctx,
         const core::Tensor& grad_image,
@@ -781,12 +794,11 @@ namespace lfs::training {
         const core::Tensor& grad_depth,
         const core::Tensor& grad_normal,
         float flatten_weight,
-        const core::Tensor& grad_T_front,
-        const core::Tensor& grad_depth_sq) {
+        const GsplatColorVarianceLoss& color_variance,
+        core::Tensor blend_peak_out) {
 
         // Get arena for temporary allocations
         auto& arena = core::GlobalArenaManager::instance().get_arena();
-        auto arena_allocator = arena.get_allocator(ctx.frame_id, "gsplat.backward");
         // Run the backward work + arena frame release on the exact stream the
         // forward began the frame on (ctx.stream), so begin_frame and end_frame
         // chain on the same stream rather than relying on the caller's guard
@@ -797,9 +809,14 @@ namespace lfs::training {
                                                ? core::getCurrentCUDAStream()
                                                : ctx.means.stream());
         try {
+            auto arena_allocator = arena.get_allocator(ctx.frame_id, "gsplat.backward");
+            if (ctx.phase_arena) {
+                ctx.phase_arena->begin_phase(RasterizerPhaseArena::Phase::Backward, 0);
+                arena_allocator = ctx.phase_arena->allocator(RasterizerPhaseArena::Phase::Backward);
+            }
             // A caller may produce loss gradients on a different stream from
             // the saved forward context. Order every raw-pointer read explicitly.
-            for (const auto* gradient : {&grad_image, &grad_alpha, &grad_depth, &grad_normal, &grad_T_front, &grad_depth_sq}) {
+            for (const auto* gradient : {&grad_image, &grad_alpha, &grad_depth, &grad_normal}) {
                 if (gradient->is_valid() && gradient->numel() > 0) {
                     gradient->sync_to_stream(stream);
                 }
@@ -851,13 +868,16 @@ namespace lfs::training {
 
             size_t total_bwd_size = v_render_colors_size + v_render_alphas_size + v_means_size;
 
-            char* bwd_blob = total_bwd_size > 0 ? arena_allocator(total_bwd_size) : nullptr;
-            if (total_bwd_size > 0 && bwd_blob == nullptr) {
+            // The trainer can reuse the loss phase's memory for the temporary RGB/geometry gradients.
+            const size_t color_grad_bytes = ctx.phase_arena ? static_cast<size_t>(N) * channels * sizeof(float) : 0;
+            const size_t bwd_bytes = total_bwd_size + color_grad_bytes;
+            char* bwd_blob = bwd_bytes > 0 ? arena_allocator(bwd_bytes) : nullptr;
+            if (bwd_bytes > 0 && bwd_blob == nullptr) {
                 throw lfs::Exception(lfs::make_error(lfs::ErrorInit{
                     .code = lfs::ErrorCode::ResourceExhausted,
                     .domain = lfs::ErrorDomain::CUDA,
                     .user_message = "Ran out of GPU memory during training backward.",
-                    .detail = std::format("gsplat backward arena allocation failed ({} bytes)", total_bwd_size),
+                    .detail = std::format("gsplat backward arena allocation failed ({} bytes)", bwd_bytes),
                     .detection = LFS_SOURCE_SITE_CURRENT(),
                 }));
             }
@@ -911,7 +931,6 @@ namespace lfs::training {
                 copy_grad(grad_depth, channels == 1 ? 0 : 3, 1);
                 if (channels == 8) {
                     copy_grad(grad_normal, 4, 3);
-                    copy_grad(grad_depth_sq, 7, 1);
                 }
                 if (expected_depth) {
                     if (grad_alpha.is_valid() && grad_alpha.numel()) {
@@ -952,14 +971,41 @@ namespace lfs::training {
             float* const edge_score_out_ptr =
                 edge_scoring ? edge_score_out.ptr<float>() : nullptr;
 
-            gsplat_lfs::FreeSpaceRender free_space;
-            if (ctx.free_space.enabled() && grad_T_front.is_valid() &&
-                grad_T_front.numel() == static_cast<size_t>(H) * W) {
-                LFS_ASSERT_MSG(grad_T_front.is_contiguous() && grad_T_front.device() == core::Device::CUDA,
-                               "T_front gradient must be a contiguous CUDA tensor");
-                core::pin_operands({&grad_T_front});
-                free_space = ctx.free_space;
-                free_space.v_T_front = grad_T_front.ptr<float>();
+            gsplat_lfs::ColorVarianceRender gsplat_color_variance;
+            core::Tensor color_variance_pixel_weight_sum;
+            if (!std::isfinite(color_variance.weight) || color_variance.weight < 0.0f) {
+                throw std::runtime_error("Color variance weight must be finite and nonnegative");
+            }
+            if (color_variance.weight > 0.0f && channels >= 3 && ctx.render_colors_ptr != nullptr) {
+                auto loss = color_variance.loss;
+                if (loss.is_valid() && (loss.numel() != 1 || loss.device() != core::Device::CUDA ||
+                                        loss.dtype() != core::DataType::Float32 || !loss.is_contiguous())) {
+                    throw std::runtime_error("Color variance loss must be a CUDA Float32 scalar");
+                }
+                const auto& pixel_weight = color_variance.pixel_weight;
+                const bool has_pixel_weight = pixel_weight.is_valid() && pixel_weight.numel() > 0;
+                if (has_pixel_weight) {
+                    if (pixel_weight.shape() != core::TensorShape{static_cast<size_t>(H), static_cast<size_t>(W)} ||
+                        pixel_weight.device() != core::Device::CUDA || !pixel_weight.is_contiguous() ||
+                        pixel_weight.dtype() != core::DataType::Float32) {
+                        throw std::runtime_error("Color variance pixel weights must be contiguous CUDA Float32 [H, W]");
+                    }
+                    core::CUDAStreamGuard sum_guard(stream);
+                    pixel_weight.sync_to_stream(stream);
+                    color_variance_pixel_weight_sum = pixel_weight.sum();
+                    color_variance_pixel_weight_sum.sync_to_stream(stream);
+                }
+                core::pin_operands({&loss, &pixel_weight, &color_variance_pixel_weight_sum});
+                if (loss.is_valid()) {
+                    loss.sync_to_stream(stream);
+                }
+                gsplat_color_variance.render_colors = ctx.render_colors_ptr;
+                if (has_pixel_weight) {
+                    gsplat_color_variance.pixel_weight = pixel_weight.ptr<float>();
+                    gsplat_color_variance.pixel_weight_sum = color_variance_pixel_weight_sum.ptr<float>();
+                }
+                gsplat_color_variance.loss_out = loss.is_valid() ? loss.ptr<float>() : nullptr;
+                gsplat_color_variance.weight = color_variance.weight;
             }
 
             // The SH backward adds straight into the optimizer's sh0 and swizzled shN gradients.
@@ -974,6 +1020,10 @@ namespace lfs::training {
                 }
             }
 
+            if (blend_peak_out.is_valid()) {
+                blend_peak_out.sync_to_stream(stream);
+                blend_peak_out.set_stream(stream);
+            }
             // Call backward with raw pointers
             gsplat_lfs::rasterize_from_world_with_sh_bwd(
                 ctx.means.ptr<float>(),
@@ -1018,6 +1068,7 @@ namespace lfs::training {
                 ctx.means2d_ptr,
                 ctx.depths_ptr,
                 ctx.compensations_ptr,
+                ctx.dilations_ptr,
                 v_render_colors_ptr,
                 v_render_alphas_ptr,
                 v_means_ptr,
@@ -1031,13 +1082,17 @@ namespace lfs::training {
                 pixel_error_map_ptr,
                 edge_weight_map_ptr,
                 edge_score_out_ptr,
-                stream, ctx.batches, ctx.tiles_per_gauss_ptr, ctx.viewmat_ptr, free_space,
+                stream, ctx.batches, ctx.tiles_per_gauss_ptr, ctx.viewmat_ptr,
                 ctx.conics_ptr, ctx.sub_tile_masks ? ctx.isect_ids_ptr : nullptr,
                 ctx.tile_sub_masks.is_valid()
                     ? reinterpret_cast<const uint32_t*>(ctx.tile_sub_masks.ptr<int32_t>())
-                    : nullptr);
+                    : nullptr,
+                gsplat_color_variance,
+                blend_peak_out.is_valid() ? blend_peak_out.ptr<float>() : nullptr,
+                color_grad_bytes > 0 ? reinterpret_cast<float*>(bwd_blob + total_bwd_size) : nullptr);
 
             gsplat_lfs::flatten_scale_grad(ctx.scales.ptr<float>(), v_scales_ptr, N, flatten_weight, stream);
+            optimizer.set_ray_depth_view(ctx.cam_position_ptr, ctx.far_plane);
 
             if (stage_means) {
                 kernels::launch_grad_accumulate(means_grad.ptr<float>(), v_means_ptr, N * 3, stream);
@@ -1083,10 +1138,12 @@ namespace lfs::training {
         gsplat_thread_caches.camera_rays = {};
         gsplat_thread_caches.geometry_bg = {};
         gsplat_thread_caches.geometry_bg_image = {};
+        gsplat_thread_caches.tile_sub_masks = {};
         return !gsplat_thread_caches.K.is_valid() &&
                !gsplat_thread_caches.image_chw.is_valid() &&
                !gsplat_thread_caches.alpha_chw.is_valid() &&
-               !gsplat_thread_caches.depth_chw.is_valid();
+               !gsplat_thread_caches.depth_chw.is_valid() &&
+               !gsplat_thread_caches.tile_sub_masks.is_valid();
     }
 
     namespace {

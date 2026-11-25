@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cuda_runtime.h>
 #include <vector>
@@ -54,8 +55,6 @@ namespace lfs::training::kernels {
     // Per-camera alignment of the depth prior against sparse anchor points
     // (COLMAP / init point cloud), fitted once at startup. Keeps the target
     // depth absolute and multi-view consistent instead of chasing the render.
-    // A depth-space anchor with floor 0 uses the render-derived floor; metric
-    // priors use that with a fixed unit scale and zero shift.
     struct DepthAnchor {
         bool valid = false;
         int model = 0; // 0 = disparity-space fit, 1 = depth-space fit
@@ -97,6 +96,7 @@ namespace lfs::training::kernels {
         float radial[6] = {};
         float tangential[2] = {};
         float thin_prism[4] = {};
+        bool pinhole_ray_distance = false;
     };
 
     [[nodiscard]] std::vector<float2> collect_depth_anchor_samples(
@@ -120,20 +120,17 @@ namespace lfs::training::kernels {
     // Pure host work — safe to run across a worker thread pool.
     [[nodiscard]] DepthAnchor fit_depth_anchor_from_samples(const std::vector<float2>& pairs);
 
-    // Fixed alignment for absolute priors: target metres = prior * metres_per_unit.
-    [[nodiscard]] inline DepthAnchor metric_depth_anchor(const float metres_per_unit) {
-        DepthAnchor anchor;
-        anchor.valid = metres_per_unit > 0.0f;
-        anchor.model = 1;
-        anchor.scale = metres_per_unit;
-        anchor.shift = 0.0f;
-        anchor.floor = 0.0f;
-        anchor.corr = 1.0f;
-        anchor.depth = {anchor.valid, metres_per_unit, 0.0f, 1.0f, 0};
-        return anchor;
-    }
-
     [[nodiscard]] size_t depth_loss_partial_count(size_t num_pixels);
+
+    struct DepthRayGrid {
+        float fx, fy, cx, cy;
+
+        __host__ __device__ float ray_length(const int x, const int y) const {
+            const float nx = (static_cast<float>(x) + 0.5f - cx) / fx;
+            const float ny = (static_cast<float>(y) + 0.5f - cy) / fy;
+            return sqrtf(nx * nx + ny * ny + 1.0f);
+        }
+    };
 
     // Scale-and-shift-invariant depth supervision on alpha-normalized expected
     // depth in inverse-depth space using a fixed per-camera anchor alignment.
@@ -161,6 +158,7 @@ namespace lfs::training::kernels {
         float prior_quantization_step = 0.0f,
         const DepthAnchor* anchor = nullptr,
         cudaStream_t stream = nullptr,
-        const float* pixel_weight = nullptr);
+        const float* pixel_weight = nullptr,
+        const DepthRayGrid* ray_grid = nullptr);
 
 } // namespace lfs::training::kernels

@@ -143,6 +143,9 @@ namespace lfs::training {
         float flatten_reg_weight = 0.0f;
         float opacity_reg_weight = 0.0f;
         float* rendered_count = nullptr;
+        // Optional [N] peak blend weight row (see FusedAdamSettings).
+        float* blend_peak = nullptr;
+        bool reg_rendered_only = false;
         // Optional persistent device scalars (caller zeros each step). Accumulated in
         // preprocess_backward so loss-only reg kernels can be skipped on the FastGS path.
         float* scale_reg_loss_out = nullptr;
@@ -155,8 +158,10 @@ namespace lfs::training {
         // is a zeroed float32 [N] per-view scratch vector.
         const float* edge_weight_map = nullptr;
         float* edge_score_out = nullptr;
-        float* impact_sum_out = nullptr;
-        float* impact_peak_out = nullptr;
+        // Optional camera gradient, set together (zeroed by the backward): dL/d(w2c) float32 [4*4], rows 0-2, and
+        // dL/d(camera position) float32 [3], the two taken as independent inputs.
+        float* grad_w2c = nullptr;
+        float* grad_cam_position = nullptr;
     };
 
     // SteadySplats color variance against each pixel's expected splat color, which the
@@ -211,6 +216,15 @@ namespace lfs::training {
         const lfs::core::Tensor& grad_normal = {},
         bool defer_optimizer_step = false,
         const FastGSColorVarianceLoss& color_variance = {});
+
+    // The camera gradient (as in FastGSFusedExtraGradients) of a forward against a frozen model: nothing in
+    // gaussian_model or its optimizer changes.
+    void fast_rasterize_camera_backward(
+        FastRasterizeContext& ctx,
+        const lfs::core::Tensor& grad_image,
+        lfs::core::SplatData& gaussian_model,
+        float* grad_w2c,
+        float* grad_cam_position);
 
     // Release per-thread renderer caches before the owning CUDA stream is torn down.
     bool release_fast_rasterizer_thread_local_caches() noexcept;

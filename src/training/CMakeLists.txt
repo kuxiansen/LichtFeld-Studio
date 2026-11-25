@@ -29,16 +29,19 @@ set(LFS_TRAINING_KERNEL_SOURCES
     kernels/pruning_kernels.cu
     kernels/mcmc_kernels.cu
     kernels/mrnf_kernels.cu
+    kernels/mrnf_growth_kernels.cu
+    kernels/mrnf_retire_kernels.cu
     kernels/densification_kernels.cu
     kernels/morton_reorder_kernels.cu
     kernels/grad_alpha.cu
     kernels/depth_loss.cu
     kernels/normal_loss.cu
     kernels/normal_consistency_loss.cu
-    kernels/depth_distortion_loss.cu
     kernels/roi_weight_map.cu
     kernels/image_kernels.cu
     kernels/mask_preprocess.cu
+    kernels/calibration_correction.cu
+    kernels/camera_pose.cu
 )
 
 # Create CUDA kernels library
@@ -48,13 +51,15 @@ target_include_directories(lfs_training_kernels
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
 )
 
 target_link_libraries(lfs_training_kernels
     PUBLIC
         lfs_core         # For lfs::core::Tensor (tensor merged into lfs_core)
         CUDA::cudart
-        lfs_core_cuda    # q16 encode/decode kernels
 )
 
 set_target_properties(lfs_training_kernels PROPERTIES
@@ -100,6 +105,8 @@ set(TRAINING_NEW_SOURCES
     strategies/postprocess_compaction.cpp
     strategies/mcmc.cpp
     strategies/mrnf.cpp
+    strategies/mrnf_growth.cpp
+    strategies/mrnf_retire.cpp
     strategies/blob_seeding.cpp
     strategies/strategy_factory.cpp
     strategies/improved_gs_plus.cpp
@@ -109,6 +116,8 @@ set(TRAINING_NEW_SOURCES
     components/config_serialization.cpp
     components/bilateral_grid.cpp
     components/ppisp.cpp
+    components/calibration_correction.cpp
+    components/camera_pose_refinement.cpp
     components/ppisp_controller.cu
     components/ppisp_controller_pool.cu
     components/ppisp_file.cpp
@@ -142,6 +151,7 @@ set(TRAINING_NEW_SOURCES
         noise_infill.cpp
         normal_auto_generate.cpp
         las_prior_sidecar.cpp
+        roi_sidecar.cpp
         vram_ledger.cpp
         perf_bench.cpp
     training_setup.cpp

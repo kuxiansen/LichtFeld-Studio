@@ -258,7 +258,6 @@
           <option value="ssi" data-tooltip="training.tooltip.opt.depth_loss_mode.ssi">{{label_depth_loss_ssi}}</option>
           <option value="ssi-disparity" data-tooltip="training.tooltip.opt.depth_loss_mode.ssi_disparity">{{label_depth_loss_ssi_disparity}}</option>
           <option value="ssi-depth" data-tooltip="training.tooltip.opt.depth_loss_mode.ssi_depth">{{label_depth_loss_ssi_depth}}</option>
-          <option value="metric" data-tooltip="training.tooltip.opt.depth_loss_mode.metric">{{label_depth_loss_metric}}</option>
         </select>
       </div>
       <div class="setting-row" data-for="row : pv_basic_depth_weight_rows" data-if="dep_depth_loss &amp;&amp; row.kind == 'checkbox'"
@@ -570,6 +569,20 @@
             </select>
             <button class="num-step-btn" data-if="row.kind == 'number'" data-event-mousedown="pv_step(row.id, -1)">-</button>
             <button class="num-step-btn" data-if="row.kind == 'number'" data-event-mousedown="pv_step(row.id, 1)">+</button>
+          </div>
+        </div>
+        <div data-class-disabled-overlay="live_disabled">
+          <div class="setting-row" data-for="row : pv_pose_opt_toggle_rows"
+               data-attr-data-tooltip="row.tooltip_key">
+            <span class="prop-label" data-attr-data-reset-prop="row.id">{{row.label}}</span>
+            <input type="checkbox" data-checked="row.checked"
+                   data-event-click="pv_value_change(row.id, !row.checked)" />
+          </div>
+          <div class="setting-row" data-for="row : pv_calibration_correction_toggle_rows"
+               data-attr-data-tooltip="row.tooltip_key">
+            <span class="prop-label" data-attr-data-reset-prop="row.id">{{row.label}}</span>
+            <input type="checkbox" data-checked="row.checked"
+                   data-event-click="pv_value_change(row.id, !row.checked)" />
           </div>
         </div>
       </div>

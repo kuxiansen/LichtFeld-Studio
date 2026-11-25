@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "core/export.hpp"
 #include "core/tensor.hpp"
 
 namespace lfs::core {
@@ -20,7 +21,7 @@ namespace lfs::core {
      * @param cuda_stream CUDA stream for async execution
      * @return Resized tensor in [C, H, W] format (float32)
      */
-    Tensor lanczos_resize(
+    LFS_CORE_API Tensor lanczos_resize(
         const Tensor& input,
         int output_h,
         int output_w,
@@ -37,7 +38,7 @@ namespace lfs::core {
      * @param cuda_stream CUDA stream for async execution
      * @return Resized tensor in [H, W] format (float32)
      */
-    Tensor lanczos_resize_grayscale(
+    LFS_CORE_API Tensor lanczos_resize_grayscale(
         const Tensor& input,
         int output_h,
         int output_w,
@@ -55,7 +56,7 @@ namespace lfs::core {
      * @param cuda_stream CUDA stream for async execution
      * @return Resized tensor in [C, H, W] format (float32)
      */
-    Tensor lanczos_resize_float_chw(
+    LFS_CORE_API Tensor lanczos_resize_float_chw(
         const Tensor& input,
         int output_h,
         int output_w,
@@ -65,9 +66,21 @@ namespace lfs::core {
     // Bilinear prior resampling excludes invalid neighbors and carries validity
     // with nearest sampling. Depth <= 0/nonfinite and normal norms < 0.5 are
     // invalid; outputs use zero sentinels and valid normals have unit length.
-    Tensor resize_depth_prior(const Tensor& input, int output_h, int output_w,
-                              cudaStream_t cuda_stream = nullptr);
-    Tensor resize_normal_prior(const Tensor& input, int output_h, int output_w,
-                               cudaStream_t cuda_stream = nullptr);
+    LFS_CORE_API Tensor resize_depth_prior(const Tensor& input, int output_h, int output_w,
+                                           cudaStream_t cuda_stream = nullptr);
+    LFS_CORE_API Tensor resize_normal_prior(const Tensor& input, int output_h, int output_w,
+                                            cudaStream_t cuda_stream = nullptr);
+
+    // Fits a prior that travelled at its own size (depth [H,W], normals [3,H,W])
+    // to a render of render_h x render_w: the prior resize to the size the loader
+    // would have resized it to (request_h x request_w; 0 means the render's size),
+    // then Lanczos if the render differs from that size. The prior resize runs on
+    // cuda_stream without waiting for it; read the result on that stream.
+    LFS_CORE_API Tensor fit_depth_prior(const Tensor& input, int request_h, int request_w,
+                                                           int render_h, int render_w,
+                                           cudaStream_t cuda_stream = nullptr);
+    LFS_CORE_API Tensor fit_normal_prior(const Tensor& input, int request_h, int request_w,
+                                                            int render_h, int render_w,
+                                            cudaStream_t cuda_stream = nullptr);
 
 } // namespace lfs::core

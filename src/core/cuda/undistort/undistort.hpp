@@ -5,7 +5,9 @@
 #pragma once
 
 #include "core/camera_types.h"
+#include "core/export.hpp"
 #include "core/tensor.hpp"
+#include <cassert>
 #include <cuda_runtime.h>
 
 namespace lfs::core {
@@ -19,7 +21,15 @@ namespace lfs::core {
         float distortion[12];
         int num_distortion;
         bool crop_solve_failed = false;
+        bool view = false;
+        // Row-major rotation from the destination pinhole frame to the source frame.
+        float view_rotation[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
     };
+
+    __host__ __device__ inline bool is_view(const UndistortParams& params) {
+        assert(params.model_type != CameraModelType::EQUIRECTANGULAR || params.view);
+        return params.view;
+    }
 
     struct UndistortGrid {
         int width;
@@ -28,40 +38,40 @@ namespace lfs::core {
         float scale_y;
     };
 
-    UndistortParams compute_undistort_params(
+    LFS_CORE_API UndistortParams compute_undistort_params(
         float fx, float fy, float cx, float cy,
         int width, int height,
         const Tensor& radial, const Tensor& tangential,
         CameraModelType model, float blank_pixels = 0.0f);
 
-    UndistortGrid compute_undistort_grid(
+    LFS_CORE_API UndistortGrid compute_undistort_grid(
         const UndistortParams& params, int resize_factor, int max_width);
 
-    UndistortParams prepare_undistort_params(
+    LFS_CORE_API UndistortParams prepare_undistort_params(
         const UndistortParams& params, int actual_src_width, int actual_src_height,
         int resize_factor, int max_width);
 
-    Tensor undistort_image(const Tensor& src, const UndistortParams& params,
-                           cudaStream_t stream);
-
-    Tensor distort_image_to_source(const Tensor& src, const UndistortParams& params,
-                                   Tensor& validity_mask, cudaStream_t stream);
-
-    Tensor undistort_mask_area(const Tensor& src, const UndistortParams& params, cudaStream_t stream);
-
-    Tensor undistort_depth_area(const Tensor& src, const UndistortParams& params, cudaStream_t stream);
-
-    Tensor undistort_normal_area(const Tensor& src, const UndistortParams& params, cudaStream_t stream);
-
-    Tensor distort_mask_to_source_area(const Tensor& src, const UndistortParams& params,
-                                       cudaStream_t stream);
-
-    Tensor distort_depth_to_source_area(const Tensor& src, const UndistortParams& params,
+    LFS_CORE_API Tensor undistort_image(const Tensor& src, const UndistortParams& params,
                                         cudaStream_t stream);
 
-    Tensor distort_normal_to_source_area(const Tensor& src, const UndistortParams& params,
-                                         cudaStream_t stream);
+    LFS_CORE_API Tensor distort_image_to_source(const Tensor& src, const UndistortParams& params,
+                                                Tensor& validity_mask, cudaStream_t stream);
 
-    Tensor inverse_distortion_sample_map(const UndistortParams& params, cudaStream_t stream);
+    LFS_CORE_API Tensor undistort_mask_area(const Tensor& src, const UndistortParams& params, cudaStream_t stream);
+
+    LFS_CORE_API Tensor undistort_depth_area(const Tensor& src, const UndistortParams& params, cudaStream_t stream);
+
+    LFS_CORE_API Tensor undistort_normal_area(const Tensor& src, const UndistortParams& params, cudaStream_t stream);
+
+    LFS_CORE_API Tensor distort_mask_to_source_area(const Tensor& src, const UndistortParams& params,
+                                                    cudaStream_t stream);
+
+    LFS_CORE_API Tensor distort_depth_to_source_area(const Tensor& src, const UndistortParams& params,
+                                                     cudaStream_t stream);
+
+    LFS_CORE_API Tensor distort_normal_to_source_area(const Tensor& src, const UndistortParams& params,
+                                                      cudaStream_t stream);
+
+    LFS_CORE_API Tensor inverse_distortion_sample_map(const UndistortParams& params, cudaStream_t stream);
 
 } // namespace lfs::core

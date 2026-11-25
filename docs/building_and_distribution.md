@@ -121,13 +121,13 @@ cmake --build --preset windows-trainer
 For a Windows headless delivery targeting Ampere and newer NVIDIA GPUs, open
 an x64 Visual Studio developer shell and build a separate PTX-only directory.
 The trainer install collects the runtime DLLs and JPEG extensions.
-`BUILD_CUDA_REAL_SMS` also compiles SM 8.6 (RTX 30) and 8.9 (RTX 40) to machine code.
+`BUILD_CUDA_REAL_SMS` also compiles SM 8.6 (RTX 30), 8.9 (RTX 40), and 12.0 (RTX 50) to machine code.
 Without it the driver compiles the whole PTX on first use, which took about four
 minutes on an RTX 4090 against about six seconds with machine code.
 
 ```powershell
 chcp 65001
-cmake --preset windows-trainer -B build-windows-trainer-ptx80 -DBUILD_CUDA_PTX_ONLY=ON -DBUILD_CUDA_MIN_SM=80 "-DBUILD_CUDA_REAL_SMS=86;89" -DENABLE_COMPILER_CACHE=OFF
+cmake --preset windows-trainer -B build-windows-trainer-ptx80 -DBUILD_CUDA_PTX_ONLY=ON -DBUILD_CUDA_MIN_SM=80 "-DBUILD_CUDA_REAL_SMS=86;89;120" -DENABLE_COMPILER_CACHE=OFF
 cmake --build build-windows-trainer-ptx80 --target lfs_train
 .\scripts\package-windows-trainer.ps1 -BuildDir build-windows-trainer-ptx80 -Config "path\to\lfs.json" -Output build-delivery\LFS-trainer-sm80 -GeosunPreRevision "<revision>"
 ```
@@ -261,6 +261,8 @@ cloud exist on disk.
 
 ## Distribution Contents
 
+Linux:
+
 ```
 dist/
 ├── bin/
@@ -270,6 +272,14 @@ dist/
 ├── share/LichtFeld-Studio/ # Shaders, icons, fonts
 └── LICENSE                 # GPL-3.0
 ```
+
+Windows portable packages contain `LichtFeld-Studio.exe` at the root, runtime
+DLLs and `bin.manifest` in `bin/`, Python's standard library in `Lib/`, and
+resources in `share/LichtFeld-Studio/`. Launch the root executable and keep the
+whole package together; `bin/bin.manifest` is required to resolve its DLLs.
+Use a full `cmake --install` to assemble the distribution. Packaging requires
+the Windows SDK `mt.exe` selected by CMake to update the installed executable's
+manifest before distribution signing.
 
 ## CMake Options
 
@@ -301,7 +311,7 @@ cache entry.
 
 **"no kernel image is available"** - GPU is older than `BUILD_CUDA_MIN_SM`. Rebuild with lower value.
 
-**Missing libraries on target** - Use `run_lichtfeld.sh` (Linux) or ensure DLLs are with .exe (Windows).
+**Missing libraries on target** - Use `run_lichtfeld.sh` (Linux). For Windows portable packages, keep `bin/` and `bin/bin.manifest` beside the root executable; DLLs stay inside `bin/`. Regular Windows builds keep their existing DLL layout.
 
 **"SDL3 was found, but the resolved SDL build does not expose an X11 or Wayland video backend"** - A stale vcpkg SDL3 artifact is being reused. Remove SDL3 from the local vcpkg install/build cache, then reconfigure with binary-cache bypass enabled:
 

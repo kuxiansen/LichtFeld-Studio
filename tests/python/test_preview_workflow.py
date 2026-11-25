@@ -16,7 +16,7 @@ from test_preview_file_revision import settle_metadata
 def test_extracted_review_hides_extractor_only_after_success_and_can_retry(panel_modules, monkeypatch):
     module, _ = panel_modules
     panel = module.ImagePreviewPanel()
-    monkeypatch.setattr(module, "_instance", panel)
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _panel_id: panel)
     changes = []
     monkeypatch.setattr(module.lf.ui, "set_panel_enabled", lambda *args: changes.append(args))
     with monkeypatch.context() as patch:
@@ -41,7 +41,7 @@ def test_pending_or_empty_review_keeps_extractor_available(panel_modules, monkey
     empty.open([], [], 0, assisted=True)
     assert not changes
     empty._metadata.close()
-    monkeypatch.setattr(module, "_instance", None)
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _panel_id: None)
     module.open_extracted_frame_preview(["frame.png"])
     assert changes == [("lfs.image_preview", True)]
     panel = module.ImagePreviewPanel()
@@ -123,7 +123,8 @@ def test_remount_populates_the_new_filmstrip_model_without_navigation(panel_modu
     panel.on_unmount(doc)
     new_records = []
     handle = SimpleNamespace(update_record_list=lambda _, rows: new_records.append(rows), dirty=lambda _: None)
-    model = SimpleNamespace(bind_func=lambda *args: None, bind_record_list=lambda *args: None, get_handle=lambda: handle)
+    model = SimpleNamespace(bind_func=lambda *args: None, bind=lambda *args: None,
+                            bind_event=lambda *args: None, bind_record_list=lambda *args: None, get_handle=lambda: handle)
     panel.on_bind_model(SimpleNamespace(create_data_model=lambda _: model))
     panel._update_filmstrip(doc, True)
     assert new_records == [expected]

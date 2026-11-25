@@ -39,10 +39,16 @@ namespace lfs::training {
             return std::nullopt;
         }
         LasPriorSidecar sidecar;
-        sidecar.depth_millimetres = string_field(json, "depth_format") == "uint16_png_mm";
+        const auto depth_format = string_field(json, "depth_format");
+        const auto depth_source = string_field(json, "depth_source");
+        const auto source = string_field(json, "source");
+        sidecar.ssi_depth =
+            depth_format == "uint16_png_ssi" ||
+            depth_source == "moge2_ssi" ||
+            source == "moge2_ssi";
         sidecar.ray_distance = string_field(json, "depth_type") == "ray_distance";
         sidecar.normals_camera_opencv = string_field(json, "normal_frame").starts_with("opencv_camera");
-        if (!sidecar.depth_millimetres && !sidecar.normals_camera_opencv) {
+        if (!sidecar.ssi_depth && !sidecar.normals_camera_opencv) {
             return std::nullopt;
         }
         return sidecar;
@@ -53,11 +59,7 @@ namespace lfs::training {
         const LasPriorSidecar& sidecar) {
         using lfs::core::param::NormalLossSpace;
         std::vector<std::string> changes;
-        if (sidecar.depth_millimetres) {
-            if (opt.depth_loss_mode == "ssi") {
-                opt.depth_loss_mode = "metric";
-                changes.emplace_back("depth_loss_mode ssi -> metric");
-            }
+        if (sidecar.ssi_depth) {
             if (opt.depth_auto_generate) {
                 opt.depth_auto_generate = false;
                 changes.emplace_back("depth_auto_generate off");

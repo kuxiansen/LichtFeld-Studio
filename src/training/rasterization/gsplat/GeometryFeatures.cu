@@ -41,50 +41,49 @@ namespace gsplat_lfs {
         __global__ void features_kernel(const float* means, const float* quats, const float* scales,
                                         const float* views, float* features,
                                         const float* gf, float* gm, float* gq,
-                                        uint32_t N, uint32_t C, uint32_t channels, CameraModelType model) {
+                                        uint32_t N, uint32_t C, uint32_t channels, CameraModelType /*model*/,
+                                        const int32_t* radii) {
+            if (channels != 8)
+                return;
             const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
             if (i >= N * C)
                 return;
+            float gf0 = 0.f, gf1 = 0.f, gf2 = 0.f;
+            if constexpr (!Backward) {
+                if (radii != nullptr && (radii[2 * i] <= 0 || radii[2 * i + 1] <= 0))
+                    return;
+            } else {
+                gf0 = gf[i * channels + 4];
+                gf1 = gf[i * channels + 5];
+                gf2 = gf[i * channels + 6];
+                if (gf0 == 0.f && gf1 == 0.f && gf2 == 0.f)
+                    return;
+            }
             const uint32_t g = i % N;
             const float* v = views + (i / N) * 16;
             const mat3 V = camera_rotation(v);
             const vec3 p = V * vec3(means[3 * g], means[3 * g + 1], means[3 * g + 2]) + vec3(v[3], v[7], v[11]);
-            const bool radial = model != CameraModelType::PINHOLE;
-            const float depth = radial ? length(p) : p.z;
-            const uint32_t d = channels == 1 ? 0 : 3;
+            (void)gm;
+            const vec4 q(quats[4 * g], quats[4 * g + 1], quats[4 * g + 2], quats[4 * g + 3]);
+            const int axis = min_axis(scales + 3 * g);
+            const vec3 normal = V * quat_to_rotmat(q)[axis];
+            const float sign = dot(normal, p) > 0 ? -1.f : 1.f;
             if constexpr (!Backward) {
-                features[i * channels + d] = depth;
-                if (channels == 8)
-                    features[i * channels + 7] = depth * depth;
-            } else {
-                const vec3 dp = radial ? p / fmaxf(depth, 1.e-12f) : vec3(0, 0, 1);
-                const float gd = gf[i * channels + d] + (channels == 8 ? 2.f * depth * gf[i * channels + 7] : 0.f);
-                const vec3 grad = transpose(V) * dp * gd;
                 for (int c = 0; c < 3; ++c)
-                    atomicAdd(gm + 3 * g + c, grad[c]);
-            }
-            if (channels == 8) {
-                const vec4 q(quats[4 * g], quats[4 * g + 1], quats[4 * g + 2], quats[4 * g + 3]);
-                const int axis = min_axis(scales + 3 * g);
-                const vec3 normal = V * quat_to_rotmat(q)[axis];
-                const float sign = dot(normal, p) > 0 ? -1.f : 1.f;
-                if constexpr (!Backward) {
-                    for (int c = 0; c < 3; ++c)
-                        features[i * channels + 4 + c] = sign * normal[c];
-                } else {
-                    const vec3 gn = sign * (transpose(V) * vec3(gf[i * channels + 4], gf[i * channels + 5], gf[i * channels + 6]));
-                    mat3 gR(0.f);
-                    gR[axis] = gn;
-                    vec4 grad(0.f);
-                    quat_to_rotmat_vjp(q, gR, grad);
-                    for (int c = 0; c < 4; ++c)
-                        atomicAdd(gq + 4 * g + c, grad[c]);
-                }
+                    features[i * channels + 4 + c] = sign * normal[c];
+            } else {
+                const vec3 gn = sign * (transpose(V) * vec3(gf0, gf1, gf2));
+                mat3 gR(0.f);
+                gR[axis] = gn;
+                vec4 grad(0.f);
+                quat_to_rotmat_vjp(q, gR, grad);
+                for (int c = 0; c < 4; ++c)
+                    atomicAdd(gq + 4 * g + c, grad[c]);
             }
         }
-        __global__ void flatten_kernel(const float* s, float* gs, uint32_t N, float weight) {
+        __global__ void flatten_kernel(const float* s, float* gs, uint32_t N, float weight, const float* blend_peak) {
             const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-            if (i >= N)
+            if (i >= N || (blend_peak && blend_peak[i] <= 0.0f))
                 return;
             const int a = min_axis(s + 3 * i);
             gs[3 * i + a] += weight * expf(s[3 * i + a]) / N;
@@ -92,10 +91,11 @@ namespace gsplat_lfs {
     } // namespace
     void geometry_features_fwd(const float* m, const float* q, const float* s, const float* v,
                                float* f, uint32_t N, uint32_t C, uint32_t channels,
-                               CameraModelType model, cudaStream_t stream) {
+                               CameraModelType model, cudaStream_t stream,
+                               const int32_t* radii) {
         if (!N || !C)
             return;
-        features_kernel<false><<<(N * C + 255) / 256, 256, 0, stream>>>(m, q, s, v, f, nullptr, nullptr, nullptr, N, C, channels, model);
+        features_kernel<false><<<(N * C + 255) / 256, 256, 0, stream>>>(m, q, s, v, f, nullptr, nullptr, nullptr, N, C, channels, model, radii);
         LFS_CUDA_LAUNCH_CHECK(stream, "gut.geometry.forward");
     }
     void geometry_features_bwd(const float* m, const float* q, const float* s, const float* v,
@@ -103,13 +103,14 @@ namespace gsplat_lfs {
                                uint32_t N, uint32_t C, uint32_t channels, CameraModelType model, cudaStream_t stream) {
         if (!N || !C)
             return;
-        features_kernel<true><<<(N * C + 255) / 256, 256, 0, stream>>>(m, q, s, v, nullptr, gf, gm, gq, N, C, channels, model);
+        features_kernel<true><<<(N * C + 255) / 256, 256, 0, stream>>>(m, q, s, v, nullptr, gf, gm, gq, N, C, channels, model, nullptr);
         LFS_CUDA_LAUNCH_CHECK(stream, "gut.geometry.backward");
     }
-    void flatten_scale_grad(const float* s, float* gs, uint32_t N, float weight, cudaStream_t stream) {
+    void flatten_scale_grad(const float* s, float* gs, uint32_t N, float weight, cudaStream_t stream,
+                            const float* blend_peak) {
         if (!N || weight <= 0.f)
             return;
-        flatten_kernel<<<(N + 255) / 256, 256, 0, stream>>>(s, gs, N, weight);
+        flatten_kernel<<<(N + 255) / 256, 256, 0, stream>>>(s, gs, N, weight, blend_peak);
         LFS_CUDA_LAUNCH_CHECK(stream, "gut.geometry.flatten");
     }
     void geometry_camera_rays(float* rays, uint32_t w, uint32_t h, const float* K,

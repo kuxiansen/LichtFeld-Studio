@@ -5,9 +5,10 @@
 
 #include "lens_views.hpp"
 
-#include "core/camera_types.h"
+#include "core/camera.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#include "depth_anchor_cache.hpp"
 
 #include <algorithm>
 #include <array>

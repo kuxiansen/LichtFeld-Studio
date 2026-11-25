@@ -11,14 +11,15 @@ namespace gsplat_lfs {
     void geometry_features_fwd(const float* means, const float* quats, const float* scales,
                                const float* viewmats, float* features,
                                uint32_t N, uint32_t C, uint32_t channels,
-                               CameraModelType model, cudaStream_t stream);
+                               CameraModelType model, cudaStream_t stream,
+                               const int32_t* radii = nullptr);
     void geometry_features_bwd(const float* means, const float* quats, const float* scales,
                                const float* viewmats, const float* grad_features,
                                float* grad_means, float* grad_quats,
                                uint32_t N, uint32_t C, uint32_t channels,
                                CameraModelType model, cudaStream_t stream);
     void flatten_scale_grad(const float* scales, float* grad_scales, uint32_t N,
-                            float weight, cudaStream_t stream);
+                            float weight, cudaStream_t stream, const float* blend_peak = nullptr);
     void geometry_camera_rays(float* rays, uint32_t width, uint32_t height,
                               const float* K, CameraModelType model, const float* radial,
                               const float* tangential, const float* thin_prism, cudaStream_t stream);

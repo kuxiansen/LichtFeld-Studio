@@ -532,13 +532,24 @@ namespace {
         }
         p.color_variance_weight = 1.0f;
         EXPECT_TRUE(p.validate().empty());
-        for (bool* flag : {&p.gut, &p.mip_filter, &p.enable_sparsity}) {
+        for (bool* flag : {&p.mip_filter, &p.enable_sparsity}) {
             *flag = true;
             EXPECT_FALSE(p.validate().empty());
             *flag = false;
         }
         p.mask_mode = param::MaskMode::Ignore;
         EXPECT_FALSE(p.validate().empty());
+        p.gut = true;
+        for (const auto mode : {param::MaskMode::None, param::MaskMode::Ignore, param::MaskMode::SegmentAndIgnore}) {
+            p.mask_mode = mode;
+            EXPECT_TRUE(p.validate().empty()) << p.validate();
+        }
+        for (bool* flag : {&p.mip_filter, &p.enable_sparsity}) {
+            *flag = true;
+            EXPECT_FALSE(p.validate().empty());
+            *flag = false;
+        }
+        p.gut = false;
         p.mask_mode = param::MaskMode::None;
         p.color_variance_warmup_iters = p.iterations;
         EXPECT_FALSE(p.validate().empty());

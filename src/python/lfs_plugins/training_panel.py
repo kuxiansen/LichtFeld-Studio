@@ -145,7 +145,7 @@ def _restore_stored_session_if_needed(then_start=False):
     return True
 
 
-DEPTH_LOSS_MODE_VALUES = ("ssi", "ssi-disparity", "ssi-depth", "metric")
+DEPTH_LOSS_MODE_VALUES = ("ssi", "ssi-disparity", "ssi-depth")
 DEFAULT_DEPTH_LOSS_MODE = "ssi"
 
 
@@ -439,10 +439,6 @@ class TrainingPanel(Panel):
         model.bind_func(
             "label_depth_loss_ssi_depth",
             lambda: tr("training.options.depth_loss.ssi_depth"),
-        )
-        model.bind_func(
-            "label_depth_loss_metric",
-            lambda: tr("training.options.depth_loss.metric"),
         )
         model.bind_func(
             "label_ppisp_sidecar_path",
@@ -2242,12 +2238,7 @@ class TrainingPanel(Panel):
         if current == val:
             return True
 
-        current_scaler = float(getattr(params, "steps_scaler", 1.0))
-        if current_scaler <= 0.0:
-            current_scaler = 1.0
-        next_scaler = current_scaler * (float(val) / float(current))
-        params.apply_step_scaling(next_scaler)
-        params.iterations = val
+        params.set_scaled_iterations(val)
         if self._handle:
             self._sync_text_bufs()
             self._handle.dirty_all()
@@ -3145,22 +3136,31 @@ class TrainingPanel(Panel):
         camera_count = scene.active_camera_count
         if camera_count == 0 or camera_count == self._auto_scaled_for_cameras:
             return False
-        self._auto_scaled_for_cameras = camera_count
         params.auto_scale_steps(camera_count)
+        self._auto_scaled_for_cameras = camera_count
         return True
 
     def _set_auto_scale_steps_locked(self, locked):
         locked = bool(locked)
         if self._auto_scale_steps_locked == locked:
             return
-        self._auto_scale_steps_locked = locked
-
+        camera_count = 0
         if locked:
-            self._auto_scaled_for_cameras = 0
-            self._auto_scale_user_override = False
             params = lf.optimization_params()
-            if params and params.has_params() and self._try_auto_scale_steps(params):
-                self._sync_text_bufs()
+            if params and params.has_params():
+                camera_count = self._active_camera_count() or 0
+                if camera_count:
+                    try:
+                        params.auto_scale_steps(camera_count)
+                    except ValueError as error:
+                        lf.ui.message_dialog(tr("status.error"), str(error), style="error")
+                        return
+            self._sync_auto_scale_markers()
+            self._auto_scaled_for_cameras = camera_count
+            self._auto_scale_user_override = False
 
+        self._auto_scale_steps_locked = locked
+        if camera_count:
+            self._sync_text_bufs()
         if self._handle:
             self._handle.dirty_all()

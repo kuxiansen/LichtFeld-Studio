@@ -9,17 +9,20 @@
 #include "core/error.hpp"
 #include "core/splat_data.hpp"
 #include "gsplat/Common.h"
-#include "gsplat/FreeSpace.h"
 #include "gsplat/TileBatch.h"
 #include "optimizer/adam_optimizer.hpp"
 #include "optimizer/render_output.hpp"
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <expected>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace lfs::training {
+
+    class RasterizerPhaseArena;
 
     // Render modes for gsplat rasterizer
     enum class GsplatRenderMode {
@@ -28,7 +31,7 @@ namespace lfs::training {
         ED = 2,     // Expected depth
         RGB_D = 3,  // RGB + depth
         RGB_ED = 4, // RGB + expected depth
-        RGB_D_N = 5 // RGB + accumulated depth + camera-space normals + accumulated squared depth
+        RGB_D_N = 5 // RGB + accumulated depth + camera-space normals
     };
 
     // Forward pass context - holds raw pointers needed for backward (arena allocated)
@@ -45,6 +48,7 @@ namespace lfs::training {
         int32_t* tile_offsets_ptr = nullptr; // [C, tile_height, tile_width]
         int32_t* last_ids_ptr = nullptr;     // [C, H, W]
         float* compensations_ptr = nullptr;  // [C, N] or nullptr
+        float* dilations_ptr = nullptr;      // [C, N] or nullptr
 
         // Borrowed from the gsplat TLS VMM intersection cache (do NOT free).
         // Valid from forward through backward on this thread; released by the
@@ -68,9 +72,10 @@ namespace lfs::training {
         lfs::core::Tensor bg_color;            // [3] or [C, 3]
 
         // Camera pointers (kept alive by K_tensor)
-        const float* viewmat_ptr = nullptr; // [C, 4, 4]
-        const float* K_ptr = nullptr;       // [C, 3, 3]
-        lfs::core::Tensor K_tensor;         // Keeps K_ptr alive
+        const float* viewmat_ptr = nullptr;      // [C, 4, 4]
+        const float* cam_position_ptr = nullptr; // [3], world; owned by the camera
+        const float* K_ptr = nullptr;            // [C, 3, 3]
+        lfs::core::Tensor K_tensor;              // Keeps K_ptr alive
 
         // Rolling shutter: world-to-camera of the first and last readout line of the
         // render window. viewmat_ptr stays the reference (mid-readout) pose.
@@ -110,6 +115,7 @@ namespace lfs::training {
 
         // Memory arena frame ID (for releasing arena memory in backward)
         uint64_t frame_id = 0;
+        std::shared_ptr<RasterizerPhaseArena> phase_arena;
         // Stream the forward chained the arena frame on; release/backward match.
         cudaStream_t stream = nullptr;
 
@@ -122,9 +128,6 @@ namespace lfs::training {
         // Background image for per-pixel blending (optional, empty = use bg_color)
         lfs::core::Tensor bg_image;
 
-        // T_front render in front of a laser scan (disabled = gt_depth null)
-        gsplat_lfs::FreeSpaceRender free_space;
-
         lfs::core::Tensor tile_sub_masks; // [tile_height, tile_width] live sub-tiles, or empty for all
     };
 
@@ -133,8 +136,8 @@ namespace lfs::training {
     lfs::Status gsplat_accumulate_pop_scores(const GsplatRasterizeContext& ctx, lfs::core::Tensor& scores);
 
     // Forward pass with optional tiling (tile_width/height=0 = full image)
+    // mip_filter: optimization.mip_filter, the smaller dilation plus opacity compensation
     // bg_image is optional - if provided, uses per-pixel background blending instead of solid color
-    // free_space renders T_front (full image only; needs a render mode with depth)
     std::expected<std::pair<RenderOutput, GsplatRasterizeContext>, std::string> gsplat_rasterize_forward(
         lfs::core::Camera& viewpoint_camera,
         lfs::core::SplatData& gaussian_model,
@@ -144,14 +147,23 @@ namespace lfs::training {
         int tile_width = 0,
         int tile_height = 0,
         float scaling_modifier = 1.0f,
-        bool antialiased = false,
+        bool mip_filter = false,
         GsplatRenderMode render_mode = GsplatRenderMode::RGB,
         bool use_gut = false,
         const lfs::core::Tensor& bg_image = {},
-        const gsplat_lfs::FreeSpaceRender& free_space = {},
         // [H, W] Float32 pixel weights: pixels farther than one 8 px sub-tile from any
         // weight > 0 are not rasterized and stay background with zero alpha.
-        const lfs::core::Tensor& pixel_weights = {});
+        const lfs::core::Tensor& pixel_weights = {},
+        float* median_depth = nullptr);
+
+    struct GsplatColorVarianceLoss {
+        lfs::core::Tensor loss;
+        float weight = 0.0f;
+        lfs::core::Tensor pixel_weight;
+    };
+
+    // Temporary storage for loss work consumed before rasterizer backward.
+    std::function<char*(size_t)> begin_gsplat_loss_phase(GsplatRasterizeContext& ctx);
 
     // Explicit backward pass - computes gradients and accumulates into optimizer
     void gsplat_rasterize_backward(
@@ -166,8 +178,8 @@ namespace lfs::training {
         const lfs::core::Tensor& grad_depth = {},
         const lfs::core::Tensor& grad_normal = {},
         float flatten_weight = 0.f,
-        const lfs::core::Tensor& grad_T_front = {},
-        const lfs::core::Tensor& grad_depth_sq = {});
+        const GsplatColorVarianceLoss& color_variance = {},
+        core::Tensor blend_peak_out = {}); // [N], raised to max(alpha * T) across the view's tiles
 
     // Release per-thread renderer caches before the owning CUDA stream is torn down.
     bool release_gsplat_rasterizer_thread_local_caches() noexcept;
@@ -178,12 +190,12 @@ namespace lfs::training {
         lfs::core::SplatData& gaussian_model,
         lfs::core::Tensor& bg_color,
         float scaling_modifier = 1.0f,
-        bool antialiased = false,
+        bool mip_filter = false,
         GsplatRenderMode render_mode = GsplatRenderMode::RGB,
         bool use_gut = false) {
         auto result = gsplat_rasterize_forward(
             viewpoint_camera, gaussian_model, bg_color, 0, 0, 0, 0,
-            scaling_modifier, antialiased, render_mode, use_gut);
+            scaling_modifier, mip_filter, render_mode, use_gut);
         if (!result) {
             throw std::runtime_error(result.error());
         }
@@ -204,7 +216,7 @@ namespace lfs::training {
         lfs::core::SplatData& gaussian_model,
         lfs::core::Tensor& bg_color,
         float scaling_modifier = 1.0f,
-        bool antialiased = false,
+        bool mip_filter = false,
         GsplatRenderMode render_mode = GsplatRenderMode::RGB,
         bool use_gut = false) {
         return gsplat_rasterize(
@@ -212,7 +224,7 @@ namespace lfs::training {
             gaussian_model,
             bg_color,
             scaling_modifier,
-            antialiased,
+            mip_filter,
             render_mode,
             use_gut);
     }

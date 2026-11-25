@@ -14,13 +14,15 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace lfs::preprocessing {
 
     enum class CachedModel : unsigned char {
         Sam2,
         Moge2,
-        Lpips
+        Lpips,
+        LlmDet
     };
 
     struct ModelDescriptor {
@@ -60,8 +62,27 @@ namespace lfs::preprocessing {
     [[nodiscard]] lfs::Result<core::nn::WeightFile> ensure_sam2_weights(
         bool allow_download, const std::function<bool()>& cancel_requested = {});
 
+    [[nodiscard]] lfs::Result<core::nn::WeightFile> ensure_llmdet_weights(
+        bool allow_download, const std::function<bool()>& cancel_requested = {});
+
     using PreprocessProgressCallback = std::function<void(
         std::size_t done, std::size_t total, std::string_view filename)>;
+
+    struct PreprocessJob {
+        std::filesystem::path image_path;
+        std::filesystem::path depth_path;
+        std::filesystem::path normals_path;
+        bool write_depth = false;
+        bool write_normals = false;
+    };
+
+    struct PreprocessPlan {
+        std::filesystem::path dataset_root;
+        std::filesystem::path images_dir;
+        std::vector<std::filesystem::path> images;
+        std::vector<PreprocessJob> jobs;
+        std::size_t skipped = 0;
+    };
 
     struct PreprocessRunResult {
         bool ok = true;
@@ -69,6 +90,9 @@ namespace lfs::preprocessing {
         std::size_t processed = 0;
         std::size_t skipped = 0;
     };
+
+    [[nodiscard]] PreprocessPlan build_preprocess_plan(
+        const lfs::core::param::PreprocessParameters& params);
 
     int run_preprocess(const lfs::core::param::PreprocessParameters& params);
 

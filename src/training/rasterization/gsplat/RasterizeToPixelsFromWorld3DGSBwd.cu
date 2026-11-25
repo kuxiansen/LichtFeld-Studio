@@ -8,7 +8,6 @@
 
 #include "Cameras.cuh"
 #include "Common.h"
-#include "FreeSpace.h"
 #include "FromWorldRay.cuh"
 #include "Rasterization.h"
 #include "Utils.cuh"
@@ -26,6 +25,11 @@ namespace gsplat_lfs {
     // 16x16 tile, 128 threads, two horizontally adjacent pixels per thread.
     constexpr uint32_t kBwdDualThreads = 128;
     constexpr uint32_t kBwdDualBatch = 256;
+
+    __device__ __forceinline__ void record_blend_peak(float* out, int32_t g, float peak) {
+        if (out && peak > 0.0f)
+            atomicMax(reinterpret_cast<int*>(out + g), __float_as_int(peak));
+    }
 
     struct PixelBwd {
         bool active;
@@ -126,6 +130,7 @@ namespace gsplat_lfs {
         float& dens_e,
         const float* edge_weight_map,
         float& edge_score,
+        float& blend_peak,
         mat3& R,
         bool& have_R) {
         bool valid = pix.active;
@@ -149,6 +154,7 @@ namespace gsplat_lfs {
         const float ra = 1.0f / (1.0f - alpha);
         pix.T *= ra;
         const float fac = alpha * pix.T;
+        blend_peak = fmaxf(blend_peak, fac);
         if constexpr (kEdgeScoring) {
             const float edge_weight = edge_weight_map[pix.pix_id];
             const float edge_contribution = fac * edge_weight;
@@ -220,6 +226,7 @@ namespace gsplat_lfs {
         float& dens_e,
         const float* edge_weight_map,
         float& edge_score,
+        float& blend_peak,
         bool& hit0,
         bool& hit1) {
         const float opac = xyz_opac[3];
@@ -242,11 +249,11 @@ namespace gsplat_lfs {
         hit0 = contribute_pixel<kEdgeScoring>(
             pix0, isect_idx, opac, Mt, gro0, o_minus_mu0, scale_act, quat,
             rgb0, rgb1, rgb2, have_bg, do_dens, v_rgb, v_mean, v_scale, v_quat,
-            v_opacity, dens_w, dens_e, edge_weight_map, edge_score, R, have_R);
+            v_opacity, dens_w, dens_e, edge_weight_map, edge_score, blend_peak, R, have_R);
         hit1 = contribute_pixel<kEdgeScoring>(
             pix1, isect_idx, opac, Mt, gro1, o_minus_mu1, scale_act, quat,
             rgb0, rgb1, rgb2, have_bg, do_dens, v_rgb, v_mean, v_scale, v_quat,
-            v_opacity, dens_w, dens_e, edge_weight_map, edge_score, R, have_R);
+            v_opacity, dens_w, dens_e, edge_weight_map, edge_score, blend_peak, R, have_R);
     }
 
     __device__ __forceinline__ float reduce_field(float v, const unsigned n_contrib, const int src_lane) {
@@ -258,6 +265,16 @@ namespace gsplat_lfs {
             v += __shfl_xor_sync(0xffffffffu, v, offset);
         }
         return v;
+    }
+
+    // d s / d log(raw scale) for the scale s the kernel used: s itself, or s0^2 / s for s = sqrt(s0^2 + sigma2)
+    // under the mip filter, whose sigma2 is a constant.
+    __device__ __forceinline__ vec3 log_scale_chain(const vec3 scale_act, const vec3* scales, const float* dilations,
+                                                    const int32_t g) {
+        if (dilations == nullptr)
+            return scale_act;
+        const vec3 s0 = activated_scale(scales[g]);
+        return s0 * s0 / scale_act;
     }
 
     __device__ __forceinline__ void flush_splat_grads(
@@ -319,6 +336,8 @@ namespace gsplat_lfs {
         const scalar_t* __restrict__ backgrounds,
         const scalar_t* __restrict__ bg_images,
         const bool* __restrict__ masks,
+        const scalar_t* __restrict__ compensations,
+        const scalar_t* __restrict__ dilations,
         const uint32_t image_width,
         const uint32_t image_height,
         const uint32_t tile_size,
@@ -349,7 +368,7 @@ namespace gsplat_lfs {
         const scalar_t* __restrict__ densification_error_map,
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
-        const FreeSpaceRender) {
+        const ColorVarianceRender, float* __restrict__ blend_peak_out) {
         auto block = cg::this_thread_block();
         const uint32_t cid = block.group_index().x;
         const uint32_t tile_id =
@@ -430,7 +449,9 @@ namespace gsplat_lfs {
                 const int32_t g = flatten_ids[idx];
                 id_batch[slot] = g;
                 const vec3 xyz = means[g];
-                const float opac = activated_opacity(opacities[g]);
+                float opac = activated_opacity(opacities[g]);
+                if (compensations != nullptr)
+                    opac *= compensations[g];
                 xyz_opacity_batch[slot] = {xyz.x, xyz.y, xyz.z, opac};
                 const vec3 scale_act = activated_scale(scales[g]);
                 const vec4 quat = quats[g];
@@ -442,6 +463,10 @@ namespace gsplat_lfs {
                     0.f, 1.0f / scale_act[1], 0.f,
                     0.f, 0.f, 1.0f / scale_act[2]);
                 mt_batch[slot] = glm::transpose(R * S);
+                if (dilations != nullptr) { // mip filter; kept apart so the unfiltered path is computed as before
+                    scale_batch[slot] = dilated_scale(scale_act, dilations[g]);
+                    mt_batch[slot] = glm::transpose(R * inverse_scale_matrix(scale_batch[slot]));
+                }
                 rgbs_batch[slot * 3u + 0] = colors[g * 3u + 0];
                 rgbs_batch[slot * 3u + 1] = colors[g * 3u + 1];
                 rgbs_batch[slot * 3u + 2] = colors[g * 3u + 2];
@@ -480,6 +505,7 @@ namespace gsplat_lfs {
                 float densification_weight_local = 0.f;
                 float densification_error_weighted_local = 0.f;
                 float edge_score_local = 0.f;
+                float blend_peak = 0.f;
 
                 bool hit0 = false;
                 bool hit1 = false;
@@ -487,49 +513,51 @@ namespace gsplat_lfs {
                     pix0, pix1, isect_idx, xyz_opac, Mt, scale_act, quat, rgb0, rgb1, rgb2,
                     have_bg, do_dens, v_rgb_local, v_mean_local, v_scale_local, v_quat_local,
                     v_opacity_local, densification_weight_local, densification_error_weighted_local,
-                    edge_weight_map, edge_score_local, hit0, hit1);
+                    edge_weight_map, edge_score_local, blend_peak, hit0, hit1);
 
                 const unsigned valid_mask = __ballot_sync(0xffffffffu, hit0 || hit1);
                 if (valid_mask == 0u) {
-                    if constexpr (!kEdgeScoring) {
-                        continue;
-                    }
+                    continue;
                 }
-                if (valid_mask != 0u) {
-                    const unsigned n_contrib = __popc(valid_mask);
-                    const int src_lane = __ffs(valid_mask) - 1;
-                    v_rgb_local[0] = reduce_field(v_rgb_local[0], n_contrib, src_lane);
-                    v_rgb_local[1] = reduce_field(v_rgb_local[1], n_contrib, src_lane);
-                    v_rgb_local[2] = reduce_field(v_rgb_local[2], n_contrib, src_lane);
-                    v_mean_local.x = reduce_field(v_mean_local.x, n_contrib, src_lane);
-                    v_mean_local.y = reduce_field(v_mean_local.y, n_contrib, src_lane);
-                    v_mean_local.z = reduce_field(v_mean_local.z, n_contrib, src_lane);
-                    v_scale_local.x = reduce_field(v_scale_local.x, n_contrib, src_lane);
-                    v_scale_local.y = reduce_field(v_scale_local.y, n_contrib, src_lane);
-                    v_scale_local.z = reduce_field(v_scale_local.z, n_contrib, src_lane);
-                    v_quat_local.x = reduce_field(v_quat_local.x, n_contrib, src_lane);
-                    v_quat_local.y = reduce_field(v_quat_local.y, n_contrib, src_lane);
-                    v_quat_local.z = reduce_field(v_quat_local.z, n_contrib, src_lane);
-                    v_quat_local.w = reduce_field(v_quat_local.w, n_contrib, src_lane);
-                    v_opacity_local = reduce_field(v_opacity_local, n_contrib, src_lane);
-                    densification_weight_local = reduce_field(densification_weight_local, n_contrib, src_lane);
-                    densification_error_weighted_local =
-                        reduce_field(densification_error_weighted_local, n_contrib, src_lane);
-                    if constexpr (kEdgeScoring) {
-                        edge_score_local = reduce_field(edge_score_local, n_contrib, src_lane);
-                    }
-                    if (warp.thread_rank() == 0) {
-                        flush_splat_grads(
-                            id_batch[t], N, do_dens, v_rgb_local, v_mean_local, v_scale_local,
-                            v_quat_local, v_opacity_local, densification_weight_local,
-                            densification_error_weighted_local, scale_act, opacities[id_batch[t]],
-                            v_means, v_quats, v_scales, v_colors, v_opacities, densification_weight,
-                            densification_error);
-                    }
-                }
+                const unsigned n_contrib = __popc(valid_mask);
+                const int src_lane = __ffs(valid_mask) - 1;
+                v_rgb_local[0] = reduce_field(v_rgb_local[0], n_contrib, src_lane);
+                v_rgb_local[1] = reduce_field(v_rgb_local[1], n_contrib, src_lane);
+                v_rgb_local[2] = reduce_field(v_rgb_local[2], n_contrib, src_lane);
+                v_mean_local.x = reduce_field(v_mean_local.x, n_contrib, src_lane);
+                v_mean_local.y = reduce_field(v_mean_local.y, n_contrib, src_lane);
+                v_mean_local.z = reduce_field(v_mean_local.z, n_contrib, src_lane);
+                v_scale_local.x = reduce_field(v_scale_local.x, n_contrib, src_lane);
+                v_scale_local.y = reduce_field(v_scale_local.y, n_contrib, src_lane);
+                v_scale_local.z = reduce_field(v_scale_local.z, n_contrib, src_lane);
+                v_quat_local.x = reduce_field(v_quat_local.x, n_contrib, src_lane);
+                v_quat_local.y = reduce_field(v_quat_local.y, n_contrib, src_lane);
+                v_quat_local.z = reduce_field(v_quat_local.z, n_contrib, src_lane);
+                v_quat_local.w = reduce_field(v_quat_local.w, n_contrib, src_lane);
+                v_opacity_local = reduce_field(v_opacity_local, n_contrib, src_lane);
+                densification_weight_local = reduce_field(densification_weight_local, n_contrib, src_lane);
+                densification_error_weighted_local =
+                    reduce_field(densification_error_weighted_local, n_contrib, src_lane);
                 if constexpr (kEdgeScoring) {
-                    warpSum(edge_score_local, warp);
-                    if (warp.thread_rank() == 0) {
+                    edge_score_local = reduce_field(edge_score_local, n_contrib, src_lane);
+                }
+                if (blend_peak_out)
+                    warpMax(blend_peak, warp);
+                if (warp.thread_rank() == 0) {
+                    record_blend_peak(blend_peak_out, id_batch[t], blend_peak);
+                    // The compensation scales the opacity gradient only and stays detached from the
+                    // covariance: feeding this determinant ratio into the scale and rotation gradients
+                    // creates long splats.
+                    if (compensations != nullptr)
+                        v_opacity_local *= compensations[id_batch[t]];
+                    flush_splat_grads(
+                        id_batch[t], N, do_dens, v_rgb_local, v_mean_local, v_scale_local,
+                        v_quat_local, v_opacity_local, densification_weight_local,
+                        densification_error_weighted_local,
+                        log_scale_chain(scale_act, scales, dilations, id_batch[t]), opacities[id_batch[t]],
+                        v_means, v_quats, v_scales, v_colors, v_opacities, densification_weight,
+                        densification_error);
+                    if constexpr (kEdgeScoring) {
                         gpuAtomicAdd(&edge_score_batch[t], edge_score_local);
                     }
                 }
@@ -559,6 +587,8 @@ namespace gsplat_lfs {
         const scalar_t* __restrict__ backgrounds, // [C, CDIM] - solid color (mutually exclusive with bg_images)
         const scalar_t* __restrict__ bg_images,   // [C, CDIM, H, W] - per-pixel background (mutually exclusive with backgrounds)
         const bool* __restrict__ masks,           // [C, tile_height, tile_width]
+        const scalar_t* __restrict__ compensations,
+        const scalar_t* __restrict__ dilations,
         const uint32_t image_width,
         const uint32_t image_height,
         const uint32_t tile_size,
@@ -595,7 +625,7 @@ namespace gsplat_lfs {
         const scalar_t* __restrict__ densification_error_map, // [H, W] or nullptr
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
-        const FreeSpaceRender free_space) {
+        const ColorVarianceRender color_variance, float* __restrict__ blend_peak_out) {
         auto block = cg::this_thread_block();
         uint32_t cid = block.group_index().x;
         uint32_t tile_id =
@@ -644,6 +674,11 @@ namespace gsplat_lfs {
             radial_coeffs, tangential_coeffs, thin_prism_coeffs);
         const vec3 ray_d = ray.ray_dir;
         const vec3 ray_o = ray.ray_org;
+        const float depth_scale =
+            (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
+        constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
+        constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
+        constexpr uint32_t kUsed = (CDIM == 8) ? 7u : CDIM;
 
         // keep not rasterizing threads around for reading data
         const bool active = (i < image_height && j < image_width) && ray.valid_flag;
@@ -678,14 +713,14 @@ namespace gsplat_lfs {
         float T_final = 1.0f - render_alphas[pix_id];
         float T = T_final;
         // the contribution from gaussians behind the current one
-        float buffer[CDIM] = {0.f};
+        float buffer[kUsed] = {0.f};
         // index of last gaussian to contribute to this pixel
         const int32_t bin_final = active ? last_ids[pix_id] : 0;
 
         // df/d_out for this pixel
-        float v_render_c[CDIM];
+        float v_render_c[kUsed];
 #pragma unroll
-        for (uint32_t k = 0; k < CDIM; ++k) {
+        for (uint32_t k = 0; k < kUsed; ++k) {
             v_render_c[k] = v_render_colors[chw_pix(k, pix_id, image_height, image_width)];
         }
         const float v_render_a = v_render_alphas[pix_id];
@@ -694,7 +729,7 @@ namespace gsplat_lfs {
         float bg_accum = 0.f;
         if (have_bg) {
 #pragma unroll
-            for (uint32_t k = 0; k < CDIM; ++k) {
+            for (uint32_t k = 0; k < kUsed; ++k) {
                 float bg_val;
                 if (bg_images != nullptr && k < 3u) {
                     bg_val = bg_images[k * image_height * image_width + pix_id];
@@ -709,14 +744,41 @@ namespace gsplat_lfs {
         const bool do_dens = densification_error != nullptr && densification_error_map != nullptr;
         const float pixel_error = do_dens ? densification_error_map[pix_id] : 0.f;
 
-        // T_front = prod(1 - alpha) over the splats in front of the scan limit,
-        // so each of them gets -v_T_front * T_front / (1 - alpha) on its alpha.
-        float free_limit = 0.f;
-        float free_v_T = 0.f;
-        if (free_space.v_T_front != nullptr && free_space.gt_depth != nullptr && active) {
-            const size_t free_pix = static_cast<size_t>(cid) * image_height * image_width + pix_id;
-            free_limit = free_space.limit(cid, j, i, image_width, image_height);
-            free_v_T = free_space.v_T_front[free_pix] * free_space.T_front[free_pix];
+        const bool do_cv = (CDIM >= 3) && color_variance.enabled();
+        float4 cv_target = make_float4(0.f, 0.f, 0.f, 0.f);
+        float cv_buf = 0.f;
+        if constexpr (CDIM >= 3) {
+            if (do_cv && active) {
+                const float cov = 1.0f - T_final;
+                if (cov >= 0.5f / 255.f) {
+                    const uint32_t pixels = image_height * image_width;
+                    float pw_scale = 0.f;
+                    if (color_variance.pixel_weight == nullptr) {
+                        pw_scale = color_variance.weight / static_cast<float>(pixels);
+                    } else {
+                        const float pw_sum = *color_variance.pixel_weight_sum;
+                        if (pw_sum > 0.f) {
+                            pw_scale = color_variance.weight *
+                                       color_variance.pixel_weight[static_cast<size_t>(cid) * pixels + pix_id] / pw_sum;
+                        }
+                    }
+                    if (pw_scale > 0.f) {
+                        const float* rc = color_variance.render_colors + static_cast<size_t>(cid) * CDIM * pixels;
+                        float bg_c[3] = {0.f, 0.f, 0.f};
+                        if (have_bg) {
+#pragma unroll
+                            for (uint32_t c = 0; c < 3u; ++c) {
+                                bg_c[c] = bg_images != nullptr ? bg_images[c * pixels + pix_id] : backgrounds[c];
+                            }
+                        }
+                        cv_target = make_float4(
+                            (rc[chw_pix(0, pix_id, image_height, image_width)] - T_final * bg_c[0]) / cov,
+                            (rc[chw_pix(1, pix_id, image_height, image_width)] - T_final * bg_c[1]) / cov,
+                            (rc[chw_pix(2, pix_id, image_height, image_width)] - T_final * bg_c[2]) / cov,
+                            pw_scale);
+                    }
+                }
+            }
         }
 
         // collect and process batches of gaussians
@@ -747,7 +809,9 @@ namespace gsplat_lfs {
                 int32_t g = flatten_ids[idx]; // flatten index in [C * N] or [nnz]
                 id_batch[tr] = g;
                 const vec3 xyz = means[g];
-                const float opac = activated_opacity(opacities[g]);
+                float opac = activated_opacity(opacities[g]);
+                if (compensations != nullptr)
+                    opac *= compensations[g];
                 xyz_opacity_batch[tr] = {xyz.x, xyz.y, xyz.z, opac};
                 const vec3 scale_act = activated_scale(scales[g]);
                 const vec4 quat = quats[g];
@@ -759,6 +823,10 @@ namespace gsplat_lfs {
                     0.f, 1.0f / scale_act[1], 0.f,
                     0.f, 0.f, 1.0f / scale_act[2]);
                 mt_batch[tr] = glm::transpose(R * S);
+                if (dilations != nullptr) { // mip filter, as above
+                    scale_batch[tr] = dilated_scale(scale_act, dilations[g]);
+                    mt_batch[tr] = glm::transpose(R * inverse_scale_matrix(scale_batch[tr]));
+                }
 #pragma unroll
                 for (uint32_t k = 0; k < CDIM; ++k) {
                     rgbs_batch[tr * CDIM + k] = colors[g * CDIM + k];
@@ -777,6 +845,9 @@ namespace gsplat_lfs {
                 float alpha = 0.f;
                 float opac = 0.f;
                 float vis = 0.f;
+                float inv_grd_len = 0.f;
+                float t_hit = 0.f;
+                float depth = 0.f;
                 vec3 xyz, o_minus_mu, gro, grd, grd_n, gcrod;
                 mat3 Mt;
                 if (valid) {
@@ -787,10 +858,16 @@ namespace gsplat_lfs {
                     o_minus_mu = ray_o - xyz;
                     gro = Mt * o_minus_mu;
                     grd = Mt * ray_d;
-                    grd_n = safe_normalize(grd);
-                    gcrod = glm::cross(grd_n, gro);
-                    const float grayDist = glm::dot(gcrod, gcrod);
-                    const float power = -0.5f * grayDist;
+                    float power;
+                    if constexpr (kHasRayDepth) {
+                        ray_gaussian_eval(gro, grd, depth_scale,
+                                          grd_n, gcrod, inv_grd_len, t_hit, depth, power);
+                    } else {
+                        grd_n = safe_normalize(grd);
+                        gcrod = glm::cross(grd_n, gro);
+                        const float grayDist = glm::dot(gcrod, gcrod);
+                        power = -0.5f * grayDist;
+                    }
                     vis = __expf(power);
                     alpha = min(0.999f, opac * vis);
                     if (power > 0.f || alpha < 1.f / 255.f) {
@@ -812,14 +889,33 @@ namespace gsplat_lfs {
                 float densification_weight_local = 0.f;
                 float densification_error_weighted_local = 0.f;
                 float edge_score_local = 0.f;
+                float blend_peak = 0.f;
                 if (valid_mask != 0u) {
                     const float ra = 1.0f / (1.0f - alpha);
                     if (valid) {
                         T *= ra;
                         const float fac = alpha * T;
+                        blend_peak = fac;
+                        float v_depth = 0.f;
+                        float v_alpha = 0.f;
 #pragma unroll
-                        for (uint32_t k = 0; k < CDIM; ++k) {
-                            v_rgb_local[k] = fac * v_render_c[k];
+                        for (uint32_t k = 0; k < kUsed; ++k) {
+                            const float v_c = v_render_c[k];
+                            float c_val;
+                            if constexpr (kHasRayDepth) {
+                                if (k == kDepthChannel) {
+                                    c_val = depth;
+                                    v_depth += fac * v_c;
+                                } else {
+                                    c_val = rgbs_batch[t * CDIM + k];
+                                    v_rgb_local[k] = fac * v_c;
+                                }
+                            } else {
+                                c_val = rgbs_batch[t * CDIM + k];
+                                v_rgb_local[k] = fac * v_c;
+                            }
+                            v_alpha += (c_val * T - buffer[k] * ra) * v_c;
+                            buffer[k] += c_val * fac;
                         }
                         if (do_dens) {
                             densification_weight_local = fac;
@@ -832,27 +928,46 @@ namespace gsplat_lfs {
                                 edge_score_local = edge_contribution;
                             }
                         }
-                        float v_alpha = 0.f;
-#pragma unroll
-                        for (uint32_t k = 0; k < CDIM; ++k) {
-                            v_alpha += (rgbs_batch[t * CDIM + k] * T - buffer[k] * ra) *
-                                       v_render_c[k];
-                        }
                         v_alpha += T_final * ra * v_render_a;
                         if (have_bg) {
                             v_alpha += -T_final * ra * bg_accum;
                         }
-                        if (free_limit > 0.f && rgbs_batch[t * CDIM + free_space.depth_channel] < free_limit) {
-                            v_alpha -= free_v_T * ra;
+                        if constexpr (CDIM >= 3) {
+                            if (cv_target.w > 0.f) {
+                                const float r0 = rgbs_batch[t * CDIM + 0] - cv_target.x;
+                                const float r1 = rgbs_batch[t * CDIM + 1] - cv_target.y;
+                                const float r2 = rgbs_batch[t * CDIM + 2] - cv_target.z;
+                                const float u = cv_target.w * (r0 * r0 + r1 * r1 + r2 * r2);
+                                const float two_w = 2.0f * cv_target.w * fac;
+                                v_rgb_local[0] += two_w * r0;
+                                v_rgb_local[1] += two_w * r1;
+                                v_rgb_local[2] += two_w * r2;
+                                v_alpha += u * T - cv_buf * ra;
+                                cv_buf += u * fac;
+                            }
                         }
 
-                        if (opac * vis <= 0.999f) {
-                            const float v_vis = opac * v_alpha;
-                            const float v_gradDist = -0.5f * vis * v_vis;
-                            const vec3 v_gcrod = 2.0f * v_gradDist * gcrod;
-                            const vec3 v_grd_n = -glm::cross(v_gcrod, gro);
-                            const vec3 v_gro = glm::cross(v_gcrod, grd_n);
-                            const vec3 v_grd = safe_normalize_bw(grd, v_grd_n);
+                        const bool alpha_grad = (opac * vis <= 0.999f);
+                        const bool depth_grad =
+                            kHasRayDepth && (v_depth != 0.f && t_hit > 0.f && inv_grd_len > 0.f);
+                        if (alpha_grad || depth_grad) {
+                            vec3 v_gro{0.f};
+                            vec3 v_grd{0.f};
+                            if (alpha_grad) {
+                                const float v_vis = opac * v_alpha;
+                                const float v_gradDist = -0.5f * vis * v_vis;
+                                const vec3 v_gcrod = 2.0f * v_gradDist * gcrod;
+                                const vec3 v_grd_n = -glm::cross(v_gcrod, gro);
+                                v_gro = glm::cross(v_gcrod, grd_n);
+                                v_grd = safe_normalize_bw(grd, v_grd_n);
+                                v_opacity_local = vis * v_alpha;
+                            }
+                            if constexpr (kHasRayDepth) {
+                                if (depth_grad) {
+                                    ray_gaussian_depth_vjp(gro, grd_n, inv_grd_len, t_hit,
+                                                           depth_scale, v_depth, v_gro, v_grd);
+                                }
+                            }
                             const mat3 v_Mt = glm::outerProduct(v_grd, ray_d) +
                                               glm::outerProduct(v_gro, o_minus_mu);
                             const vec3 v_o_minus_mu = glm::transpose(Mt) * v_gro;
@@ -862,12 +977,6 @@ namespace gsplat_lfs {
                             const mat3 R = quat_to_rotmat(quat);
                             quat_scale_to_preci_half_vjp(
                                 quat, scale_act, R, glm::transpose(v_Mt), v_quat_local, v_scale_local);
-                            v_opacity_local = vis * v_alpha;
-                        }
-
-#pragma unroll
-                        for (uint32_t k = 0; k < CDIM; ++k) {
-                            buffer[k] += rgbs_batch[t * CDIM + k] * fac;
                         }
                     }
                     warpSum<CDIM>(v_rgb_local, warp);
@@ -877,11 +986,18 @@ namespace gsplat_lfs {
                     warpSum(v_opacity_local, warp);
                     warpSum(densification_weight_local, warp);
                     warpSum(densification_error_weighted_local, warp);
+                    if (blend_peak_out)
+                        warpMax(blend_peak, warp);
                     if (warp.thread_rank() == 0) {
                         const int32_t g = id_batch[t];
+                        record_blend_peak(blend_peak_out, g, blend_peak);
                         float* v_rgb_ptr = (float*)(v_colors) + CDIM * g;
 #pragma unroll
                         for (uint32_t k = 0; k < CDIM; ++k) {
+                            if constexpr (kHasRayDepth) {
+                                if (k == kDepthChannel || (CDIM == 8 && k == 7u))
+                                    continue;
+                            }
                             gpuAtomicAdd(v_rgb_ptr + k, v_rgb_local[k]);
                         }
                         float* v_mean_ptr = (float*)(v_means) + 3 * g;
@@ -890,7 +1006,7 @@ namespace gsplat_lfs {
                         gpuAtomicAdd(v_mean_ptr + 2, v_mean_local.z);
 
                         float* v_scale_ptr = (float*)(v_scales) + 3 * g;
-                        const vec3 scale_act = scale_batch[t];
+                        const vec3 scale_act = log_scale_chain(scale_batch[t], scales, dilations, g);
                         gpuAtomicAdd(v_scale_ptr, v_scale_local.x * scale_act.x);
                         gpuAtomicAdd(v_scale_ptr + 1, v_scale_local.y * scale_act.y);
                         gpuAtomicAdd(v_scale_ptr + 2, v_scale_local.z * scale_act.z);
@@ -901,6 +1017,9 @@ namespace gsplat_lfs {
                         gpuAtomicAdd(v_quat_ptr + 2, v_quat_local.z);
                         gpuAtomicAdd(v_quat_ptr + 3, v_quat_local.w);
 
+                        // Detached from the covariance, as above.
+                        if (compensations != nullptr)
+                            v_opacity_local *= compensations[g];
                         const float derivative = lfs::core::sigmoid_derivative_from_logit(opacities[g]);
                         gpuAtomicAdd(v_opacities + g, v_opacity_local * derivative);
                         if (do_dens) {
@@ -925,6 +1044,14 @@ namespace gsplat_lfs {
                 block.sync();
             }
         }
+        if constexpr (CDIM >= 3) {
+            if (do_cv && color_variance.loss_out != nullptr) {
+                warpSum(cv_buf, warp);
+                if (warp.thread_rank() == 0 && cv_buf != 0.f) {
+                    gpuAtomicAdd(color_variance.loss_out, cv_buf);
+                }
+            }
+        }
     }
 
     // Per-splat backward. One warp takes an 8x8 sub-tile of a 16x16 tile. Each lane
@@ -937,7 +1064,7 @@ namespace gsplat_lfs {
     constexpr uint32_t kSplatBwdPixels = kSplatBwdSub * kSplatBwdSub;
     constexpr int kSplatBwdSurvivors = 8 * 32;
 
-    template <uint32_t CDIM, bool kPerfectPinhole, bool kEdgeScoring, bool kBatched>
+    template <uint32_t CDIM, bool kPerfectPinhole, bool kEdgeScoring, bool kBatched, bool kColorVariance = false>
     __global__ void __launch_bounds__(32) rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel(
         const uint32_t C,
         const uint32_t N,
@@ -949,6 +1076,8 @@ namespace gsplat_lfs {
         const float* __restrict__ backgrounds,
         const float* __restrict__ bg_images,
         const bool* __restrict__ masks,
+        const float* __restrict__ compensations,
+        const float* __restrict__ dilations,
         const uint32_t image_width,
         const uint32_t image_height,
         const uint32_t tile_size,
@@ -979,8 +1108,8 @@ namespace gsplat_lfs {
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out,
         const TileRange tiles,
-        const FreeSpaceRender free_space,
-        const ScreenFootprint footprint) {
+        const ScreenFootprint footprint,
+        const ColorVarianceRender color_variance, float* __restrict__ blend_peak_out) {
         const uint32_t cid = blockIdx.x;
         const uint32_t subs = tile_size / kSplatBwdSub;
         const uint32_t sub_y = blockIdx.y;
@@ -1015,48 +1144,94 @@ namespace gsplat_lfs {
         }
         const bool have_bg = bg_images != nullptr || backgrounds != nullptr;
         const bool do_dens = densification_error != nullptr && densification_error_map != nullptr;
-        const bool do_free = free_space.v_T_front != nullptr && free_space.gt_depth != nullptr;
+        constexpr bool kUseCv = kColorVariance && (CDIM >= 3);
 
-        constexpr uint32_t kUsed = CDIM;
+        constexpr uint32_t kUsed = (CDIM == 8) ? 7u : CDIM;
         __shared__ float s_T[kSplatBwdPixels];
-        __shared__ float s_buffer[kSplatBwdPixels * kUsed];
+        // Each pixel uses the same color gradient for every splat. Store the
+        // dot product with its accumulated color instead of all channels.
+        __shared__ float s_buffer_dot[kSplatBwdPixels];
         __shared__ float s_v_c[kSplatBwdPixels * kUsed];
         __shared__ float s_v_a[kSplatBwdPixels];
         __shared__ float s_T_final[kSplatBwdPixels];
         __shared__ float s_bg[kSplatBwdPixels];
         __shared__ float s_error[kSplatBwdPixels];
         __shared__ float s_edge[kEdgeScoring ? kSplatBwdPixels : 1];
-        __shared__ float2 s_free[kSplatBwdPixels]; // (limit, v_T_front * T_front)
+        __shared__ float4 s_cv_target[kUseCv ? kSplatBwdPixels : 1];
+        __shared__ float s_cv_buf[kUseCv ? kSplatBwdPixels : 1];
         __shared__ float3 s_ray_o[kSplatBwdPixels];
-        __shared__ float3 s_ray_d[kSplatBwdPixels];
+        __shared__ float4 s_ray_d[kSplatBwdPixels];
         __shared__ int32_t s_bin[kSplatBwdPixels]; // last contributing pair; -1 inactive
         __shared__ int32_t s_surv[kSplatBwdSurvivors];
+
+        float cv_pw_sum = 0.f;
+        if constexpr (kUseCv) {
+            if (color_variance.pixel_weight != nullptr) {
+                if (lane == 0) {
+                    cv_pw_sum = *color_variance.pixel_weight_sum;
+                }
+                cv_pw_sum = __shfl_sync(0xffffffffu, cv_pw_sum, 0);
+            }
+        }
+
+        const int32_t range_start = tile_offsets[tile_id];
+        const int32_t range_end = tile_offsets[tile_id + 1];
+        if (range_start >= range_end)
+            return;
 
         int32_t bin_max = -1;
         for (uint32_t p = lane; p < kSplatBwdPixels; p += 32) {
             const uint32_t x = sub_x * kSplatBwdSub + p % kSplatBwdSub;
             const uint32_t y = sub_y * kSplatBwdSub + p / kSplatBwdSub;
-            const bool inside = x < image_width && y < image_height;
-            const uint32_t pix = min(y * image_width + x, pixels - 1);
+            s_bin[p] = -1;
+            if constexpr (kUseCv)
+                s_cv_buf[p] = 0.f;
+            if (x >= image_width || y >= image_height)
+                continue;
+
+            const uint32_t pix = y * image_width + x;
+            const float render_alpha = render_alphas[pix];
+            const int32_t last_id = last_ids[pix];
+            if (render_alpha == 0.f || last_id < range_start)
+                continue;
+
+            const float v_a = v_render_alphas[pix];
+            float v_color[kUsed];
+            bool has_gradient = v_a != 0.f;
+#pragma unroll
+            for (uint32_t k = 0; k < kUsed; ++k) {
+                v_color[k] = v_render_colors[chw_pix(k, pix, image_height, image_width)];
+                has_gradient |= v_color[k] != 0.f;
+            }
+            // These auxiliary paths can contribute even when the image loss has no gradient.
+            if constexpr (!kUseCv && !kEdgeScoring) {
+                if (!do_dens && !has_gradient && !blend_peak_out)
+                    continue;
+            }
+
             const WorldRay ray = from_world_pixel_ray<kPerfectPinhole>(
                 camera_model_type, rs_type, image_width, image_height,
                 static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f,
                 viewmats0, viewmats1, Ks, cid, radial_coeffs, tangential_coeffs, thin_prism_coeffs);
-            const bool active = inside && ray.valid_flag;
-            s_bin[p] = active ? last_ids[pix] : -1;
-            bin_max = max(bin_max, s_bin[p]);
+            if (!ray.valid_flag)
+                continue;
+
+            s_bin[p] = last_id;
+            bin_max = max(bin_max, last_id);
+            const float depth_scale =
+                (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
             s_ray_o[p] = make_float3(ray.ray_org.x, ray.ray_org.y, ray.ray_org.z);
-            s_ray_d[p] = make_float3(ray.ray_dir.x, ray.ray_dir.y, ray.ray_dir.z);
-            const float T_final = 1.0f - render_alphas[pix];
+            s_ray_d[p] = make_float4(ray.ray_dir.x, ray.ray_dir.y, ray.ray_dir.z, depth_scale);
+            const float T_final = 1.0f - render_alpha;
             s_T[p] = T_final;
             s_T_final[p] = T_final;
-            s_v_a[p] = v_render_alphas[pix];
+            s_v_a[p] = v_a;
+            s_buffer_dot[p] = 0.f;
             float bg = 0.f;
 #pragma unroll
             for (uint32_t k = 0; k < kUsed; ++k) {
-                const float v_c = v_render_colors[chw_pix(k, pix, image_height, image_width)];
+                const float v_c = v_color[k];
                 s_v_c[p * kUsed + k] = v_c;
-                s_buffer[p * kUsed + k] = 0.f;
                 // Geometry channels have a zero background; only RGB contributes.
                 if (have_bg && k < 3u) {
                     bg += (bg_images != nullptr ? bg_images[k * pixels + pix] : backgrounds[k]) * v_c;
@@ -1067,25 +1242,47 @@ namespace gsplat_lfs {
             if constexpr (kEdgeScoring) {
                 s_edge[p] = edge_weight_map[pix];
             }
-            float2 free = make_float2(0.f, 0.f);
-            if (do_free && active) {
-                const size_t free_pix = static_cast<size_t>(cid) * pixels + pix;
-                free.x = free_space.limit(cid, x, y, image_width, image_height);
-                free.y = free_space.v_T_front[free_pix] * free_space.T_front[free_pix];
+            if constexpr (kUseCv) {
+                float4 cv_t = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (color_variance.enabled()) {
+                    const float cov = 1.0f - T_final;
+                    if (cov >= 0.5f / 255.f) {
+                        float pw_scale = 0.f;
+                        if (color_variance.pixel_weight == nullptr) {
+                            pw_scale = color_variance.weight / static_cast<float>(pixels);
+                        } else if (cv_pw_sum > 0.f) {
+                            pw_scale = color_variance.weight *
+                                       color_variance.pixel_weight[static_cast<size_t>(cid) * pixels + pix] / cv_pw_sum;
+                        }
+                        if (pw_scale > 0.f) {
+                            const float* rc = color_variance.render_colors + static_cast<size_t>(cid) * CDIM * pixels;
+                            float bg_c[3] = {0.f, 0.f, 0.f};
+                            if (have_bg) {
+#pragma unroll
+                                for (uint32_t c = 0; c < 3u; ++c) {
+                                    bg_c[c] = bg_images != nullptr ? bg_images[c * pixels + pix] : backgrounds[c];
+                                }
+                            }
+                            cv_t = make_float4(
+                                (rc[chw_pix(0, pix, image_height, image_width)] - T_final * bg_c[0]) / cov,
+                                (rc[chw_pix(1, pix, image_height, image_width)] - T_final * bg_c[1]) / cov,
+                                (rc[chw_pix(2, pix, image_height, image_width)] - T_final * bg_c[2]) / cov,
+                                pw_scale);
+                        }
+                    }
+                }
+                s_cv_target[p] = cv_t;
+
             }
-            s_free[p] = free;
         }
         for (int offset = 16; offset > 0; offset /= 2) {
             bin_max = max(bin_max, __shfl_xor_sync(0xffffffffu, bin_max, offset));
         }
         __syncwarp();
 
-        const int32_t range_start = tile_offsets[tile_id];
-        const int32_t range_end = tile_offsets[tile_id + 1];
         const float sub_x0 = static_cast<float>(sub_x * kSplatBwdSub);
         const float sub_y0 = static_cast<float>(sub_y * kSplatBwdSub);
         const uint32_t sub_bit = (sub_y % subs) * subs + sub_x % subs;
-        const uint32_t depth_channel = free_space.depth_channel;
         const bool cull = footprint.means2d != nullptr && footprint.conics != nullptr &&
                           footprint.radii != nullptr;
 
@@ -1132,11 +1329,14 @@ namespace gsplat_lfs {
                 for (uint32_t k = 0; k < kUsed; ++k) {
                     rgb[k] = 0.f;
                 }
-                float splat_depth = 0.f;
                 if (owns) {
                     xyz = means[g];
                     opac = activated_opacity(opacities[g]);
+                    if (compensations != nullptr)
+                        opac *= compensations[g];
                     scale_act = activated_scale(scales[g]);
+                    if (dilations != nullptr)
+                        scale_act = dilated_scale(scale_act, dilations[g]);
                     quat = quats[g];
                     const mat3 S = mat3(
                         1.0f / scale_act[0], 0.f, 0.f,
@@ -1146,9 +1346,6 @@ namespace gsplat_lfs {
 #pragma unroll
                     for (uint32_t k = 0; k < kUsed; ++k) {
                         rgb[k] = colors[g * CDIM + k];
-                    }
-                    if (depth_channel < CDIM) {
-                        splat_depth = colors[g * CDIM + depth_channel];
                     }
                 }
 
@@ -1165,21 +1362,37 @@ namespace gsplat_lfs {
                 float dens_w = 0.f;
                 float dens_e = 0.f;
                 float edge_score = 0.f;
+                float blend_peak = 0.f;
                 bool touched = false;
+
+                constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
+                constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
 
                 for (int t = 0; t < batch + static_cast<int>(kSplatBwdPixels) - 1; ++t) {
                     const int p = t - static_cast<int>(lane);
                     if (owns && p >= 0 && p < static_cast<int>(kSplatBwdPixels) && isect_idx <= s_bin[p]) {
                         const float3 o = s_ray_o[p];
-                        const float3 d = s_ray_d[p];
+                        const float4 d = s_ray_d[p];
                         const vec3 ray_o{o.x, o.y, o.z};
                         const vec3 ray_d{d.x, d.y, d.z};
+                        const float depth_scale = d.w;
                         const vec3 o_minus_mu = ray_o - xyz;
                         const vec3 gro = Mt * o_minus_mu;
                         const vec3 grd = Mt * ray_d;
-                        const vec3 grd_n = safe_normalize(grd);
-                        const vec3 gcrod = glm::cross(grd_n, gro);
-                        const float power = -0.5f * glm::dot(gcrod, gcrod);
+                        vec3 grd_n;
+                        vec3 gcrod;
+                        float inv_grd_len = 0.f;
+                        float t_hit = 0.f;
+                        float depth = 0.f;
+                        float power;
+                        if constexpr (kHasRayDepth) {
+                            ray_gaussian_eval(gro, grd, depth_scale,
+                                              grd_n, gcrod, inv_grd_len, t_hit, depth, power);
+                        } else {
+                            grd_n = safe_normalize(grd);
+                            gcrod = glm::cross(grd_n, gro);
+                            power = -0.5f * glm::dot(gcrod, gcrod);
+                        }
                         const float vis = __expf(power);
                         const float alpha = min(0.999f, opac * vis);
                         if (power <= 0.f && alpha >= 1.f / 255.f) {
@@ -1187,23 +1400,51 @@ namespace gsplat_lfs {
                             const float ra = 1.0f / (1.0f - alpha);
                             const float T = s_T[p] * ra;
                             const float fac = alpha * T;
+                            if (blend_peak_out)
+                                blend_peak = fmaxf(blend_peak, fac);
                             const float T_final = s_T_final[p];
-                            float v_alpha = 0.f;
+                            float v_depth = 0.f;
+                            float color_dot = 0.f;
 #pragma unroll
                             for (uint32_t k = 0; k < kUsed; ++k) {
                                 const float v_c = s_v_c[p * kUsed + k];
-                                const float buffer = s_buffer[p * kUsed + k];
-                                v_rgb[k] += fac * v_c;
-                                v_alpha += (rgb[k] * T - buffer * ra) * v_c;
-                                s_buffer[p * kUsed + k] = buffer + rgb[k] * fac;
+                                float c_val;
+                                if constexpr (kHasRayDepth) {
+                                    if (k == kDepthChannel) {
+                                        c_val = depth;
+                                        v_depth += fac * v_c;
+                                    } else {
+                                        c_val = rgb[k];
+                                        v_rgb[k] += fac * v_c;
+                                    }
+                                } else {
+                                    c_val = rgb[k];
+                                    v_rgb[k] += fac * v_c;
+                                }
+                                color_dot += c_val * v_c;
                             }
+                            const float buffer_dot = s_buffer_dot[p];
+                            s_buffer_dot[p] = buffer_dot + color_dot * fac;
+                            float v_alpha = color_dot * T - buffer_dot * ra;
                             v_alpha += T_final * ra * s_v_a[p];
                             if (have_bg) {
                                 v_alpha += -T_final * ra * s_bg[p];
                             }
-                            const float2 free = s_free[p];
-                            if (free.x > 0.f && splat_depth < free.x) {
-                                v_alpha -= free.y * ra;
+                            if constexpr (kUseCv) {
+                                const float4 cv_t = s_cv_target[p];
+                                if (cv_t.w > 0.f) {
+                                    const float r0 = rgb[0] - cv_t.x;
+                                    const float r1 = rgb[1] - cv_t.y;
+                                    const float r2 = rgb[2] - cv_t.z;
+                                    const float u = cv_t.w * (r0 * r0 + r1 * r1 + r2 * r2);
+                                    const float two_w = 2.0f * cv_t.w * fac;
+                                    v_rgb[0] += two_w * r0;
+                                    v_rgb[1] += two_w * r1;
+                                    v_rgb[2] += two_w * r2;
+                                    const float cv_buf = s_cv_buf[p];
+                                    v_alpha += u * T - cv_buf * ra;
+                                    s_cv_buf[p] = cv_buf + u * fac;
+                                }
                             }
                             if (do_dens) {
                                 dens_w += fac;
@@ -1215,17 +1456,30 @@ namespace gsplat_lfs {
                                     edge_score += edge_contribution;
                                 }
                             }
-                            if (opac * vis <= 0.999f) {
-                                const float v_vis = opac * v_alpha;
-                                const float v_gradDist = -0.5f * vis * v_vis;
-                                const vec3 v_gcrod = 2.0f * v_gradDist * gcrod;
-                                const vec3 v_grd_n = -glm::cross(v_gcrod, gro);
-                                const vec3 v_gro = glm::cross(v_gcrod, grd_n);
-                                const vec3 v_grd = safe_normalize_bw(grd, v_grd_n);
+                            const bool alpha_grad = (opac * vis <= 0.999f);
+                            const bool depth_grad =
+                                kHasRayDepth && (v_depth != 0.f && t_hit > 0.f && inv_grd_len > 0.f);
+                            if (alpha_grad || depth_grad) {
+                                vec3 v_gro{0.f};
+                                vec3 v_grd{0.f};
+                                if (alpha_grad) {
+                                    const float v_vis = opac * v_alpha;
+                                    const float v_gradDist = -0.5f * vis * v_vis;
+                                    const vec3 v_gcrod = 2.0f * v_gradDist * gcrod;
+                                    const vec3 v_grd_n = -glm::cross(v_gcrod, gro);
+                                    v_gro = glm::cross(v_gcrod, grd_n);
+                                    v_grd = safe_normalize_bw(grd, v_grd_n);
+                                    v_opacity += vis * v_alpha;
+                                }
+                                if constexpr (kHasRayDepth) {
+                                    if (depth_grad) {
+                                        ray_gaussian_depth_vjp(gro, grd_n, inv_grd_len, t_hit,
+                                                               depth_scale, v_depth, v_gro, v_grd);
+                                    }
+                                }
                                 v_Mt_sum += glm::outerProduct(v_grd, ray_d) +
                                             glm::outerProduct(v_gro, o_minus_mu);
                                 v_gro_sum += v_gro;
-                                v_opacity += vis * v_alpha;
                             }
                             s_T[p] = T;
                         }
@@ -1234,6 +1488,7 @@ namespace gsplat_lfs {
                 }
 
                 if (touched) {
+                    record_blend_peak(blend_peak_out, g, blend_peak);
                     const vec3 v_mean = -(glm::transpose(Mt) * v_gro_sum);
                     vec3 v_scale{0.f};
                     vec4 v_quat{0.f};
@@ -1242,6 +1497,10 @@ namespace gsplat_lfs {
                     float* v_rgb_ptr = v_colors + CDIM * g;
 #pragma unroll
                     for (uint32_t k = 0; k < kUsed; ++k) {
+                        if constexpr (kHasRayDepth) {
+                            if (k == kDepthChannel)
+                                continue;
+                        }
                         gpuAtomicAdd(v_rgb_ptr + k, v_rgb[k]);
                     }
                     float* v_mean_ptr = reinterpret_cast<float*>(v_means) + 3 * g;
@@ -1249,14 +1508,17 @@ namespace gsplat_lfs {
                     gpuAtomicAdd(v_mean_ptr + 1, v_mean.y);
                     gpuAtomicAdd(v_mean_ptr + 2, v_mean.z);
                     float* v_scale_ptr = reinterpret_cast<float*>(v_scales) + 3 * g;
-                    gpuAtomicAdd(v_scale_ptr, v_scale.x * scale_act.x);
-                    gpuAtomicAdd(v_scale_ptr + 1, v_scale.y * scale_act.y);
-                    gpuAtomicAdd(v_scale_ptr + 2, v_scale.z * scale_act.z);
+                    const vec3 scale_chain = log_scale_chain(scale_act, scales, dilations, g);
+                    gpuAtomicAdd(v_scale_ptr, v_scale.x * scale_chain.x);
+                    gpuAtomicAdd(v_scale_ptr + 1, v_scale.y * scale_chain.y);
+                    gpuAtomicAdd(v_scale_ptr + 2, v_scale.z * scale_chain.z);
                     float* v_quat_ptr = reinterpret_cast<float*>(v_quats) + 4 * g;
                     gpuAtomicAdd(v_quat_ptr, v_quat.x);
                     gpuAtomicAdd(v_quat_ptr + 1, v_quat.y);
                     gpuAtomicAdd(v_quat_ptr + 2, v_quat.z);
                     gpuAtomicAdd(v_quat_ptr + 3, v_quat.w);
+                    if (compensations != nullptr)
+                        v_opacity *= compensations[g];
                     gpuAtomicAdd(v_opacities + g, v_opacity * lfs::core::sigmoid_derivative_from_logit(opacities[g]));
                     if (do_dens) {
                         if (densification_weight != nullptr)
@@ -1269,6 +1531,21 @@ namespace gsplat_lfs {
                 }
             }
             __syncwarp();
+        }
+        if constexpr (kUseCv) {
+            if (color_variance.enabled() && color_variance.loss_out != nullptr) {
+                __syncwarp();
+                float local_loss = 0.f;
+                for (uint32_t p = lane; p < kSplatBwdPixels; p += 32) {
+                    local_loss += s_cv_buf[p];
+                }
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    local_loss += __shfl_xor_sync(0xffffffffu, local_loss, offset);
+                }
+                if (lane == 0 && local_loss != 0.f) {
+                    gpuAtomicAdd(color_variance.loss_out, local_loss);
+                }
+            }
         }
     }
 
@@ -1296,6 +1573,8 @@ namespace gsplat_lfs {
         const float* backgrounds,
         const float* bg_images,
         const bool* masks,
+        const float* compensations,
+        const float* dilations,
         uint32_t C,
         uint32_t N,
         uint32_t n_isects,
@@ -1328,12 +1607,10 @@ namespace gsplat_lfs {
         const float* edge_weight_map,
         float* edge_score_out,
         cudaStream_t stream, TileRange tiles,
-        const FreeSpaceRender& free_space_in,
-        const ScreenFootprint& footprint) {
+        const ScreenFootprint& footprint,
+        const ColorVarianceRender& color_variance,
+        float* blend_peak_out) {
         const bool packed = false; // Only support non-packed for now
-        // The free-space test reads the splat depth from a render channel.
-        const FreeSpaceRender free_space =
-            free_space_in.depth_channel < CDIM ? free_space_in : FreeSpaceRender{};
         const uint32_t tile_width = (image_width + tile_size - 1) / tile_size;
         const uint32_t tile_height = (image_height + tile_size - 1) / tile_size;
 
@@ -1362,6 +1639,8 @@ namespace gsplat_lfs {
                 backgrounds,
                 bg_images,
                 masks,
+                compensations,
+                dilations,
                 image_width,
                 image_height,
                 tile_size,
@@ -1391,7 +1670,7 @@ namespace gsplat_lfs {
                 densification_error,
                 densification_error_map,
                 edge_weight_map,
-                edge_score_out, tiles, free_space);
+                edge_score_out, tiles, color_variance, blend_peak_out);
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd");
         };
 
@@ -1407,7 +1686,7 @@ namespace gsplat_lfs {
                             reinterpret_cast<const vec3*>(means),
                             reinterpret_cast<const vec4*>(quats),
                             reinterpret_cast<const vec3*>(scales),
-                            colors, opacities, backgrounds, bg_images, masks,
+                            colors, opacities, backgrounds, bg_images, masks, compensations, dilations,
                             image_width, image_height, tile_size, tile_width, tile_height,
                             viewmats0, viewmats1, Ks, camera_model, rs_type,
                             radial_coeffs, tangential_coeffs, thin_prism_coeffs,
@@ -1417,26 +1696,35 @@ namespace gsplat_lfs {
                             reinterpret_cast<vec4*>(v_quats),
                             reinterpret_cast<vec3*>(v_scales),
                             v_colors, v_opacities, densification_weight, densification_error, densification_error_map,
-                            edge_weight_map, edge_score_out, tiles, free_space, footprint);
+                            edge_weight_map, edge_score_out, tiles, footprint, color_variance, blend_peak_out);
                         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd_splat");
                     };
                     const bool edges = edge_weight_map != nullptr && edge_score_out != nullptr;
-                    if (global_shutter && perfect_pinhole) {
-                        if (edges)
-                            launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, true, kBatched>);
-                        else
-                            launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, false, kBatched>);
-                    } else {
-                        if (edges)
-                            launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, true, kBatched>);
-                        else
-                            launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, false, kBatched>);
+                    auto dispatch_splat = [&]<bool kUseCv>() {
+                        if (global_shutter && perfect_pinhole) {
+                            if (edges)
+                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, true, kBatched, kUseCv>);
+                            else
+                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, false, kBatched, kUseCv>);
+                        } else {
+                            if (edges)
+                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, true, kBatched, kUseCv>);
+                            else
+                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, false, kBatched, kUseCv>);
+                        }
+                    };
+                    if constexpr (CDIM >= 3) {
+                        if (color_variance.enabled()) {
+                            dispatch_splat.template operator()<true>();
+                            return;
+                        }
                     }
+                    dispatch_splat.template operator()<false>();
                     return;
                 }
             }
             if constexpr (CDIM == 3) {
-                if (tile_size == 16) {
+                if (tile_size == 16 && !color_variance.enabled()) {
                     dim3 threads = {8, 16, 1};
                     dim3 grid = {C, tile_height, tile_width};
                     int64_t shmem_size =
@@ -1539,6 +1827,8 @@ namespace gsplat_lfs {
         const float* backgrounds,                                              \
         const float* bg_images,                                                \
         const bool* masks,                                                     \
+        const float* compensations,                                            \
+        const float* dilations,                                                \
         uint32_t C,                                                            \
         uint32_t N,                                                            \
         uint32_t n_isects,                                                     \
@@ -1571,8 +1861,9 @@ namespace gsplat_lfs {
         const float* edge_weight_map,                                          \
         float* edge_score_out,                                                 \
         cudaStream_t stream, TileRange tiles,                                  \
-        const FreeSpaceRender& free_space,                                     \
-        const ScreenFootprint& footprint);
+        const ScreenFootprint& footprint,                                      \
+        const ColorVarianceRender& color_variance,                            \
+        float* blend_peak_out);
 
     __INS__(1)
     __INS__(2)

@@ -56,6 +56,11 @@ namespace fast_lfs::rasterization {
         float flatten_reg_weight = 0.0f;
         float opacity_reg_weight = 0.0f;
         float* rendered_count = nullptr;
+        // Optional [N] row raised to each primitive's largest blend weight alpha * T over the pixels of the view
+        // (blend backward, atomic max).
+        float* blend_peak = nullptr;
+        // The scale, rank and flatten regularizers skip splats that did not contribute to the view.
+        bool reg_rendered_only = false;
         // Optional persistent device scalars (caller zeros). Filled by preprocess_backward
         // via block-reduce + atomicAdd so the trainer can skip loss-only reg kernels.
         float* scale_reg_loss_out = nullptr;
@@ -67,6 +72,12 @@ namespace fast_lfs::rasterization {
         float mean_step_median_extent = 0.0f;
         const bool* mean_step_far_mask = nullptr;
         int mean_step_far_mask_n = 0;
+        // Ray-depth rows (lfs/training/ray_depth_step.cuh) stepped after the geometry rows; null: off.
+        float* ray_depth_state = nullptr;
+        int ray_depth_n = 0;
+        float ray_depth_lr = 0.0f;
+        float ray_depth_mean_lr = 0.0f;   // position learning rate, world units
+        float ray_depth_far_limit = 0.0f; // the rasterizer's far plane, world units
 
         FusedAdamParam means;
         FusedAdamParam scaling;

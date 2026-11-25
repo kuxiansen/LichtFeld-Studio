@@ -250,6 +250,9 @@ namespace lfs::core {
             size_t sh_degree_interval = 1'000;
             float means_lr = 0.000016f;
             float means_lr_end = 0.00000016f;
+            // Bound of the per-step ray-depth move (fraction of the distance to the observing cameras),
+            // decaying with the position learning rate; 0 turns it off.
+            float ray_depth_lr = 0.01f;
             float shs_lr = 0.0025f;
             float opacity_lr = 0.025f;
             float scaling_lr = 0.005f;
@@ -323,19 +326,14 @@ namespace lfs::core {
             // Depth supervision
             bool use_depth_loss = false;         // Use dataset depth maps when available
             float depth_loss_weight = 2.0f;      // Depth supervision weight (decays over training)
-            std::string depth_loss_mode = "ssi"; // ssi (auto prior), ssi-disparity, ssi-depth, or metric
+            std::string depth_loss_mode = "ssi"; // ssi (auto prior), ssi-disparity, or ssi-depth
             bool depth_auto_generate = true;     // Generate missing/mismatched maps from images/ with MoGe-2
-            float free_space_weight = 0.0f;      // Opacity in front of metric depth maps (--gut); 0 = off
-            float free_space_margin = 0.15f;     // Metres in front of the depth map that stay unpenalized
-            float free_space_margin_rel = 0.02f; // Or this fraction of the depth, whichever is larger
 
             // Normal supervision
             bool use_normal_loss = false;             // Use dataset normal maps when available
             bool normal_auto_generate = true;         // Generate missing/mismatched maps from images/ with MoGe-2
             float normal_loss_weight = 0.005f;        // Prior normal supervision weight (sweep: free geometry; raise to ~0.1 when geometry is the product)
             float normal_consistency_weight = 0.001f; // Depth-normal consistency weight
-            float depth_distortion_weight = 0.0f;     // Spread of depth along each ray (--gut); 0 = off
-            float normal_prior_depth_weight = -1.0f;  // Prior normal vs rendered-depth normal; -1 follows normal_loss_weight
             float normal_flatten_weight = 0.0f;       // L1 on the smallest scale axis; off by default - it suppresses densification under the benchmark refine regime
             float normal_start_fraction = 0.08f;      // Start normal supervision at floor(fraction * total iterations)
             float normal_end_fraction = 1.0f;         // Active while iter < end_fraction * total; 1.0 means until the end
@@ -368,6 +366,15 @@ namespace lfs::core {
                 return use_ppisp || use_exposure_correction;
             }
 
+            // Refines every training camera's pose with the model (training/components/camera_pose_refinement.hpp).
+            bool pose_opt = false;
+
+            // Aligns each training photo to the render with a smooth per-photo displacement field before the loss
+            // (training/components/calibration_correction.hpp), from calibration_correction_start_iteration() on.
+            bool calibration_correction = true;
+            static constexpr int CALIBRATION_CORRECTION_START_ITER = 1000;
+            [[nodiscard]] int calibration_correction_start_iteration() const;
+
             // PPISP (Physically-Plausible ISP) parameters
             bool use_ppisp = false;
             bool ppisp_exposure_from_exif = true;
@@ -391,12 +398,8 @@ namespace lfs::core {
             float image_count_scaler = 1.f; // Share of steps_scaler applied by the GUI image-count auto-scale
 
             // MRNF strategy specific parameters
-            float growth_grad_threshold = 0.003f;
             float grow_fraction = 0.07f;
             size_t grow_until_iter = 15000;
-            // At the cap, frees the splats whose removal changes the image least so error-guided
-            // growth keeps working until grow_until_iter.
-            bool growth_exchange = false;
             float opacity_decay = 0.004f;
             float scale_decay = 0.002f;
             float means_noise_weight = 50.0f;
@@ -455,6 +458,7 @@ namespace lfs::core {
             std::string config_file = "";
 
             void scale_steps(float ratio);
+            [[nodiscard]] OptimizationParameters scaled_to_iterations(size_t target) const;
             void apply_step_scaling();
             void remove_step_scaling();
             [[nodiscard]] int resolved_total_iterations() const;
@@ -467,6 +471,8 @@ namespace lfs::core {
             [[nodiscard]] int resolved_ppisp_controller_activation_step(int total_iterations) const;
 
             nlohmann::json to_json() const;
+            // Reads stored parameters: a key left out takes the strategy's default, except that calibration
+            // correction stays off, since such parameters were saved before the option existed.
             static OptimizationParameters from_json(const nlohmann::json& j);
 
             [[nodiscard]] std::string validate() const;
@@ -631,6 +637,8 @@ namespace lfs::core {
             // Turns the --cropbox box about its centre by X, Y, Z degrees about the dataset's axes, as Rx * Ry * Rz.
             // Unset keeps the box axis-aligned with its corners stored as given.
             std::optional<std::array<float, 3>> cropbox_rotation = std::nullopt;
+            // Ignore dataset roi.json sidecar when loading a dataset or evaluating with --eval-mask cropbox.
+            bool no_roi = false;
 
             // Optional trained splats to append to the training model before optimizer initialization
             std::vector<std::filesystem::path> add_splat_paths;
@@ -790,8 +798,9 @@ namespace lfs::core {
             std::filesystem::path output_path;
             std::filesystem::path colmap_path; // Cameras of a reference folder that is no COLMAP dataset
             // The eval_* options and enable_save_eval_images as in training; undistort says that test images
-            // without cameras of their own were rendered with the undistorted reference cameras.
-            OptimizationParameters evaluation{.enable_save_eval_images = false};
+            // without cameras of their own were rendered with the undistorted reference cameras. The test images
+            // are scored as given, without calibration correction's aligned scores.
+            OptimizationParameters evaluation{.enable_save_eval_images = false, .calibration_correction = false};
             bool no_download = false;
         };
 

@@ -85,15 +85,10 @@ namespace lfs::core::args {
             OptimizationCliBinding{"--depth-loss-weight", "depth_loss_weight", Float},
             OptimizationCliBinding{"--depth-loss-mode", "depth_loss_mode", String},
             OptimizationCliBinding{"--no-depth-auto-generate", "depth_auto_generate", Bool, true},
-            OptimizationCliBinding{"--free-space-weight", "free_space_weight", Float},
-            OptimizationCliBinding{"--free-space-margin", "free_space_margin", Float},
-            OptimizationCliBinding{"--free-space-margin-rel", "free_space_margin_rel", Float},
             OptimizationCliBinding{"--use-normal-loss", "use_normal_loss", Bool},
             OptimizationCliBinding{"--no-normal-auto-generate", "normal_auto_generate", Bool, true},
             OptimizationCliBinding{"--normal-loss-weight", "normal_loss_weight", Float},
             OptimizationCliBinding{"--normal-consistency-weight", "normal_consistency_weight", Float},
-            OptimizationCliBinding{"--depth-distortion-weight", "depth_distortion_weight", Float},
-            OptimizationCliBinding{"--normal-prior-depth-weight", "normal_prior_depth_weight", Float},
             OptimizationCliBinding{"--normal-flatten-weight", "normal_flatten_weight", Float},
             OptimizationCliBinding{"--normal-start-fraction", "normal_start_fraction", Float},
             OptimizationCliBinding{"--normal-end-fraction", "normal_end_fraction", Float},
@@ -105,6 +100,8 @@ namespace lfs::core::args {
             OptimizationCliBinding{"--bilateral-grid", "use_bilateral_grid", Bool},
             OptimizationCliBinding{"--exposure-correction", "use_exposure_correction", Bool},
             OptimizationCliBinding{"--no-exposure-correction", "use_exposure_correction", Bool, true},
+            OptimizationCliBinding{"--pose-opt", "pose_opt", Bool},
+            OptimizationCliBinding{"--no-calibration-correction", "calibration_correction", Bool, true},
             OptimizationCliBinding{"--ppisp", "ppisp", Bool},
             OptimizationCliBinding{"--no-ppisp-exif-exposure", "ppisp_exposure_from_exif", Bool, true},
             OptimizationCliBinding{"--ppisp-controller", "ppisp_use_controller", Bool},
@@ -832,6 +829,7 @@ namespace {
             ::args::ValueFlag<float> cropbox_lr_scale(training_group, "scale", lfs::core::args::optimization_cli_help("--cropbox-lr-scale"), {"cropbox-lr-scale"});
             ::args::ValueFlag<float> cropbox_loss_weight(training_group, "weight", lfs::core::args::optimization_cli_help("--cropbox-loss-weight"), {"cropbox-loss-weight"});
             ::args::ValueFlag<float> cropbox_growth_inside(training_group, "share", lfs::core::args::optimization_cli_help("--cropbox-growth-inside"), {"cropbox-growth-inside"});
+            ::args::Flag no_roi(training_group, "no-roi", "Ignore dataset roi.json sidecar when loading a dataset or evaluating with --eval-mask cropbox", {"no-roi"});
             ::args::ValueFlag<float> thin_structure_weight(training_group, "weight", lfs::core::args::optimization_cli_help("--thin-structure-weight"), {"thin-structure-weight"});
             ::args::ValueFlag<float> late_lr_anneal(training_group, "fraction", lfs::core::args::optimization_cli_help("--late-lr-anneal"), {"late-lr-anneal"});
             ::args::ValueFlag<float> gradient_loss_weight(training_group, "weight", lfs::core::args::optimization_cli_help("--gradient-loss-weight"), {"gradient-loss-weight"});
@@ -841,6 +839,8 @@ namespace {
             ::args::Flag opacity_decay_rendered_only(training_group, "enabled", lfs::core::args::optimization_cli_help("--opacity-decay-rendered-only"), {"opacity-decay-rendered-only"});
             ::args::Flag no_opacity_decay_rendered_only(training_group, "disabled", lfs::core::args::optimization_cli_help("--no-opacity-decay-rendered-only"), {"no-opacity-decay-rendered-only"});
             ::args::ValueFlag<float> steps_scaler(training_group, "steps_scaler", lfs::core::args::optimization_cli_help("--steps-scaler"), {"steps-scaler"});
+            ::args::Flag pose_opt(training_group, "pose_opt", lfs::core::args::optimization_cli_help("--pose-opt"), {"pose-opt"});
+            ::args::Flag no_calibration_correction(training_group, "no_calibration_correction", lfs::core::args::optimization_cli_help("--no-calibration-correction"), {"no-calibration-correction"});
             ::args::Flag no_error_map(training_group, "no_error_map", lfs::core::args::optimization_cli_help("--no-error-map"), {"no-error-map"});
             ::args::MapFlag<std::string, lfs::core::param::DensifyErrorMap> densify_error_map(
                 training_group, "densify_error_map",
@@ -926,15 +926,10 @@ namespace {
             ::args::ValueFlag<float> depth_loss_weight(mask_group, "depth_loss_weight", lfs::core::args::optimization_cli_help("--depth-loss-weight"), {"depth-loss-weight"});
             ::args::ValueFlag<std::string> depth_loss_mode(mask_group, "depth_loss_mode", lfs::core::args::optimization_cli_help("--depth-loss-mode"), {"depth-loss-mode"});
             ::args::Flag no_depth_auto_generate(mask_group, "no_depth_auto_generate", lfs::core::args::optimization_cli_help("--no-depth-auto-generate"), {"no-depth-auto-generate"});
-            ::args::ValueFlag<float> free_space_weight(mask_group, "weight", lfs::core::args::optimization_cli_help("--free-space-weight"), {"free-space-weight"});
-            ::args::ValueFlag<float> free_space_margin(mask_group, "metres", lfs::core::args::optimization_cli_help("--free-space-margin"), {"free-space-margin"});
-            ::args::ValueFlag<float> free_space_margin_rel(mask_group, "fraction", lfs::core::args::optimization_cli_help("--free-space-margin-rel"), {"free-space-margin-rel"});
             ::args::Flag use_normal_loss(mask_group, "use_normal_loss", lfs::core::args::optimization_cli_help("--use-normal-loss"), {"use-normal-loss"});
             ::args::Flag no_normal_auto_generate(mask_group, "no_normal_auto_generate", lfs::core::args::optimization_cli_help("--no-normal-auto-generate"), {"no-normal-auto-generate"});
             ::args::ValueFlag<float> normal_loss_weight(mask_group, "normal_loss_weight", lfs::core::args::optimization_cli_help("--normal-loss-weight"), {"normal-loss-weight"});
             ::args::ValueFlag<float> normal_consistency_weight(mask_group, "normal_consistency_weight", lfs::core::args::optimization_cli_help("--normal-consistency-weight"), {"normal-consistency-weight"});
-            ::args::ValueFlag<float> depth_distortion_weight(mask_group, "depth_distortion_weight", lfs::core::args::optimization_cli_help("--depth-distortion-weight"), {"depth-distortion-weight"});
-            ::args::ValueFlag<float> normal_prior_depth_weight(mask_group, "normal_prior_depth_weight", lfs::core::args::optimization_cli_help("--normal-prior-depth-weight"), {"normal-prior-depth-weight"});
             ::args::ValueFlag<float> normal_flatten_weight(mask_group, "normal_flatten_weight", lfs::core::args::optimization_cli_help("--normal-flatten-weight"), {"normal-flatten-weight"});
             ::args::ValueFlag<float> normal_start_fraction(mask_group, "normal_start_fraction", lfs::core::args::optimization_cli_help("--normal-start-fraction"), {"normal-start-fraction"});
             ::args::ValueFlag<float> normal_end_fraction(mask_group, "normal_end_fraction", lfs::core::args::optimization_cli_help("--normal-end-fraction"), {"normal-end-fraction"});
@@ -1287,6 +1282,8 @@ namespace {
                 }
                 cfg.include_provenance = params.include_provenance;
                 params.render_path = cfg;
+                params.optimization.gut = bool(gut);
+                params.optimization.mip_filter = bool(enable_mip);
 
                 return std::make_tuple(ParseResult::Success, std::function<void()>{});
             }
@@ -1361,6 +1358,10 @@ namespace {
                         ::args::get(cropbox)));
                 params.cropbox = *box;
             }
+            params.no_roi = static_cast<bool>(no_roi);
+            if (params.no_roi && params.cropbox) {
+                return std::unexpected("--no-roi cannot be combined with --cropbox");
+            }
             if (cropbox_rotation) {
                 if (!params.cropbox)
                     return std::unexpected("--cropbox-rotation turns the --cropbox box about its centre: it needs --cropbox");
@@ -1371,10 +1372,6 @@ namespace {
                         ::args::get(cropbox_rotation)));
                 params.cropbox_rotation = *rotation;
             }
-            if (crop && !params.cropbox && !params.resume_checkpoint && !params.resume_project)
-                return std::unexpected(
-                    "--crop removes the splats outside the training crop box when training completes and when exporting: "
-                    "it needs --cropbox, or a resumed project that has a crop box");
 
             auto add_splat_freeze = parse_add_splat_freeze_modifiers(args);
             if (!add_splat_freeze) {
@@ -1420,9 +1417,10 @@ namespace {
                 params.resume_checkpoint.has_value() ||
                 params.resume_project.has_value();
 
-            // If headless mode, require data path or resume
+            const bool has_scripts = python_scripts && !::args::get(python_scripts).empty();
+            // Headless scripts can run without a training source. TCP still needs one.
             // (--resume accepts both .resume checkpoints and .licht projects).
-            if (headless && !has_data_path && !has_resume) {
+            if (headless && !has_data_path && !has_resume && (!has_scripts || tcp_connection || init_path)) {
                 return std::unexpected(std::format(
                     "ERROR: Headless mode requires --data-path or --resume "
                     "(--resume file.licht counts as a project source)\n\n{}",
@@ -1499,6 +1497,18 @@ namespace {
                                 lfs::core::path_to_utf8(params.dataset.output_path), ec.message()));
                         }
                     }
+                }
+            }
+
+            if (crop && !params.cropbox && !params.resume_checkpoint && !params.resume_project) {
+                std::error_code roi_ec;
+                const bool has_roi_sidecar =
+                    !params.no_roi && !params.dataset.data_path.empty() &&
+                    lfs::core::native_fs::exists(params.dataset.data_path / "roi.json", roi_ec);
+                if (!has_roi_sidecar) {
+                    return std::unexpected(
+                        "--crop removes the splats outside the training crop box when training completes and when exporting: "
+                        "it needs --cropbox, dataset roi.json, or a resumed project that has a crop box");
                 }
             }
 
@@ -1695,13 +1705,8 @@ namespace {
                                         mask_mode_val = cli_option_present({"--mask-mode"}) ? std::optional<lfs::core::param::MaskMode>(::args::get(mask_mode)) : std::optional<lfs::core::param::MaskMode>(),
                                         depth_loss_weight_val = cli_option_present({"--depth-loss-weight"}) ? std::optional<float>(::args::get(depth_loss_weight)) : std::optional<float>(),
                                         depth_loss_mode_val = cli_option_present({"--depth-loss-mode"}) ? std::optional<std::string>(::args::get(depth_loss_mode)) : std::optional<std::string>(),
-                                        free_space_weight_val = cli_option_present({"--free-space-weight"}) ? std::optional<float>(::args::get(free_space_weight)) : std::optional<float>(),
-                                        free_space_margin_val = cli_option_present({"--free-space-margin"}) ? std::optional<float>(::args::get(free_space_margin)) : std::optional<float>(),
-                                        free_space_margin_rel_val = cli_option_present({"--free-space-margin-rel"}) ? std::optional<float>(::args::get(free_space_margin_rel)) : std::optional<float>(),
                                         normal_loss_weight_val = cli_option_present({"--normal-loss-weight"}) ? std::optional<float>(::args::get(normal_loss_weight)) : std::optional<float>(),
                                         normal_consistency_weight_val = cli_option_present({"--normal-consistency-weight"}) ? std::optional<float>(::args::get(normal_consistency_weight)) : std::optional<float>(),
-                                        depth_distortion_weight_val = cli_option_present({"--depth-distortion-weight"}) ? std::optional<float>(::args::get(depth_distortion_weight)) : std::optional<float>(),
-                                        normal_prior_depth_weight_val = cli_option_present({"--normal-prior-depth-weight"}) ? std::optional<float>(::args::get(normal_prior_depth_weight)) : std::optional<float>(),
                                         normal_flatten_weight_val = cli_option_present({"--normal-flatten-weight"}) ? std::optional<float>(::args::get(normal_flatten_weight)) : std::optional<float>(),
                                         normal_start_fraction_val = cli_option_present({"--normal-start-fraction"}) ? std::optional<float>(::args::get(normal_start_fraction)) : std::optional<float>(),
                                         normal_end_fraction_val = cli_option_present({"--normal-end-fraction"}) ? std::optional<float>(::args::get(normal_end_fraction)) : std::optional<float>(),
@@ -1718,6 +1723,8 @@ namespace {
                                         opacity_decay_rendered_only_flag = bool(opacity_decay_rendered_only),
                                         crop_flag = bool(crop),
                                         no_opacity_decay_rendered_only_flag = bool(no_opacity_decay_rendered_only),
+                                        pose_opt_flag = bool(pose_opt),
+                                        no_calibration_correction_flag = bool(no_calibration_correction),
                                         use_ppisp_flag = bool(use_ppisp),
                                         no_ppisp_exif_exposure_flag = bool(no_ppisp_exif_exposure),
                                         ppisp_controller_flag = bool(ppisp_controller),
@@ -1903,6 +1910,9 @@ namespace {
                 setFlag(use_exposure_correction_flag, opt.use_exposure_correction);
                 if (no_exposure_correction_flag)
                     opt.use_exposure_correction = false;
+                setFlag(pose_opt_flag, opt.pose_opt);
+                if (no_calibration_correction_flag)
+                    opt.calibration_correction = false;
                 setFlag(use_ppisp_flag, opt.use_ppisp);
                 if (no_ppisp_exif_exposure_flag)
                     opt.ppisp_exposure_from_exif = false;
@@ -1984,16 +1994,11 @@ namespace {
                 }
                 if (no_depth_auto_generate_flag)
                     opt.depth_auto_generate = false;
-                setVal(free_space_weight_val, opt.free_space_weight);
-                setVal(free_space_margin_val, opt.free_space_margin);
-                setVal(free_space_margin_rel_val, opt.free_space_margin_rel);
                 setFlag(use_normal_loss_flag, opt.use_normal_loss);
                 if (no_normal_auto_generate_flag)
                     opt.normal_auto_generate = false;
                 setVal(normal_loss_weight_val, opt.normal_loss_weight);
                 setVal(normal_consistency_weight_val, opt.normal_consistency_weight);
-                setVal(depth_distortion_weight_val, opt.depth_distortion_weight);
-                setVal(normal_prior_depth_weight_val, opt.normal_prior_depth_weight);
                 setVal(normal_flatten_weight_val, opt.normal_flatten_weight);
                 setVal(normal_start_fraction_val, opt.normal_start_fraction);
                 setVal(normal_end_fraction_val, opt.normal_end_fraction);
@@ -2010,7 +2015,7 @@ namespace {
                 // Python scripts
                 if (python_scripts_val) {
                     for (const auto& script : *python_scripts_val) {
-                        params.python_scripts.emplace_back(script);
+                        params.python_scripts.emplace_back(lfs::core::utf8_to_path(script));
                     }
                 }
 
@@ -2052,6 +2057,8 @@ namespace {
                 note_opt("use_bilateral_grid", use_bilateral_grid_flag);
                 note_opt("use_exposure_correction",
                          use_exposure_correction_flag || no_exposure_correction_flag);
+                note_opt("pose_opt", pose_opt_flag);
+                note_opt("calibration_correction", no_calibration_correction_flag);
                 note_opt("use_ppisp", use_ppisp_flag || ppisp_controller_flag ||
                                           ppisp_freeze_from_sidecar_flag);
                 note_opt("ppisp_use_controller", ppisp_controller_flag);
@@ -2093,14 +2100,9 @@ namespace {
                 note_opt("use_depth_loss", use_depth_loss_flag);
                 note_opt("depth_loss_weight", depth_loss_weight_val.has_value());
                 note_opt("depth_loss_mode", depth_loss_mode_val.has_value());
-                note_opt("free_space_weight", free_space_weight_val.has_value());
-                note_opt("free_space_margin", free_space_margin_val.has_value());
-                note_opt("free_space_margin_rel", free_space_margin_rel_val.has_value());
                 note_opt("use_normal_loss", use_normal_loss_flag);
                 note_opt("normal_loss_weight", normal_loss_weight_val.has_value());
                 note_opt("normal_consistency_weight", normal_consistency_weight_val.has_value());
-                note_opt("depth_distortion_weight", depth_distortion_weight_val.has_value());
-                note_opt("normal_prior_depth_weight", normal_prior_depth_weight_val.has_value());
                 note_opt("normal_flatten_weight", normal_flatten_weight_val.has_value());
                 note_opt("ppisp_holdout_appearance", ppisp_holdout_appearance_val.has_value());
                 note_opt("normal_loss_space", normal_loss_space_val.has_value());
@@ -2320,9 +2322,6 @@ lfs::core::args::parse_args_and_params(int argc, const char* const argv[], const
     if (auto error = validate_cli_nonnegative("--normal-consistency-weight", "normal_consistency_weight",
                                               params->optimization.normal_consistency_weight))
         return std::unexpected("ERROR: " + *error);
-    if (auto error = validate_cli_nonnegative("--depth-distortion-weight", "depth_distortion_weight",
-                                              params->optimization.depth_distortion_weight))
-        return std::unexpected("ERROR: " + *error);
     if (auto error = validate_cli_nonnegative("--normal-flatten-weight", "normal_flatten_weight",
                                               params->optimization.normal_flatten_weight))
         return std::unexpected("ERROR: " + *error);
@@ -2370,11 +2369,17 @@ namespace {
         "  LichtFeld-Studio convert project.licht output.ply\n"
         "\n"
         "SUPPORTED FORMATS:\n"
-        "  Input:  .ply, .sog, .ssog, lod-meta.json, .spz, .glb (SPZ glTF), .usd, .usda, .usdc, .usdz, .resume (checkpoint), .licht (project)\n"
+        "  Input:  .ply, .sog, .ssog, lod-meta.json, .spz, .glb (SPZ glTF), .usd, .usda, .usdc, .usdz, .rad, .resume (checkpoint),\n"
+        "          .licht (visible splat nodes of a project with their transforms and enabled crops)\n"
         "  Output: .ply, .sog, .ssog, .spz, .glb, .usd, .usda, .usdc, .html, .rad\n"
         "  SPZ:    --spz-version 4 (default, zstd) or 3 (legacy gzip)\n"
         "  Metadata: --no-provenance strips identifying metadata; a minimal build stamp is always embedded\n"
+        "  Scripts:  --capabilities prints stable feature identifiers, one per line\n"
         "\n";
+
+    // Identifiers for scripts and plugins. Never reword one; add a new identifier
+    // when the behavior it names changes.
+    constexpr const char* CONVERT_CAPABILITIES = "visible-project-splats-v1\n";
 
     constexpr const char* MESH2SPLAT_HELP_HEADER = "LichtFeld Studio - Convert mesh files to Gaussian splats\n";
     constexpr const char* MESH2SPLAT_HELP_FOOTER =
@@ -2436,6 +2441,7 @@ namespace {
         ::args::Flag rad_stream(parser, "stream", "RAD output: streamable Spark-compatible chunks (default)", {"stream"});
         ::args::Flag rad_none_stream(parser, "none-stream", "RAD output: native LichtFeld chunks", {"none-stream"});
         ::args::Flag overwrite(parser, "overwrite", "Overwrite existing files without prompting", {'y', "overwrite"});
+        ::args::Flag capabilities(parser, "capabilities", "Print stable feature identifiers, one per line, and exit", {"capabilities"});
 
         std::vector<std::string> args_vec(argv + 1, argv + argc);
         args_vec[0] = std::string(argv[0]) + " convert";
@@ -2448,6 +2454,11 @@ namespace {
             return core_args::HelpMode{};
         } catch (const ::args::ParseError& e) {
             return std::unexpected(std::format("{}\n\n{}", e.what(), parser.Help()));
+        }
+
+        if (capabilities) {
+            std::print("{}", CONVERT_CAPABILITIES);
+            return core_args::HelpMode{};
         }
 
         if (!input) {
@@ -2568,7 +2579,7 @@ Evaluation options:
             help += std::format("  {}\n      {}\n", flag, description);
         };
         for (const std::string_view flag : {"--eval-all", "--eval-mask", "--eval-mask-opacity", "--eval-flip", "--eval-green-infill",
-                                            "--eval-space", "--eval-bit-depth", "--noise-infill-mesh"})
+                                            "--eval-space", "--eval-bit-depth", "--no-calibration-correction", "--noise-infill-mesh"})
             add(flag, lfs::core::args::optimization_cli_help(flag));
         add("--eval-mask-report", EVAL_MASK_REPORT_HELP);
         add("--no-save-eval-images", "Do not save the evaluation comparison images (default: saved)");
