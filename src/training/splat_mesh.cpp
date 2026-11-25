@@ -2,15 +2,14 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #define NOMINMAX
 #include "splat_mesh.hpp"
-#include "splat_mesh_bake.hpp"
-#include "splat_mesh_pack.hpp"
 #include "splat_mesh_parallel.hpp"
-#include "splat_mesh_patch.hpp"
-#include "splat_mesh_patch_tiles.hpp"
 
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <psapi.h>
+#else
+#  include <fcntl.h>
+#  include <unistd.h>
 #endif
 
 #include "components/ppisp.hpp"
@@ -30,6 +29,7 @@
 #include "core/splat_data.hpp"
 #include "core/tensor/internal/cub_workspace.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#include "diagnostics/vram_profiler.hpp"
 #include "rasterization/gsplat/GeometryFeatures.h"
 #include "rasterization/gsplat/TsdfFusion.h"
 #include "rasterization/gsplat_rasterizer.hpp"
@@ -47,6 +47,7 @@
 #include <format>
 #include <fstream>
 #include <meshoptimizer.h>
+#include <stb_image_write.h>
 #include <mutex>
 #include <new>
 #include <numeric>
@@ -67,9 +68,6 @@ namespace lfs::training {
         constexpr uint64_t kAxisStep[3] = {uint64_t{1}, uint64_t{1} << gsplat_lfs::kTsdfKeyBits,
                                            uint64_t{1} << (2 * gsplat_lfs::kTsdfKeyBits)};
         constexpr uint64_t kAxisMask = (uint64_t{1} << gsplat_lfs::kTsdfKeyBits) - 1;
-        // Against whole-mesh reduction on a 2 cm indoor scene at 5 mm: 17% fewer faces, 0.02 dB more color
-        // against the photos and a p99 deviation of 6.0 instead of 6.9 mm. At half this, 38% fewer faces and 0.02 dB less.
-        constexpr float kSimplifyColorWeight = 0.9f;
         // The simplifier's single-precision quadrics lose a tolerance once a plane lies this many
         // tolerances from the corner of its piece: at 5 mm, 25 m beyond a 6 m crop keeps 39% of the
         // faces instead of 13%, and 100 m keeps 63%. Smaller pieces gain nothing and grow the seams.
@@ -101,7 +99,7 @@ namespace lfs::training {
         constexpr double kRamBytesPerVoxel = 65.;
         // The auto voxel is this fraction of one median splat spacing: slightly finer than the
         // point density so thin structures survive, without paying for sub-spacing voxels.
-        constexpr float kAutoVoxelDetail = .75f;
+        constexpr float kAutoVoxelDetail = .65f;
         // Bounds on the automatic size: below the minimum the voxel grid explodes in memory, above
         // the maximum the surface gets too coarse to be worth fusing.
         constexpr float kAutoVoxelSizeMin = .015f;
@@ -111,6 +109,9 @@ namespace lfs::training {
         // Automatic simplify tolerance, as a fraction of the voxel: just under one voxel keeps the
         // voxel detail without paying for the faces that only differ within a voxel.
         constexpr float kAutoSimplifyVoxels = .9f;
+        // Automatic texel size, as a fraction of the voxel: a quarter keeps the pages finer than the
+        // surface the voxel resolved, which is what the photos can still add over the mesh itself.
+        constexpr float kAutoTexelVoxels = .25f;
         // Automatic hole perimeter, as a multiple of the voxel: a gap narrower than twenty voxels is
         // a sampling hole, while a wider one is surface no view ever fused.
         constexpr float kAutoHolePerimeterVoxels = 20.f;
@@ -127,6 +128,35 @@ namespace lfs::training {
 
         constexpr uint32_t kAutoKeyBits = 21;
         constexpr uint32_t kAutoKeyLimit = 1u << kAutoKeyBits;
+
+        // Who owns the device memory at this point: the largest tracked scopes, largest first, so a phase that holds
+        // more than the mesh itself shows up instead of hiding in the process total.
+        static void log_vram_owners(const char* tag) {
+            auto& profiler = diagnostics::VramProfiler::instance();
+            if (!profiler.enabled())
+                profiler.setEnabled(true);
+            auto snap = profiler.snapshot();
+            if (!snap.enabled) {
+                LOG_INFO("VRAM [{}]: profiler off", tag);
+                return;
+            }
+            std::sort(snap.rows.begin(), snap.rows.end(),
+                      [](const auto& a, const auto& b) { return a.live_bytes > b.live_bytes; });
+            std::string line;
+            for (size_t i = 0; i < snap.rows.size() && i < 8; ++i) {
+                const auto& row = snap.rows[i];
+                if (row.live_bytes < (8ull << 20))
+                    continue;
+                line += std::format("{}{}:{} {:.0f} MB", line.empty() ? "" : ", ", row.scope, row.label,
+                                    row.live_bytes / 1048576.0);
+            }
+            LOG_INFO("VRAM [{}]: tracked {:.0f} MB, pool reserved {:.0f} MB (frag {:.0f}), context {:.0f} MB, "
+                     "vulkan {:.0f} MB, splat tensors {:.0f} MB | {}",
+                     tag, snap.accounted_live_bytes / 1048576.0, snap.process.cuda_pool_reserved / 1048576.0,
+                     snap.process.cuda_pool_fragmentation / 1048576.0, snap.process.cuda_context_baseline / 1048576.0,
+                     snap.process.vulkan_vma_block_bytes / 1048576.0, snap.process.exportable_splat_bytes / 1048576.0,
+                     line);
+        }
 
         // One-line RAM + GPU snapshot tag, useful to spot the phase that owns the peak of a run.
         // Windows-only — falls back gracefully on other platforms.
@@ -146,6 +176,45 @@ namespace lfs::training {
             }
             LOG_INFO("MEM [{}]: RAM {:.0f} MB (priv {:.0f} MB), GPU {:.0f}/{:.0f} MB",
                      tag, ram_mb, priv_mb, gpu_used_mb, gpu_total_mb);
+            log_vram_owners(tag);
+        }
+
+        // What the mesh holds, in MB, so that a MEM line can be attributed to a structure instead of guessed at.
+        static void log_mesh_ledger(const char* tag, const SplatMesh& mesh, const size_t candidates_bytes = 0,
+                                    const size_t mask_bytes = 0) {
+            size_t page_bytes = 0;
+            for (const auto& page : mesh.pages)
+                page_bytes += page.size();
+            const auto mb = [](const size_t bytes) { return double(bytes) / (1024. * 1024.); };
+            LOG_INFO("LEDGER [{}]: vertices {:.0f} MB, normals {:.0f} MB, colors {:.0f} MB, faces {:.0f} MB, uvs {:.0f} MB, "
+                     "uv_source {:.0f} MB, page_face {:.0f} MB, face_error {:.0f} MB, pages {:.0f} MB, candidates {:.0f} MB, masks {:.0f} MB",
+                     tag,
+                     mb(mesh.vertices.size() * sizeof(mesh.vertices[0])),
+                     mb(mesh.normals.size() * sizeof(mesh.normals[0])),
+                     mb(mesh.colors.size() * sizeof(mesh.colors[0])),
+                     mb(mesh.faces.size() * sizeof(mesh.faces[0])),
+                     mb(mesh.uvs.size() * sizeof(mesh.uvs[0])),
+                     mb(mesh.uv_source.size() * sizeof(mesh.uv_source[0])),
+                     mb(mesh.page_first_face.size() * sizeof(mesh.page_first_face[0])),
+                     mb(mesh.face_error.size() * sizeof(mesh.face_error[0])),
+                     mb(page_bytes), mb(candidates_bytes), mb(mask_bytes));
+        }
+
+        // The page as both exporters store it: JPEG at 95, which is what they embedded one page at a time before. Keeping
+        // the encoded bytes instead of the RGB saves three quarters of the atlas in RAM and changes no output.
+        constexpr int kPageJpegQuality = 95;
+
+        [[nodiscard]] std::vector<uint8_t> encode_page_jpeg(const std::vector<uint8_t>& rgb, const int side) {
+            std::vector<uint8_t> jpeg;
+            const auto append = [](void* context, void* data, const int size) {
+                auto* target = static_cast<std::vector<uint8_t>*>(context);
+                const auto* begin = static_cast<const uint8_t*>(data);
+                target->insert(target->end(), begin, begin + size);
+            };
+            if (side <= 0 || rgb.size() < size_t(side) * size_t(side) * 3 ||
+                !stbi_write_jpg_to_func(append, &jpeg, side, side, 3, rgb.data(), kPageJpegQuality))
+                throw collisionError("mesh.texture", "Could not encode a texture page", ErrorCode::Unavailable);
+            return jpeg;
         }
 
         template <class T>
@@ -172,15 +241,14 @@ namespace lfs::training {
                             s.full_weight_range >= 0 && s.view_stride >= 1 && s.color_stride >= 1 && s.min_views >= 1 &&
                             s.min_views <= 65535 && s.max_width >= 16 &&
                             std::isfinite(s.simplify_error) && s.simplify_error >= 0 && std::isfinite(s.max_range) && s.max_range >= 0 &&
+                            std::isfinite(s.simplify_color_weight) && s.simplify_color_weight >= 0 &&
                             std::isfinite(s.trunc_gradient) && s.trunc_gradient >= 0 &&
                             std::isfinite(s.trunc_cap) && s.trunc_cap >= 0 && s.ear_cut_holes >= 0 &&
                             std::isfinite(s.spurious_edge_factor) && s.spurious_edge_factor >= 0 &&
                             std::isfinite(s.spurious_component_factor) && s.spurious_component_factor >= 0 &&
                             s.remove_isolated_small_components >= 0 && s.isolated_component_max_faces >= 0 &&
                             std::isfinite(s.isolated_component_neighbor_radius) && s.isolated_component_neighbor_radius >= 0.f &&
-                            std::isfinite(s.texel_size) && s.texel_size >= 0 && (s.from_mesh.empty() || s.texel_size > 0) && s.texture_size >= 64 && s.texture_size <= 16384 && s.texture_width >= 0 && (s.texture_width == 0 || s.texture_width >= 16) &&
-                            s.texture_mode >= 0 && s.texture_mode <= 1 && std::isfinite(s.texel_min) && s.texel_min >= 0 &&
-                            s.seam_leveling_mode >= 0 && s.seam_leveling_mode <= 1;
+                            std::isfinite(s.texel_size) && s.texel_size >= 0 && s.texture_size >= 64 && s.texture_size <= 16384 && s.texture_width >= 0 && (s.texture_width == 0 || s.texture_width >= 16);
             if (!ok)
                 throw collisionError("mesh.settings_invalid", "Invalid mesh settings", ErrorCode::InvalidArgument,
                                      std::format("{}; {}", s.voxel_size, s.truncation));
@@ -587,6 +655,214 @@ namespace lfs::training {
             }
         };
 
+        // Keeps the depth maps beside the mesh output instead of in RAM: one temp file, one view at a time.
+        // The touch and integrate passes need every view's depth, but fusion runs once per TSDF chunk and so
+        // reads each view back as often as there are chunks. Writes bypass the file cache where the volume
+        // allows it, so the pages do not come back as standby memory. A failed write stops the spill and
+        // leaves the remaining views in RAM; the views already spilled stay readable.
+        class DepthSpill {
+        public:
+            DepthSpill() = default;
+            DepthSpill(const DepthSpill&) = delete;
+            DepthSpill& operator=(const DepthSpill&) = delete;
+            ~DepthSpill() { close(); }
+
+            // Frees the file and its staging buffer now, so the disk space comes back as soon as fusion ends rather
+            // than when this object goes out of scope.
+            void close() {
+                if (!active_)
+                    return;
+                active_ = false;
+                release_stage();
+#if defined(_WIN32)
+                if (handle_ != INVALID_HANDLE_VALUE) {
+                    CloseHandle(handle_);
+                    handle_ = INVALID_HANDLE_VALUE;
+                }
+#else
+                if (fd_ >= 0) {
+                    ::close(fd_);
+                    fd_ = -1;
+                }
+                std::error_code error;
+                std::filesystem::remove(path_, error);
+#endif
+            }
+
+            [[nodiscard]] bool open(const std::filesystem::path& dir, const size_t view_count) {
+                if (dir.empty() || view_count == 0)
+                    return false;
+                std::error_code error;
+                core::native_fs::create_directories(dir, error);
+                directory_ = dir;
+                path_ = dir / "mesh_depth_spill.bin";
+                offsets_.assign(view_count, 0);
+                counts_.assign(view_count, 0);
+#if defined(_WIN32)
+                // Unbuffered I/O keeps the pages out of the standby list. Not every volume accepts it, so a
+                // plain buffered handle is the fallback.
+                handle_ = CreateFileW(core::native_fs::native_path(path_).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                      CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_NO_BUFFERING,
+                                      nullptr);
+                unbuffered_ = handle_ != INVALID_HANDLE_VALUE;
+                if (!unbuffered_)
+                    handle_ = CreateFileW(core::native_fs::native_path(path_).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                          CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+                if (handle_ == INVALID_HANDLE_VALUE) {
+                    LOG_WARN("Mesh: cannot create the depth spill '{}' (error {})", core::path_to_utf8(path_),
+                             static_cast<unsigned long>(GetLastError()));
+                    return false;
+                }
+#else
+                fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                if (fd_ < 0) {
+                    LOG_WARN("Mesh: cannot create the depth spill '{}'", core::path_to_utf8(path_));
+                    return false;
+                }
+#endif
+                active_ = true;
+                return true;
+            }
+
+            [[nodiscard]] bool active() const { return active_; }
+            [[nodiscard]] size_t read_bytes() const { return read_bytes_; }
+            [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+            [[nodiscard]] bool write(const size_t index, const float* data, const size_t count) {
+                if (!active_ || !writing_ || index >= offsets_.size() || count == 0)
+                    return false;
+                // Checked as the file grows, so a nearly full output disk turns the spill off instead of
+                // failing the run in the middle of the render.
+                if ((index % 64) == 0) {
+                    std::error_code error;
+                    const auto space = std::filesystem::space(directory_, error);
+                    if (!error && space.available < kRoomNeeded) {
+                        writing_ = false;
+                        LOG_WARN("Mesh: depth spill stopped at view {}: {:.2f} GB free on the output disk", index,
+                                 static_cast<double>(space.available) / double(size_t{1} << 30));
+                        return false;
+                    }
+                }
+                const size_t bytes = count * sizeof(float);
+                const size_t offset = align_offset(cursor_);
+                if (!write_at(offset, bytes, data)) {
+                    writing_ = false;
+                    LOG_WARN("Mesh: depth spill write failed at view {}; keeping the rest of the depth maps in RAM", index);
+                    return false;
+                }
+                offsets_[index] = offset;
+                counts_[index] = count;
+                cursor_ = offset + bytes;
+                return true;
+            }
+
+            [[nodiscard]] bool read(const size_t index, float* data) {
+                if (!active_ || index >= counts_.size() || counts_[index] == 0)
+                    return false;
+                const size_t bytes = counts_[index] * sizeof(float);
+                if (!read_at(offsets_[index], bytes, data))
+                    return false;
+                read_bytes_ += bytes;
+                return true;
+            }
+
+        private:
+            static constexpr size_t kAlign = 64 * 1024;     // keeps offsets sector aligned for unbuffered I/O
+            static constexpr size_t kSector = 4 * 1024;     // unbuffered transfers must cover whole sectors
+            static constexpr size_t kMaxTransfer = size_t{1} << 30;
+            static constexpr size_t kRoomNeeded = size_t{1} << 30;
+
+            [[nodiscard]] static size_t align_offset(const size_t offset) {
+                return (offset + kAlign - 1) / kAlign * kAlign;
+            }
+
+            [[nodiscard]] static size_t pad_to_sector(const size_t bytes) {
+                return (bytes + kSector - 1) / kSector * kSector;
+            }
+
+            [[nodiscard]] bool ensure_stage(const size_t bytes) {
+                if (bytes <= stage_size_)
+                    return true;
+                release_stage();
+#if defined(_WIN32)
+                stage_ = static_cast<std::byte*>(_aligned_malloc(bytes, kSector));
+#else
+                stage_ = static_cast<std::byte*>(std::aligned_alloc(kSector, bytes));
+#endif
+                if (stage_ == nullptr)
+                    return false;
+                stage_size_ = bytes;
+                return true;
+            }
+
+            void release_stage() {
+                if (stage_ == nullptr)
+                    return;
+#if defined(_WIN32)
+                _aligned_free(stage_);
+#else
+                std::free(stage_);
+#endif
+                stage_ = nullptr;
+                stage_size_ = 0;
+            }
+
+            [[nodiscard]] bool write_at(const size_t offset, const size_t bytes, const void* data) {
+                const size_t padded = pad_to_sector(bytes);
+                if (padded > kMaxTransfer || !ensure_stage(padded))
+                    return false;
+                std::memcpy(stage_, data, bytes);
+#if defined(_WIN32)
+                LARGE_INTEGER pos;
+                pos.QuadPart = static_cast<LONGLONG>(offset);
+                if (!SetFilePointerEx(handle_, pos, nullptr, FILE_BEGIN))
+                    return false;
+                DWORD written = 0;
+                const auto chunk = static_cast<DWORD>(padded);
+                return WriteFile(handle_, stage_, chunk, &written, nullptr) && written == chunk;
+#else
+                return ::pwrite(fd_, stage_, padded, static_cast<off_t>(offset)) == static_cast<ssize_t>(padded);
+#endif
+            }
+
+            [[nodiscard]] bool read_at(const size_t offset, const size_t bytes, void* data) {
+                const size_t padded = pad_to_sector(bytes);
+                if (padded > kMaxTransfer || !ensure_stage(padded))
+                    return false;
+#if defined(_WIN32)
+                LARGE_INTEGER pos;
+                pos.QuadPart = static_cast<LONGLONG>(offset);
+                if (!SetFilePointerEx(handle_, pos, nullptr, FILE_BEGIN))
+                    return false;
+                DWORD got = 0;
+                const auto chunk = static_cast<DWORD>(padded);
+                if (!ReadFile(handle_, stage_, chunk, &got, nullptr) || got != chunk)
+                    return false;
+#else
+                if (::pread(fd_, stage_, padded, static_cast<off_t>(offset)) != static_cast<ssize_t>(padded))
+                    return false;
+#endif
+                std::memcpy(data, stage_, bytes);
+                return true;
+            }
+
+            std::filesystem::path directory_, path_;
+            std::vector<size_t> offsets_;
+            std::vector<size_t> counts_;
+            std::byte* stage_ = nullptr;
+            size_t stage_size_ = 0;
+            size_t cursor_ = 0;
+            size_t read_bytes_ = 0;
+            bool writing_ = true;
+            bool active_ = false;
+#if defined(_WIN32)
+            bool unbuffered_ = false;
+            HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+            int fd_ = -1;
+#endif
+        };
+
         // Masks as one bit per pixel, for renders that come back to a view: decoding one takes about as long as
         // rendering it, and a texture bake renders each view three times or more.
         struct MaskCache {
@@ -869,8 +1145,10 @@ namespace lfs::training {
             return;
 
         const auto corners_start = Clock::now();
-        // Each vertex averages the crossings of its cell.
-        std::vector<std::array<double, 3>> sums(cells.size(), {0., 0., 0.});
+        // Each vertex averages the crossings of its cell. The sums accumulate in place in
+        // mesh.vertices as floats: until the divide below that array holds un-normalized sums,
+        // not positions. This halves the temporary memory a separate double array would need.
+        mesh.vertices.assign(cells.size(), {0.f, 0.f, 0.f});
         std::vector<uint8_t> crossings(cells.size(), 0);
         mesh.faces.clear();
         mesh.faces.reserve(quad_count * 2);
@@ -893,9 +1171,9 @@ namespace lfs::training {
                         ++cursor[c];
                     const size_t vertex = cursor[c];
                     corner[c] = static_cast<int32_t>(vertex);
-                    sums[vertex][0] += x;
-                    sums[vertex][1] += y;
-                    sums[vertex][2] += z;
+                    mesh.vertices[vertex][0] += x;
+                    mesh.vertices[vertex][1] += y;
+                    mesh.vertices[vertex][2] += z;
                     ++crossings[vertex];
                 }
                 if (va >= 0)
@@ -907,10 +1185,11 @@ namespace lfs::training {
                      seconds_since(axis_start), mesh.faces.size());
         }
         cells = {};
-        mesh.vertices.resize(sums.size());
-        for (size_t v = 0; v < sums.size(); ++v) {
-            const double n = crossings[v];
-            mesh.vertices[v] = {float(sums[v][0] / n), float(sums[v][1] / n), float(sums[v][2] / n)};
+        for (size_t v = 0; v < mesh.vertices.size(); ++v) {
+            const float n = float(crossings[v]);
+            mesh.vertices[v][0] /= n;
+            mesh.vertices[v][1] /= n;
+            mesh.vertices[v][2] /= n;
         }
         mesh.raw_faces = mesh.faces.size();
         LOG_INFO("Mesh: surface nets corners in {:.2f}s, {} vertices, {} faces", seconds_since(corners_start),
@@ -2365,9 +2644,187 @@ namespace lfs::training {
             }
         }
 
+        // After each piece is simplified on its own, the vertices the pieces share still sit where the fused
+        // mesh put them, so a cut shows as a band of points over a surface that has lost most of its faces.
+        // Collapsing a seam vertex onto another seam vertex thins that band: both pieces lose the vertex, so
+        // the cut stays closed. A collapse is only taken where the faces around it stay on the surface within
+        // the error the simplify was allowed and none of them tilts, so the seam keeps its shape.
+        void thin_piece_seams(SplatMesh& mesh, const std::vector<uint8_t>& shared, const float max_error) {
+            constexpr float kSeamDeviation = .5f; // of the simplify's error, how far a seam vertex may move
+            constexpr float kSeamNormalDot = .5f; // how far a face around it may tilt
+            const bool has_colors = mesh.colors.size() == mesh.vertices.size();
+            std::unordered_map<int32_t, std::vector<int32_t>> seam_faces;
+            for (size_t f = 0; f < mesh.faces.size(); ++f)
+                for (const auto vertex : mesh.faces[f])
+                    if (shared[size_t(vertex)])
+                        seam_faces[vertex].push_back(static_cast<int32_t>(f));
+            std::vector<uint8_t> dead(mesh.faces.size(), 0);
+
+            // The live faces around a vertex, in order of their index and without repeats.
+            const auto ring_of = [&](const int32_t vertex) {
+                std::vector<int32_t> ring;
+                const auto found = seam_faces.find(vertex);
+                if (found == seam_faces.end())
+                    return ring;
+                ring = found->second;
+                std::ranges::sort(ring);
+                ring.erase(std::unique(ring.begin(), ring.end()), ring.end());
+                std::erase_if(ring, [&](const int32_t f) {
+                    if (dead[size_t(f)])
+                        return true;
+                    const auto& face = mesh.faces[size_t(f)];
+                    return face[0] != vertex && face[1] != vertex && face[2] != vertex;
+                });
+                return ring;
+            };
+
+            // The neighbors of a vertex and how often its ring reaches each. A manifold interior vertex reaches
+            // every one of them twice, so a vertex where that fails is left alone.
+            const auto link_of = [&](const std::vector<int32_t>& ring, const int32_t vertex, std::vector<int32_t>& neighbors) {
+                std::vector<std::pair<int32_t, int>> counted;
+                for (const auto f : ring)
+                    for (const auto x : mesh.faces[size_t(f)])
+                        if (x != vertex) {
+                            const auto found = std::find_if(counted.begin(), counted.end(), [&](const auto& entry) { return entry.first == x; });
+                            if (found == counted.end())
+                                counted.push_back({x, 1});
+                            else
+                                ++found->second;
+                        }
+                neighbors.clear();
+                bool manifold = true;
+                for (const auto& [x, count] : counted) {
+                    manifold = manifold && count == 2;
+                    neighbors.push_back(x);
+                }
+                return manifold;
+            };
+
+            const auto started = Clock::now();
+            size_t seam_vertices = 0;
+            size_t collapsed = 0;
+            for (int32_t vertex = 0; vertex < static_cast<int32_t>(mesh.vertices.size()); ++vertex) {
+                if (!shared[size_t(vertex)])
+                    continue;
+                const auto ring = ring_of(vertex);
+                if (ring.size() < 3)
+                    continue;
+                ++seam_vertices;
+                std::vector<int32_t> link;
+                if (!link_of(ring, vertex, link))
+                    continue;
+
+                int32_t best = -1;
+                float best_deviation = FLT_MAX;
+                for (const auto target : link) {
+                    if (target == vertex || !shared[size_t(target)])
+                        continue;
+                    // The two faces that hold the edge, and the corner each has opposite it.
+                    int32_t first_corner = -1, second_corner = -1;
+                    int edge_faces = 0;
+                    for (const auto f : ring) {
+                        const auto& face = mesh.faces[size_t(f)];
+                        if (face[0] != target && face[1] != target && face[2] != target)
+                            continue;
+                        if (++edge_faces > 2)
+                            break;
+                        for (const auto corner : face)
+                            if (corner != vertex && corner != target)
+                                (edge_faces == 1 ? first_corner : second_corner) = corner;
+                    }
+                    if (edge_faces != 2 || first_corner < 0 || second_corner < 0)
+                        continue;
+                    const auto target_ring = ring_of(target);
+                    std::vector<int32_t> target_link;
+                    if (!link_of(target_ring, target, target_link))
+                        continue;
+                    // The link condition: the two rings meet only at the corners opposite the edge, which keeps
+                    // the collapse from pinching the surface.
+                    bool linked = true;
+                    for (const auto x : target_link)
+                        if (x != first_corner && x != second_corner && std::ranges::find(link, x) != link.end()) {
+                            linked = false;
+                            break;
+                        }
+                    if (!linked)
+                        continue;
+
+                    const auto& position = mesh.vertices[size_t(vertex)];
+                    const auto& moved = mesh.vertices[size_t(target)];
+                    float deviation = 0.f;
+                    bool keeps_shape = true;
+                    for (const auto f : ring) {
+                        const auto& face = mesh.faces[size_t(f)];
+                        if (face[0] == target || face[1] == target || face[2] == target)
+                            continue;
+                        int32_t p = -1, q = -1;
+                        for (const auto corner : face)
+                            if (corner != vertex)
+                                (p < 0 ? p : q) = corner;
+                        const auto& P = mesh.vertices[size_t(p)];
+                        const auto& Q = mesh.vertices[size_t(q)];
+                        std::array<float, 3> was{}, now{};
+                        for (int axis = 0; axis < 3; ++axis) {
+                            const int next = (axis + 1) % 3;
+                            was[axis] = (P[next] - position[next]) * (Q[axis] - position[axis]) - (P[axis] - position[axis]) * (Q[next] - position[next]);
+                            now[axis] = (P[next] - moved[next]) * (Q[axis] - moved[axis]) - (P[axis] - moved[axis]) * (Q[next] - moved[next]);
+                        }
+                        const float was_length = std::sqrt(was[0] * was[0] + was[1] * was[1] + was[2] * was[2]);
+                        const float now_length = std::sqrt(now[0] * now[0] + now[1] * now[1] + now[2] * now[2]);
+                        if (was_length <= 1e-12f || now_length <= 1e-12f) {
+                            keeps_shape = false;
+                            break;
+                        }
+                        const float dot = (was[0] * now[0] + was[1] * now[1] + was[2] * now[2]) / (was_length * now_length);
+                        if (dot < kSeamNormalDot) {
+                            keeps_shape = false;
+                            break;
+                        }
+                        // How far the corner leaves the new face's plane.
+                        const float distance = std::abs((position[0] - moved[0]) * now[0] + (position[1] - moved[1]) * now[1] + (position[2] - moved[2]) * now[2]) / now_length;
+                        deviation = std::max(deviation, distance);
+                    }
+                    if (!keeps_shape || deviation > kSeamDeviation * max_error)
+                        continue;
+                    if (deviation < best_deviation) {
+                        best_deviation = deviation;
+                        best = target;
+                    }
+                }
+                if (best < 0)
+                    continue;
+
+                for (const auto f : ring) {
+                    auto& face = mesh.faces[size_t(f)];
+                    if (face[0] == best || face[1] == best || face[2] == best) {
+                        dead[size_t(f)] = 1;
+                        continue;
+                    }
+                    for (auto& corner : face)
+                        if (corner == vertex)
+                            corner = best;
+                    seam_faces[best].push_back(f);
+                }
+                if (has_colors)
+                    for (int c = 0; c < 3; ++c)
+                        mesh.colors[size_t(best)][c] = static_cast<uint8_t>(std::lround(.5f * (float(mesh.colors[size_t(best)][c]) + float(mesh.colors[size_t(vertex)][c]))));
+                ++collapsed;
+            }
+
+            const size_t faces_before = mesh.faces.size();
+            size_t kept = 0;
+            for (size_t f = 0; f < mesh.faces.size(); ++f)
+                if (!dead[f])
+                    mesh.faces[kept++] = mesh.faces[f];
+            mesh.faces.resize(kept);
+            LOG_INFO("Seam thinning: {} of {} seam vertices collapsed, {} of {} faces removed, {:.2f} s",
+                     collapsed, seam_vertices, faces_before - kept, faces_before, seconds_since(started));
+        }
+
         // Simplifies each piece on its own, so RAM follows the piece size. Vertices that pieces share stay put,
         // so no cracks open between them, and the seams keep their density. Leaves unused vertices for the caller.
-        void simplify_in_pieces(SplatMesh& mesh, const float max_error, const float color_weight, const size_t piece_faces) {
+        void simplify_in_pieces(SplatMesh& mesh, const float max_error, const float color_weight, const size_t piece_faces,
+                                const bool seam_thinning) {
             const int threads = std::clamp(int(std::thread::hardware_concurrency()), 1, kSimplifyThreads);
             std::vector<std::pair<size_t, size_t>> ranges;
             std::mutex ranges_mutex;
@@ -2454,6 +2911,11 @@ namespace lfs::training {
                 out += kept[r];
             }
             mesh.faces.resize(out);
+            if (seam_thinning) {
+                LOG_INFO("Simplify pieces: {}, {} vertices on their seams", ranges.size(), std::ranges::count(shared, uint8_t{1}));
+                if (ranges.size() > 1)
+                    thin_piece_seams(mesh, shared, max_error);
+            }
             mesh.simplify_result_error = errors.empty() ? 0.f : *std::ranges::max_element(errors);
         }
     } // namespace
@@ -2471,12 +2933,13 @@ namespace lfs::training {
         return ranges;
     }
 
-    void simplify_splat_mesh(SplatMesh& mesh, const float max_error, const float color_weight, const size_t piece_faces) {
+    void simplify_splat_mesh(SplatMesh& mesh, const float max_error, const float color_weight, const size_t piece_faces,
+                             const bool seam_thinning) {
         mesh.faces_before_simplify = mesh.faces.size();
         if (max_error <= 0.f || mesh.faces.empty())
             return;
         const bool has_colors = mesh.colors.size() == mesh.vertices.size();
-        simplify_in_pieces(mesh, max_error, color_weight, piece_faces);
+        simplify_in_pieces(mesh, max_error, color_weight, piece_faces, seam_thinning);
 
         std::vector<int32_t> remap(mesh.vertices.size(), -1);
         std::vector<std::array<float, 3>> vertices;
@@ -2641,6 +3104,8 @@ namespace lfs::training {
             mesh.pages.assign(page_count, {});
             core::GlobalArenaManager::instance().get_arena().release_idle_for_pressure();
             core::Tensor::trim_memory_pool();
+            log_phase_mem("tex_start");
+            log_mesh_ledger("tex_start", mesh);
             constexpr size_t bytes_per_texel = 52;
             const auto room = core::MemoryPressureCoordinator::instance().preflight({.operation = "Mesh texture"});
             const size_t available = room.effective_free_bytes > room.required_peak_bytes ? room.effective_free_bytes - room.required_peak_bytes : 0;
@@ -2680,6 +3145,9 @@ namespace lfs::training {
                                                        [&](const float value) { report(pass_share * value); });
             const auto& face_views = chosen_views.labels;
             auto& candidates = chosen_views.candidates;
+            log_phase_mem("tex_views");
+            log_mesh_ledger("tex_views", mesh,
+                            candidates.views.size() * sizeof(int32_t) + candidates.scores.size() * sizeof(float));
             const auto face_count = static_cast<uint32_t>(mesh.faces.size());
             MaskCache masks;
             // A batch needs the views chosen for its faces, and those nearly as good, which fill in what a chosen view cannot
@@ -2780,6 +3248,8 @@ namespace lfs::training {
                 batch_views_total += size_t(std::ranges::count(batch.uses_view, uint8_t{1}));
             }
             candidates = FaceViewCandidates(0);
+            log_phase_mem("tex_plan");
+            log_mesh_ledger("tex_plan", mesh);
             LOG_INFO("Mesh: {} batches of at most {} M covered texels read {:.1f} times the photos in all", batches.size(), max_texels / 1000000, double(batch_views_total) / double(std::max<size_t>(views.size(), 1)));
 
             // A photo and its blur, through the appearance inverse; false if it has no use here.
@@ -2808,6 +3278,8 @@ namespace lfs::training {
             // Seam samples are read in the first batch's pass over the photos, which then takes every view, and leveled
             // before its pages are composed.
             auto leveling = plan_color_leveling(mesh, face_views);
+            log_phase_mem("tex_leveling");
+            log_mesh_ledger("tex_leveling", mesh);
             const auto sample_count = static_cast<uint32_t>(leveling.sample_labels.size());
             struct SeamArrays {
                 DeviceArray<float> positions, sum, weight, high, best, tolerances;
@@ -2841,8 +3313,12 @@ namespace lfs::training {
                     seams = {};
                     for (size_t s = 0; s < sample_count; ++s)
                         for (size_t c = 0; c < 3; ++c) {
-                            if (std::isinf(bests[s]))
-                                host_colors[3 * s + c] = direct[3 * s + c];
+                            if (std::isinf(bests[s])) {
+                                // Across views, the sample is the mean plus the chosen view's detail, as the pages are.
+                                host_colors[3 * s + c] = settings.texture_cross_view_color && mean_weights[s] > 0.f
+                                                             ? means[3 * s + c] / mean_weights[s] + direct[3 * s + c]
+                                                             : direct[3 * s + c];
+                            }
                             // Where no view sets the detail, the texels hold the mean of all views.
                             else if (leveling.sample_labels[s] < 0 && mean_weights[s] > 0.f)
                                 host_colors[3 * s + c] = means[3 * s + c] / mean_weights[s];
@@ -2859,6 +3335,8 @@ namespace lfs::training {
             }
 
             size_t observed = 0, direct = 0, total = 0, batch_views_done = 0;
+            SeamLevelingStats seam_stats;
+            std::mutex seam_stats_mutex;
             for (size_t b = 0; b < batches.size(); ++b) {
                 const auto& batch = batches[b];
                 const bool with_seams = b == 0 && sample_count > 0;
@@ -2908,10 +3386,10 @@ namespace lfs::training {
                     // Blurred, so that misregistration and grain do not read as a step.
                     if (with_seams)
                         gsplat_lfs::mesh_texture_accumulate(seams.positions.data(), sample_count, view, static_cast<int32_t>(i), seams.labels.data(), depth.ptr<float>(), low.data(), low.data(), seams.tolerances.data(),
-                                                            mask_bits(masks, camera), seams.sum.data(), seams.weight.data(), seams.high.data(), seams.best.data(), stream);
+                                                            mask_bits(masks, camera), settings.texture_own_pixel_sampling, settings.texture_cross_view_color, seams.sum.data(), seams.weight.data(), seams.high.data(), seams.best.data(), stream);
                     if (batch.uses_view[i])
                         gsplat_lfs::mesh_texture_accumulate(positions.data(), static_cast<uint32_t>(count), view, static_cast<int32_t>(i), labels.data(), depth.ptr<float>(), photo.ptr<float>(), low.data(), tolerances.data(),
-                                                            mask_bits(masks, camera), low_sum.data(), low_weight.data(), high.data(), best_weight.data(), stream);
+                                                            mask_bits(masks, camera), settings.texture_own_pixel_sampling, settings.texture_cross_view_color, low_sum.data(), low_weight.data(), high.data(), best_weight.data(), stream);
                     LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture");
                 }
                 // The batch's sums stay on the GPU while the leveling is solved, and come down a few pages at a time.
@@ -2956,16 +3434,29 @@ namespace lfs::training {
                             float level[3];
                             leveling.offset_at(mesh, texels[p].faces[t], &texels[p].positions[3 * t], level);
                             const bool direct = std::isinf(bests[at]);
+                            // Across views, even a texel the chosen view covers takes its broad color from the mean,
+                            // so the exposure and white balance of that one photo do not become a patch per face.
+                            const bool use_mean = !direct || settings.texture_cross_view_color;
                             if (direct)
                                 direct_here.fetch_add(1, std::memory_order_relaxed);
                             for (size_t c = 0; c < 3; ++c)
-                                colors[3 * t + c] = std::max((direct ? 0.f : sums[3 * at + c] / sum_weights[at]) + highs[3 * at + c] + level[c], 0.f);
+                                colors[3 * t + c] = std::max((use_mean ? sums[3 * at + c] / sum_weights[at] : 0.f) + highs[3 * at + c] + level[c], 0.f);
                         }
                         seen_here += seen_page;
+                        if (settings.texture_local_seam_leveling) {
+                            const auto stats = level_mesh_page_seams(mesh, texels[p], face_views, batch.first_page + p, colors);
+                            if (stats.seam_texels > 0) {
+                                std::lock_guard lock(seam_stats_mutex);
+                                seam_stats.seam_texels += stats.seam_texels;
+                                seam_stats.band_texels += stats.band_texels;
+                                seam_stats.iterations = std::max(seam_stats.iterations, stats.iterations);
+                                seam_stats.max_delta = std::max(seam_stats.max_delta, stats.max_delta);
+                            }
+                        }
                         const int side = mesh.page_side(batch.first_page + p);
                         auto image = compose_mesh_page(texels[p], colors, side);
                         sharpen_mesh_page(image, side, settings.texture_sharpen);
-                        mesh.pages[batch.first_page + p] = std::move(image);
+                        mesh.pages[batch.first_page + p] = encode_page_jpeg(image, side);
                         texels[p] = {};
                     });
                     first = last;
@@ -2973,101 +3464,29 @@ namespace lfs::training {
                 observed += seen_here;
                 direct += direct_here;
                 total += count;
+                core::Tensor::trim_memory_pool();
+                size_t mask_bytes = 0;
+                for (const auto& entry : masks.entries)
+                    mask_bytes += entry.second.bits.size() * sizeof(uint32_t);
+                const auto batch_tag = std::format("tex_batch_{}", b);
+                log_phase_mem(batch_tag.c_str());
+                log_mesh_ledger(batch_tag.c_str(), mesh, 0, mask_bytes);
             }
+            log_phase_mem("tex_done");
+            log_mesh_ledger("tex_done", mesh);
             mesh.texels = total;
             mesh.observed_texel_share = total > 0 ? float(observed) / float(total) : 0.f;
             LOG_INFO("Mesh: {} pages, {} texels, {:.1f}% seen by a view, {:.1f}% of those take the face's own pixel",
                      page_count, total, 100.f * mesh.observed_texel_share, 100. * double(direct) / double(std::max<size_t>(observed, 1)));
+            if (settings.texture_local_seam_leveling)
+                LOG_INFO("Mesh: local seam leveling, {} border texels, {} diffused, {} iterations, max {:.2f}/255",
+                         seam_stats.seam_texels, seam_stats.band_texels, seam_stats.iterations, 255.f * seam_stats.max_delta);
         }
 
-        // The affine patch texture over the tile levels: one pass chooses every level's views, one pass over the
-        // photos textures them all, and the levels are assembled into the OSGB model. The mesh the viewer shows is
-        // the finest levels, whose pages stay in that model rather than another copy.
-        void bake_affine_tiled_texture(SplatMesh& mesh, core::SplatData& model, const std::span<core::Camera* const> views,
-                                       const core::SplatMeshSettings& settings, const int max_page, const int level_count,
-                                       cudaStream_t stream, const std::stop_token stop, const auto& report, const PPISP* appearance) {
-            auto step = Clock::now();
-            core::GlobalArenaManager::instance().get_arena().release_idle_for_pressure();
-            core::Tensor::trim_memory_pool();
-            std::vector<PatchTiledLevel> levels;
-            for (auto& geometry : build_tiled_level_geometry(mesh, settings.texel_size, max_page, level_count, settings.simplify_error, stop))
-                levels.push_back({.mesh = std::move(geometry.mesh), .face_views = {}, .texel = geometry.texel, .tile = geometry.tile,
-                                  .level = geometry.level, .center = geometry.center, .radius = geometry.radius});
-            mesh.seconds_unwrap = seconds_since(step);
-            step = Clock::now();
-            // One pass over the photos chooses the view of every level's faces, so that the levels of a tile agree.
-            auto combined = combine_patch_tiled_levels(levels);
-            const auto face_views = choose_mesh_face_views(combined, model, views, settings, stream,
-                                                           [&](const float value) { report(.15f * value); }).labels;
-            combined = {};
-            // The cameras the patches can read.
-            std::vector<int32_t> patch_of_view(views.size(), -1);
-            std::vector<PatchView> patch_views;
-            std::vector<core::Camera*> patch_camera;
-            for (size_t i = 0; i < views.size(); ++i) {
-                PatchView patch_view;
-                if (!views[i]->has_image() || !make_patch_view(*views[i], patch_view))
-                    continue;
-                patch_of_view[i] = static_cast<int32_t>(patch_views.size());
-                patch_views.push_back(patch_view);
-                patch_camera.push_back(views[i]);
-            }
-            size_t face_base = 0;
-            for (auto& level : levels) {
-                level.face_views.assign(level.mesh.faces.size(), -1);
-                for (size_t f = 0; f < level.mesh.faces.size(); ++f) {
-                    const int32_t view = face_views[face_base + f];
-                    if (view >= 0)
-                        level.face_views[f] = patch_of_view[size_t(view)];
-                }
-                face_base += level.mesh.faces.size();
-            }
-            // A photo and its depth, read once for every level that has patches of it.
-            auto bake_settings = settings;
-            bake_settings.max_width = settings.texture_width;
-            MaskCache masks;
-            std::vector<float> host_photo, host_depth;
-            const auto photo_source = [&](const size_t v, PatchBakePhoto& out) {
-                auto& camera = *patch_camera[v];
-                camera.load_image_size(1, settings.texture_width);
-                auto depth = render_median_depth(camera, model, bake_settings, stream, &masks);
-                auto photo = load_photo(camera, settings.texture_width)
-                                 .to(Device::CUDA, stream)
-                                 .to(core::DataType::Float32)
-                                 .contiguous();
-                if (appearance && appearance->is_known_camera(camera.camera_id()) && appearance->is_known_frame(camera.uid()))
-                    photo = appearance->invert(photo, camera.camera_id(), camera.uid(), stream).contiguous();
-                if (photo.numel() != size_t(patch_views[v].width) * patch_views[v].height * 3 ||
-                    depth.numel() != size_t(patch_views[v].width) * patch_views[v].height)
-                    return false;
-                host_photo.resize(photo.numel());
-                host_depth.resize(depth.numel());
-                LFS_CUDA_CHECK(cudaMemcpyAsync(host_photo.data(), photo.ptr<float>(), photo.numel() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                LFS_CUDA_CHECK(cudaMemcpyAsync(host_depth.data(), depth.ptr<float>(), depth.numel() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh patch photo");
-                out = {host_photo.data(), host_depth.data(), patch_views[v].width, patch_views[v].height};
-                return true;
-            };
-            auto textures = bake_patch_tiled_levels(levels, patch_views,
-                                                    {.page_size = max_page,
-                                                     .padding = 4,
-                                                     .texel_min = settings.texel_min,
-                                                     .base_tolerance = 2.5f * settings.voxel_size,
-                                                     .seam_leveling_mode = settings.seam_leveling_mode},
-                                                    photo_source,
-                                                    [&](const float value) { report(.15f + .85f * value); }, stop);
-            assemble_patch_tiled_mesh(levels, textures, mesh);
-            mesh.charts = mesh.tiled->combined.charts;
-            mesh.texels = mesh.tiled->combined.texels;
-            mesh.observed_texel_share = mesh.tiled->combined.observed_texel_share;
-            mesh.seconds_bake = seconds_since(step);
-            LOG_INFO("Mesh: {} pages, {} texels over {} tile levels, {:.1f}% seen by a view",
-                     mesh.tiled->combined.pages.size(), mesh.tiled->combined.texels, levels.size(),
-                     100.f * mesh.observed_texel_share);
-        }
         // The surface from the depth of the views: fused, cleaned up, colored at its vertices and reduced.
         void extract_surface(SplatMesh& mesh, core::SplatData& model, const std::span<core::Camera* const> views, const core::SplatMeshSettings& settings, cudaStream_t stream,
-                             const std::stop_token stop, const core::ProgressCallback& progress, const PPISP* appearance, const float geometry_share) {
+                             const std::stop_token stop, const core::ProgressCallback& progress, const PPISP* appearance, const float geometry_share,
+                             const std::filesystem::path& scratch_dir) {
             const auto stage = [](const std::string_view key, const char* diagnostic) { return std::string(core::collisionStage(key, diagnostic)); };
             // Widen the band to the local depth spacing where neighbouring pixels disagree, which is
             // the one lever that reaches voxels no view ever touched. Defaults come from the settings;
@@ -3096,9 +3515,18 @@ namespace lfs::training {
             if (const char* dir = std::getenv("LFS_MESH_DUMP_DIR"); dir != nullptr && *dir != '\0')
                 depth_dump.open(dir, settings, views.size(), tsdf.grid.trunc);
 
-            // Depth stays in RAM between the touch and the integrate passes, which need the block set first.
-            auto step = Clock::now();
+            // Depth stays between the touch and the integrate passes, which need the block set first. The
+            // spill keeps it beside the mesh output instead of in RAM unless that file cannot be written.
+            DepthSpill spill;
             std::vector<std::vector<float>> depths(views.size());
+            std::vector<float> depth_buffer;
+            if (!scratch_dir.empty()) {
+                if (spill.open(scratch_dir, views.size()))
+                    LOG_INFO("Mesh: {} depth maps spill to '{}'", views.size(), core::path_to_utf8(spill.path()));
+                else
+                    LOG_INFO("Mesh: keeping the depth maps in RAM");
+            }
+            auto step = Clock::now();
             DeviceArray<uint64_t> block_keys;
             Tensor rays;
             size_t block_count = 0;
@@ -3170,10 +3598,20 @@ namespace lfs::training {
                 touch_batches += view_batches;
                 split_touch_views += view_batches > 1;
                 seconds_touch += seconds_since(touch_start);
-                depths[i].resize(pixels);
-                LFS_CUDA_CHECK(cudaMemcpyAsync(depths[i].data(), depth.ptr<float>(), pixels * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh depth download");
-                depth_dump.write(i, camera.uid(), camera.image_name(), view.width, view.height, depths[i]);
+                if (spill.active()) {
+                    depth_buffer.resize(pixels);
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(depth_buffer.data(), depth.ptr<float>(), pixels * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh depth download");
+                    depth_dump.write(i, camera.uid(), camera.image_name(), view.width, view.height, depth_buffer);
+                    // A view the spill could not take stays in RAM, so fusion still has every depth.
+                    if (!spill.write(i, depth_buffer.data(), pixels))
+                        depths[i] = depth_buffer;
+                } else {
+                    depths[i].resize(pixels);
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(depths[i].data(), depth.ptr<float>(), pixels * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh depth download");
+                    depth_dump.write(i, camera.uid(), camera.image_name(), view.width, view.height, depths[i]);
+                }
             }
             rays = {};
             mesh.seconds_render = seconds_since(step) - seconds_touch;
@@ -3223,7 +3661,16 @@ namespace lfs::training {
                     const auto view = make_view(*views[i]);
                     auto depth = Tensor::empty({size_t(view.height), size_t(view.width)}, Device::CUDA);
                     depth.set_stream(stream);
-                    LFS_CUDA_CHECK(cudaMemcpyAsync(depth.ptr<float>(), depths[i].data(), depths[i].size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+                    // A view the spill took has an empty entry here; the rest were kept in RAM.
+                    const void* source = depths[i].data();
+                    if (depths[i].empty()) {
+                        depth_buffer.resize(size_t(view.height) * size_t(view.width));
+                        if (!spill.read(i, depth_buffer.data()))
+                            throw collisionError("mesh.spill", "Could not read back a depth map the mesh spilled to the output folder; check the disk it was written to",
+                                                 ErrorCode::ResourceExhausted);
+                        source = depth_buffer.data();
+                    }
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(depth.ptr<float>(), source, depths[i].empty() ? depth_buffer.size() * sizeof(float) : depths[i].size() * sizeof(float), cudaMemcpyHostToDevice, stream));
                     integrate_view(tsdf, view, depth, stream);
                     LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh fusion");
                 }
@@ -3235,7 +3682,15 @@ namespace lfs::training {
             tsdf = {};
             core::Tensor::trim_memory_pool();
             mesh.seconds_fusion = seconds_since(step);
+            if (spill.read_bytes() > 0)
+                LOG_INFO("Mesh: depth spill read {:.2f} GB back from the output disk",
+                         static_cast<double>(spill.read_bytes()) / double(size_t{1} << 30));
+            // Fusion is the last reader: hand the disk space back before the texture bake.
+            spill.close();
             log_phase_mem("after_fusion");
+            // Depths were only needed for TSDF integrate. Color rendering now produces depth on demand,
+            // so drop them before surface nets to avoid stacking ~15 GB with the band voxels.
+            depths = {};
             ram_preflight(voxels.keys.size());
 
             step = Clock::now();
@@ -3258,69 +3713,76 @@ namespace lfs::training {
             mesh.seconds_extract = seconds_since(step);
 
             step = Clock::now();
-            const auto vertex_count = static_cast<uint32_t>(mesh.vertices.size());
-            DeviceArray<float> vertices_device(size_t(vertex_count) * 3, stream);
-            LFS_CUDA_CHECK(cudaMemcpyAsync(vertices_device.data(), mesh.vertices.data(), size_t(vertex_count) * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
-            DeviceArray<float> color_sum(size_t(vertex_count) * 3, stream, true);
-            DeviceArray<float> color_weight(vertex_count, stream, true);
-            const float tolerance = 2.5f * settings.voxel_size;
-            for (size_t i = 0; i < views.size(); i += settings.color_stride) {
-                core::reportProgress(stop, progress, geometry_share * (.85f + .1f * float(i) / views.size()), stage("mesh.stage_color", "Coloring"));
-                auto& camera = *views[i];
-                if (!camera.has_image())
-                    continue;
-                const auto view = make_view(camera);
-                auto photo = load_photo(camera, settings.max_width);
-                const size_t pixels = size_t(view.width) * view.height;
-                if (photo.numel() != pixels * 3) {
-                    LOG_WARN("Mesh: photo size of {} does not match the render; skipping its colors", camera.image_name());
-                    continue;
+            // Colors the points from the photos of the views that see them. Runs on the fused surface, and
+            // again on the simplified one when reproject_vertex_colors asks the colors to describe what is
+            // exported.
+            const auto accumulate_colors = [&](const std::vector<std::array<float, 3>>& points,
+                                               const float share, const float span) {
+                const auto count = static_cast<uint32_t>(points.size());
+                DeviceArray<float> device_points(size_t(count) * 3, stream);
+                LFS_CUDA_CHECK(cudaMemcpyAsync(device_points.data(), points.data(), size_t(count) * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
+                DeviceArray<float> color_sum(size_t(count) * 3, stream, true);
+                DeviceArray<float> color_weight(count, stream, true);
+                const float tolerance = 2.5f * settings.voxel_size;
+                size_t corrected = 0;
+                for (size_t i = 0; i < views.size(); i += settings.color_stride) {
+                    core::reportProgress(stop, progress, share + span * float(i) / float(views.size()), stage("mesh.stage_color", "Coloring"));
+                    auto& camera = *views[i];
+                    if (!camera.has_image())
+                        continue;
+                    const auto view = make_view(camera);
+                    auto photo = load_photo(camera, settings.max_width);
+                    const size_t pixels = size_t(view.width) * view.height;
+                    if (photo.numel() != pixels * 3) {
+                        LOG_WARN("Mesh: photo size of {} does not match the render; skipping its colors", camera.image_name());
+                        continue;
+                    }
+                    photo = photo.to(Device::CUDA, stream).to(core::DataType::Float32).contiguous();
+                    if (appearance && appearance->is_known_camera(camera.camera_id()) && appearance->is_known_frame(camera.uid())) {
+                        photo = appearance->invert(photo, camera.camera_id(), camera.uid(), stream);
+                        ++corrected;
+                    }
+                    // Render median depth on the GPU directly (no round-trip through CPU RAM). Depth
+                    // rendering is deterministic (same camera + same model -> same tensor), so the kernel
+                    // receives bit-identical values as the old CPU-backed path.
+                    auto depth = render_median_depth(camera, model, settings, stream);
+                    gsplat_lfs::mesh_color_accumulate(device_points.data(), count, view, depth.ptr<float>(), photo.ptr<float>(), tolerance, color_sum.data(), color_weight.data(), stream);
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh color");
                 }
-                photo = photo.to(Device::CUDA, stream).to(core::DataType::Float32).contiguous();
-                if (appearance && appearance->is_known_camera(camera.camera_id()) && appearance->is_known_frame(camera.uid())) {
-                    photo = appearance->invert(photo, camera.camera_id(), camera.uid(), stream);
-                    ++mesh.views_color_corrected;
+                std::vector<float> sums(size_t(count) * 3);
+                std::vector<float> weights(count);
+                LFS_CUDA_CHECK(cudaMemcpyAsync(sums.data(), color_sum.data(), sums.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                LFS_CUDA_CHECK(cudaMemcpyAsync(weights.data(), color_weight.data(), weights.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh color download");
+                std::vector<std::array<uint8_t, 3>> colors(count);
+                size_t colored = 0;
+                for (size_t v = 0; v < count; ++v) {
+                    colored += weights[v] > 0.f;
+                    for (int c = 0; c < 3; ++c) {
+                        const float value = weights[v] > 0.f ? 255.f * sums[3 * v + c] / weights[v] : 128.f;
+                        colors[v][c] = static_cast<uint8_t>(std::clamp(std::lround(value), 0l, 255l));
+                    }
                 }
-                auto depth = Tensor::empty({size_t(view.height), size_t(view.width)}, Device::CUDA);
-                depth.set_stream(stream);
-                LFS_CUDA_CHECK(cudaMemcpyAsync(depth.ptr<float>(), depths[i].data(), depths[i].size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-                gsplat_lfs::mesh_color_accumulate(vertices_device.data(), vertex_count, view, depth.ptr<float>(), photo.ptr<float>(), tolerance, color_sum.data(), color_weight.data(), stream);
-                LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh color");
-            }
-            std::vector<float> sums(size_t(vertex_count) * 3);
-            std::vector<float> weights(vertex_count);
-            LFS_CUDA_CHECK(cudaMemcpyAsync(sums.data(), color_sum.data(), sums.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-            LFS_CUDA_CHECK(cudaMemcpyAsync(weights.data(), color_weight.data(), weights.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-            LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh color download");
-            mesh.colors.resize(vertex_count);
-            size_t colored = 0;
-            for (size_t v = 0; v < vertex_count; ++v) {
-                colored += weights[v] > 0.f;
-                for (int c = 0; c < 3; ++c) {
-                    const float value = weights[v] > 0.f ? 255.f * sums[3 * v + c] / weights[v] : 128.f;
-                    mesh.colors[v][c] = static_cast<uint8_t>(std::clamp(std::lround(value), 0l, 255l));
-                }
-            }
-            mesh.colored_vertex_share = float(colored) / float(vertex_count);
+                mesh.colored_vertex_share = float(colored) / float(count);
+                return std::pair{std::move(colors), corrected};
+            };
+            const auto fused = accumulate_colors(mesh.vertices, geometry_share * .85f, geometry_share * .1f);
+            mesh.colors = fused.first;
+            mesh.views_color_corrected = fused.second;
             mesh.seconds_color = seconds_since(step);
             LOG_INFO("Mesh: colored with the trained appearance taken out of {} views", mesh.views_color_corrected);
-            // Reducing faces is the peak of RAM use; it needs none of these, and recomputes the normals.
-            depths = {};
-            sums = {};
-            weights = {};
             if (settings.simplify_error > 0.f)
                 mesh.normals = {};
-            vertices_device = {};
-            color_sum = {};
-            color_weight = {};
             core::Tensor::trim_memory_pool();
             core::reportProgress(stop, progress, geometry_share * .95f, stage("mesh.stage_simplify", "Reducing faces"));
             log_phase_mem("before_simplify");
             step = Clock::now();
-            simplify_splat_mesh(mesh, settings.simplify_error, kSimplifyColorWeight);
+            simplify_splat_mesh(mesh, settings.simplify_error, settings.simplify_color_weight, 3'000'000,
+                                settings.simplify_seam_thinning);
             mesh.seconds_simplify = seconds_since(step);
-            LOG_INFO("Mesh: simplification in {:.2f}s, {} vertices, {} faces", mesh.seconds_simplify,
-                     mesh.vertices.size(), mesh.faces.size());
+            LOG_INFO("Mesh: simplification in {:.2f}s, {} vertices, {} -> {} faces (color weight {:.2g})",
+                     mesh.seconds_simplify, mesh.vertices.size(), mesh.faces_before_simplify, mesh.faces.size(),
+                     settings.simplify_color_weight);
             log_phase_mem("after_simplify");
             // Reducing faces moves the kept vertices and merges their neighbors, which can leave the
             // same corner several times. Cleaning after the decimation keeps that damage off the raw
@@ -3368,6 +3830,15 @@ namespace lfs::training {
             sub = Clock::now();
             compute_splat_mesh_normals(mesh);
             LOG_INFO("Mesh: surface after cleanup is {:.0f} m2, normals in {:.2f}s", mesh.area, seconds_since(sub));
+            // The simplifier interpolates the colors and the seam thinning averages them, so the colors of the fused surface no longer describe the surface that is exported.
+            // Depth is rendered on demand inside accumulate_colors, so there is no RAM cost to re-render it here.
+            if (settings.reproject_vertex_colors) {
+                const auto recolor = Clock::now();
+                const auto simplified = accumulate_colors(mesh.vertices, geometry_share * .96f, geometry_share * .03f);
+                mesh.colors = simplified.first;
+                LOG_INFO("Mesh: colors reprojected onto the simplified surface, {:.0f}% of its vertices seen, in {:.2f}s",
+                         double(mesh.colored_vertex_share) * 100., seconds_since(recolor));
+            }
             // No topology clean after the final hole fill. A full clean would collapse coincident
             // vertices and split non-manifold ones, which can reopen holes the fills just closed.
             // The non-manifold-only pass already happens before that final fill so its light touch
@@ -3386,11 +3857,12 @@ namespace lfs::training {
 
     SplatMesh extract_splat_mesh(core::SplatData& model, const std::span<core::Camera* const> cameras,
                                  const core::SplatMeshSettings& settings, const std::stop_token stop, const core::ProgressCallback& progress,
-                                 const PPISP* appearance) try {
+                                 const PPISP* appearance, const std::filesystem::path& scratch_dir) try {
         validate(settings);
+        log_phase_mem("mesh_start");
         const auto stage = [](const std::string_view key, const char* diagnostic) { return std::string(core::collisionStage(key, diagnostic)); };
         // Baking takes about as long as all the rest.
-        const float geometry_share = settings.texel_size > 0.f ? .5f : 1.f;
+        const float geometry_share = settings.bake_texture ? .5f : 1.f;
         std::vector<core::Camera*> views;
         for (size_t i = 0; i < cameras.size(); i += settings.view_stride)
             if (cameras[i])
@@ -3424,6 +3896,12 @@ namespace lfs::training {
             LOG_INFO("Mesh: hole perimeter {:.4f} = {:.0f} x voxel size (auto)", resolved.fill_hole_perimeter,
                      kAutoHolePerimeterVoxels);
         }
+        // A zero texel asks for a quarter of the voxel, so the page detail follows the surface the
+        // voxel resolved instead of needing its own per-scene number.
+        if (resolved.bake_texture && !(resolved.texel_size > 0.f)) {
+            resolved.texel_size = kAutoTexelVoxels * resolved.voxel_size;
+            LOG_INFO("Mesh: texel size {:.4f} = {:.2f} x voxel size (auto)", resolved.texel_size, kAutoTexelVoxels);
+        }
 
         const auto stream = core::getCurrentCUDAStream();
         SplatMesh mesh;
@@ -3434,7 +3912,7 @@ namespace lfs::training {
                 sizes.saved.push_back({camera, camera->image_width(), camera->image_height(), camera->image_size_loaded()});
 
         if (settings.from_mesh.empty()) {
-            extract_surface(mesh, model, views, resolved, stream, stop, progress, appearance, geometry_share);
+            extract_surface(mesh, model, views, resolved, stream, stop, progress, appearance, geometry_share, scratch_dir);
         } else {
             core::reportProgress(stop, progress, 0.f, stage("mesh.stage_read", "Reading mesh"));
             auto read = read_splat_mesh_ply(core::utf8_to_path(settings.from_mesh));
@@ -3443,54 +3921,44 @@ namespace lfs::training {
             LOG_INFO("Mesh: {} vertices and {} faces from {}", mesh.vertices.size(), mesh.faces.size(), settings.from_mesh);
         }
         auto step = Clock::now();
-        if (settings.texel_size > 0.f) {
-            // Two texturing paths, kept side by side for comparison: the atlas one the mesh has always had,
-            // and the affine patch one, where every patch of one photo is painted from that photo alone.
-            texture_ram_preflight(mesh, settings);
+        if (resolved.bake_texture) {
+            texture_ram_preflight(mesh, resolved);
             step = Clock::now();
             std::vector<core::Camera*> all_views;
             for (auto* camera : cameras)
                 if (camera)
                     all_views.push_back(camera);
-            if (resolved.texture_mode != 0) {
-                // The affine patch texture over the tile levels: the same LOD and OSGB the atlas path writes,
-                // baked from each patch's own photo.
-                core::reportProgress(stop, progress, .5f, stage("mesh.stage_unwrap", "Building tiles"));
-                bake_affine_tiled_texture(mesh, model, all_views, resolved, std::min(resolved.texture_size, kOsgbMaxPage),
-                                          std::clamp(resolved.lod_levels, 1, kOsgbMaxLevels), stream, stop,
-                                          [&](const float value) {
-                                              core::reportProgress(stop, progress, .5f + .5f * value, stage("mesh.stage_bake", "Baking texture"));
-                                          },
-                                          appearance);
-            } else {
-                core::reportProgress(stop, progress, .5f, stage("mesh.stage_unwrap", "Unwrapping"));
-                const int levels = std::clamp(resolved.lod_levels, 1, kOsgbMaxLevels);
-                // A tile's texel follows the photos that see it, so the choice needs them first: the view that sets each
-                // face's detail, then what one pixel of it covers there.
-                std::vector<float> gsd;
-                {
-                    auto choice = choose_mesh_face_views(mesh, model, all_views, resolved, stream,
-                                                         [&](const float value) { core::reportProgress(stop, progress, .5f + .07f * value, stage("mesh.stage_unwrap", "Reading the photos")); });
-                    gsd = vertex_gsd(mesh, choice.candidates, choice.labels, all_views, stop);
-                }
-                mesh.tiled = std::make_shared<TiledMesh>(build_tiled_mesh(mesh, resolved.texel_size, std::min(resolved.texture_size, kOsgbMaxPage), levels, resolved.simplify_error, stop, 150'000, gsd));
-                mesh.seconds_unwrap = seconds_since(step);
-                step = Clock::now();
-                // The levels of a tile stay together, and tiles come in the order of the splits: neighbors in the list are neighbors in space.
-                std::vector<std::pair<size_t, size_t>> page_groups;
-                for (const auto& level : mesh.tiled->levels) {
-                    const size_t last = level.first_page + level.page_count;
-                    if (level.level == 0 || page_groups.empty())
-                        page_groups.push_back({level.first_page, last});
-                    else
-                        page_groups.back().second = last;
-                }
-                bake_texture(mesh.tiled->combined, model, all_views, resolved, stream, [&](const float value) { core::reportProgress(stop, progress, .6f + .4f * value, stage("mesh.stage_bake", "Baking texture")); }, appearance, page_groups);
-                mesh.seconds_bake = seconds_since(step);
-                mesh.charts = mesh.tiled->combined.charts;
-                mesh.texels = mesh.tiled->combined.texels;
-                mesh.observed_texel_share = mesh.tiled->combined.observed_texel_share;
+            core::reportProgress(stop, progress, .5f, stage("mesh.stage_unwrap", "Unwrapping"));
+            const int levels = std::clamp(resolved.lod_levels, 1, kOsgbMaxLevels);
+            // A tile's texel follows the photos that see it, so the choice needs them first: the view that sets each
+            // face's detail, then what one pixel of it covers there.
+            std::vector<float> gsd;
+            {
+                auto choice = choose_mesh_face_views(mesh, model, all_views, resolved, stream,
+                                                     [&](const float value) { core::reportProgress(stop, progress, .5f + .07f * value, stage("mesh.stage_unwrap", "Reading the photos")); });
+                gsd = vertex_gsd(mesh, choice.candidates, choice.labels, all_views, stop);
             }
+            mesh.tiled = std::make_shared<TiledMesh>(build_tiled_mesh(mesh, resolved.texel_size, std::min(resolved.texture_size, kOsgbMaxPage), levels, resolved.simplify_error, stop, 150'000, gsd));
+            mesh.seconds_unwrap = seconds_since(step);
+            log_phase_mem("after_unwrap");
+            log_mesh_ledger("after_unwrap", mesh.tiled->combined);
+            step = Clock::now();
+            // The levels of a tile stay together, and tiles come in the order of the splits: neighbors in the list are neighbors in space.
+            std::vector<std::pair<size_t, size_t>> page_groups;
+            for (const auto& level : mesh.tiled->levels) {
+                const size_t last = level.first_page + level.page_count;
+                if (level.level == 0 || page_groups.empty())
+                    page_groups.push_back({level.first_page, last});
+                else
+                    page_groups.back().second = last;
+            }
+            bake_texture(mesh.tiled->combined, model, all_views, resolved, stream, [&](const float value) { core::reportProgress(stop, progress, .6f + .4f * value, stage("mesh.stage_bake", "Baking texture")); }, appearance, page_groups);
+            mesh.seconds_bake = seconds_since(step);
+            log_phase_mem("after_texture");
+            log_mesh_ledger("after_texture", mesh.tiled->combined);
+            mesh.charts = mesh.tiled->combined.charts;
+            mesh.texels = mesh.tiled->combined.texels;
+            mesh.observed_texel_share = mesh.tiled->combined.observed_texel_share;
         }
         return mesh;
     } catch (const std::bad_alloc&) {
@@ -3748,9 +4216,7 @@ namespace lfs::training {
         }
         core::MeshData data(std::move(vertices), std::move(indices));
         data.normals = std::move(normals);
-        // The affine path keeps the finest levels' pages in the tiled model, where OSGB writes them; only those the
-        // base mesh refers to are uploaded.
-        const auto& pages = mesh.pages_in_tiled && mesh.tiled ? mesh.tiled->combined.pages : mesh.pages;
+        const auto& pages = mesh.pages;
         const size_t page_count = mesh.page_first_face.empty() ? 0 : mesh.page_first_face.size() - 1;
         if (pages.empty() || pages.size() < page_count) {
             data.colors = std::move(colors);

@@ -269,7 +269,7 @@ namespace {
         lfs::app::HeadlessRunCoordinator coordinator;
         const auto mesh = training::extract_splat_mesh(
             trainer.get_strategy_mutable().get_model(), cameras, settings, coordinator.stop_token(), {},
-            trainer.hasPPISP() ? trainer.getPPISP() : nullptr);
+            trainer.hasPPISP() ? trainer.getPPISP() : nullptr, cli.mesh_output.parent_path());
         training::write_splat_mesh_ply(mesh, cli.mesh_output);
         if (mesh.tiled) {
             auto folder = cli.mesh_output;

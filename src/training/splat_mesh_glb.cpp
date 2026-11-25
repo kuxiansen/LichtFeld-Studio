@@ -16,7 +16,6 @@
 #include <format>
 #include <fstream>
 #include <nlohmann/json.hpp>
-#include <stb_image_write.h>
 #include <string>
 #include <vector>
 
@@ -31,7 +30,6 @@ namespace lfs::training {
         constexpr uint32_t kGlbMagic = 0x46546C67; // "glTF"
         constexpr uint32_t kChunkJson = 0x4E4F534A;
         constexpr uint32_t kChunkBin = 0x004E4942;
-        constexpr int kJpegQuality = 95;
 
         // The scene is right-handed with y down and z forward, as the PLY and SPZ exports treat it; glTF is y up
         // with z back. Flipping y and z is a rotation, so triangle winding stays as it is.
@@ -42,20 +40,6 @@ namespace lfs::training {
             const float s = float(value) / 255.f;
             const float linear = s <= .04045f ? s / 12.92f : std::pow((s + .055f) / 1.055f, 2.4f);
             return static_cast<uint8_t>(std::lround(255.f * linear));
-        }
-
-        [[nodiscard]] std::vector<uint8_t> encode_page_jpeg(const std::vector<uint8_t>& rgb, const int side,
-                                                            const std::string& name) {
-            std::vector<uint8_t> jpeg;
-            const auto append = [](void* context, void* data, const int size) {
-                auto* out = static_cast<std::vector<uint8_t>*>(context);
-                const auto* bytes = static_cast<const uint8_t*>(data);
-                out->insert(out->end(), bytes, bytes + size);
-            };
-            if (side <= 0 || rgb.size() < size_t(side) * size_t(side) * 3 ||
-                !stbi_write_jpg_to_func(append, &jpeg, side, side, 3, rgb.data(), kJpegQuality))
-                throw collisionError("mesh.write_failed", "Could not write the mesh texture", ErrorCode::Unavailable, name);
-            return jpeg;
         }
 
         struct Block {
@@ -84,7 +68,7 @@ namespace lfs::training {
         const std::vector<std::vector<uint8_t>>* pages = nullptr;
         std::vector<size_t> surface_pages;
         if (mesh.page_first_face.size() > 1 && mesh.uvs.size() == mesh.vertices.size()) {
-            const auto& source = mesh.pages_in_tiled && mesh.tiled ? mesh.tiled->combined.pages : mesh.pages;
+            const auto& source = mesh.pages;
             if (source.size() >= mesh.page_first_face.size() - 1) {
                 pages = &source;
                 surface_pages.resize(mesh.page_first_face.size() - 1);
@@ -125,11 +109,10 @@ namespace lfs::training {
         if (textured) {
             jpegs.reserve(ranges.size());
             for (const auto& range : ranges) {
-                const auto side = surface->page_side(range.page);
-                if (side <= 0 || (*pages)[range.page].size() < size_t(side) * size_t(side) * 3)
+                if ((*pages)[range.page].empty())
                     throw collisionError("mesh.write_failed", "The mesh texture page is incomplete", ErrorCode::Unavailable,
                                          path_text);
-                jpegs.push_back(encode_page_jpeg((*pages)[range.page], side, std::format("page_{}", range.page)));
+                jpegs.push_back((*pages)[range.page]);
             }
         }
 

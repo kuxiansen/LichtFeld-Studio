@@ -5,15 +5,19 @@
 #include "splat_mesh.hpp"
 #include "splat_mesh_parallel.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <span>
+#include <unordered_map>
 #include <xatlas/xatlas.h>
 
 namespace lfs::training {
@@ -827,6 +831,265 @@ namespace lfs::training {
                     out[i] = static_cast<uint8_t>(std::clamp(std::lround(float(original[i]) + amount * (float(original[i]) - blurred[i])), 0l, 255l));
             }
         }
+    }
+
+    namespace {
+        constexpr int kLocalSeamBandTexels = 16;
+        constexpr float kLocalSeamCoreTexels = 1.f;
+        constexpr int kLocalSeamMaxIterations = 400;
+        constexpr float kLocalSeamTolerance = 1e-4f;
+        constexpr float kLocalSeamOverRelaxation = 1.8f;
+
+        struct LocalSeamTexel {
+            uint32_t texel = 0;   // into MeshTexels
+            uint32_t pixel = 0;
+            int32_t label = -1;
+            bool fixed = false;   // on the seam: delta is the mean of both sides, not an unknown
+            std::array<float, 3> delta{};
+        };
+
+        [[nodiscard]] std::array<float, 3> closest_point_on_segment(const std::array<float, 3>& point, const std::array<float, 3>& a, const std::array<float, 3>& b) {
+            const float ab[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+            const float ap[3] = {point[0] - a[0], point[1] - a[1], point[2] - a[2]};
+            const float denominator = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+            const float t = denominator > 0.f ? std::clamp((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / denominator, 0.f, 1.f) : 0.f;
+            return {a[0] + t * ab[0], a[1] + t * ab[1], a[2] + t * ab[2]};
+        }
+
+        [[nodiscard]] float distance_squared(const std::array<float, 3>& a, const std::array<float, 3>& b) {
+            const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+            return dx * dx + dy * dy + dz * dz;
+        }
+
+        // The UV of a point on a face, weighted the same way ColorLeveling::offset_at does.
+        [[nodiscard]] std::array<float, 2> face_uv_at(const SplatMesh& mesh, const uint32_t face, const std::array<float, 3>& position) {
+            const auto& corner = mesh.faces[face];
+            const auto& a = mesh.vertices[size_t(corner[0])];
+            const auto& b = mesh.vertices[size_t(corner[1])];
+            const auto& c = mesh.vertices[size_t(corner[2])];
+            const float u[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+            const float v[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+            const float p[3] = {position[0] - a[0], position[1] - a[1], position[2] - a[2]};
+            const auto dot = [](const float* x, const float* y) { return x[0] * y[0] + x[1] * y[1] + x[2] * y[2]; };
+            const float uu = dot(u, u), uv = dot(u, v), vv = dot(v, v), pu = dot(p, u), pv = dot(p, v);
+            const float area = uu * vv - uv * uv;
+            const float wb = area > 0.f ? std::clamp((vv * pu - uv * pv) / area, 0.f, 1.f) : 0.f;
+            const float wc = area > 0.f ? std::clamp((uu * pv - uv * pu) / area, 0.f, 1.f - wb) : 0.f;
+            const float wa = 1.f - wb - wc;
+            const auto& ua = mesh.uvs[size_t(corner[0])];
+            const auto& ub = mesh.uvs[size_t(corner[1])];
+            const auto& uc = mesh.uvs[size_t(corner[2])];
+            return {wa * ua[0] + wb * ub[0] + wc * uc[0], wa * ua[1] + wb * ub[1] + wc * uc[1]};
+        }
+
+        // The page texel of `face` nearest to a UV, or -1. Texels are sorted by pixel, so a small window finds it.
+        [[nodiscard]] int64_t find_page_texel(const MeshTexels& texels, const int side, const float u, const float v, const uint32_t face, const int radius) {
+            const int cx = std::clamp(int(std::floor(u * float(side))), 0, side - 1);
+            const int cy = std::clamp(int(std::floor(v * float(side))), 0, side - 1);
+            int64_t best = -1;
+            int best_distance = std::numeric_limits<int>::max();
+            for (int dy = -radius; dy <= radius; ++dy) {
+                const int y = cy + dy;
+                if (y < 0 || y >= side)
+                    continue;
+                for (int dx = -radius; dx <= radius; ++dx) {
+                    const int x = cx + dx;
+                    if (x < 0 || x >= side)
+                        continue;
+                    const uint32_t pixel = uint32_t(y) * uint32_t(side) + uint32_t(x);
+                    const auto it = std::lower_bound(texels.pixels.begin(), texels.pixels.end(), pixel);
+                    if (it == texels.pixels.end() || *it != pixel)
+                        continue;
+                    const size_t index = size_t(it - texels.pixels.begin());
+                    if (texels.faces[index] != face)
+                        continue;
+                    const int distance = dx * dx + dy * dy;
+                    if (distance < best_distance) {
+                        best_distance = distance;
+                        best = int64_t(index);
+                    }
+                }
+            }
+            return best;
+        }
+    }
+
+    SeamLevelingStats level_mesh_page_seams(const SplatMesh& mesh, const MeshTexels& texels, const std::span<const int32_t> face_views,
+                                            const size_t page, std::vector<float>& colors) {
+        SeamLevelingStats stats;
+        if (face_views.empty() || texels.pixels.empty() || mesh.page_first_face.size() < 2 ||
+            page + 1 >= mesh.page_first_face.size() || page >= mesh.page_texels.size())
+            return stats;
+        const size_t first = mesh.page_first_face[page], last = mesh.page_first_face[page + 1];
+        if (first >= last || last > face_views.size() || mesh.uvs.size() != mesh.vertices.size())
+            return stats;
+        const float texel = mesh.page_texels[page];
+        if (!(texel > 0.f))
+            return stats;
+        const float band_distance = texel * float(kLocalSeamBandTexels), core_distance = texel * kLocalSeamCoreTexels;
+
+        // The surface edges that join two faces of different views: OpenMVS's seam edges.
+        struct EdgeEntry {
+            uint64_t key;
+            uint32_t face;
+            uint8_t edge;
+        };
+        const auto source = [&](const int32_t vertex) {
+            return mesh.uv_source.empty() ? vertex : mesh.uv_source[size_t(vertex)];
+        };
+        std::vector<EdgeEntry> edges;
+        edges.reserve(3 * (last - first));
+        for (size_t f = first; f < last; ++f) {
+            const auto& corner = mesh.faces[f];
+            for (uint8_t e = 0; e < 3; ++e) {
+                const int32_t a = source(corner[e]), b = source(corner[(e + 1) % 3]);
+                const uint32_t low = uint32_t(std::min(a, b)), high = uint32_t(std::max(a, b));
+                edges.push_back({(uint64_t(low) << 32) | uint64_t(high), uint32_t(f), e});
+            }
+        }
+        std::sort(edges.begin(), edges.end(), [](const EdgeEntry& left, const EdgeEntry& right) {
+            return left.key != right.key ? left.key < right.key : left.face != right.face ? left.face < right.face : left.edge < right.edge;
+        });
+        struct OtherSide {
+            uint32_t face;
+            uint8_t edge;
+        };
+        std::unordered_map<uint64_t, OtherSide> seam;
+        std::vector<uint8_t> seam_mask(last - first, 0);
+        for (size_t i = 0; i < edges.size();) {
+            size_t end = i + 1;
+            while (end < edges.size() && edges[end].key == edges[i].key)
+                ++end;
+            for (size_t k = i; k + 1 < end; k += 2) {
+                const auto& a = edges[k];
+                const auto& b = edges[k + 1];
+                const int32_t la = face_views[a.face], lb = face_views[b.face];
+                if (a.face == b.face || la < 0 || lb < 0 || la == lb)
+                    continue;
+                seam.emplace(uint64_t(a.face) * 3 + a.edge, OtherSide{b.face, b.edge});
+                seam.emplace(uint64_t(b.face) * 3 + b.edge, OtherSide{a.face, a.edge});
+                seam_mask[size_t(a.face) - first] |= uint8_t(1u << a.edge);
+                seam_mask[size_t(b.face) - first] |= uint8_t(1u << b.edge);
+            }
+            i = end;
+        }
+        std::vector<EdgeEntry>().swap(edges);
+        if (seam.empty())
+            return stats;
+
+        const int side = mesh.page_side(page);
+        std::vector<LocalSeamTexel> band;
+        std::unordered_map<uint32_t, uint32_t> index;
+        for (size_t t = 0; t < texels.pixels.size(); ++t) {
+            const uint32_t face = texels.faces[t];
+            if (face < first || face >= last)
+                continue;
+            const int32_t label = face_views[face];
+            if (label < 0 || colors[3 * t] < 0.f)
+                continue;
+            const uint8_t mask = seam_mask[size_t(face) - first];
+            if (!mask)
+                continue;
+            const std::array<float, 3> point{texels.positions[3 * t], texels.positions[3 * t + 1], texels.positions[3 * t + 2]};
+            float best = std::numeric_limits<float>::max();
+            uint8_t best_edge = 0;
+            uint32_t other_face = 0;
+            for (uint8_t e = 0; e < 3; ++e) {
+                if (!(mask & (1u << e)))
+                    continue;
+                const auto it = seam.find(uint64_t(face) * 3 + e);
+                if (it == seam.end())
+                    continue;
+                const auto& corner = mesh.faces[face];
+                const auto& a = mesh.vertices[size_t(corner[e])];
+                const auto& b = mesh.vertices[size_t(corner[(e + 1) % 3])];
+                const float distance = distance_squared(point, closest_point_on_segment(point, a, b));
+                if (distance < best) {
+                    best = distance;
+                    best_edge = e;
+                    other_face = it->second.face;
+                }
+            }
+            if (best > band_distance * band_distance)
+                continue;
+            LocalSeamTexel texel_entry;
+            texel_entry.texel = uint32_t(t);
+            texel_entry.pixel = texels.pixels[t];
+            texel_entry.label = label;
+            if (best <= core_distance * core_distance) {
+                const auto& corner = mesh.faces[face];
+                const auto& a = mesh.vertices[size_t(corner[best_edge])];
+                const auto& b = mesh.vertices[size_t(corner[(best_edge + 1) % 3])];
+                const auto uv = face_uv_at(mesh, other_face, closest_point_on_segment(point, a, b));
+                const int64_t other = find_page_texel(texels, side, uv[0], uv[1], other_face, 4);
+                if (other < 0 || colors[3 * size_t(other)] < 0.f)
+                    continue;
+                texel_entry.fixed = true;
+                for (size_t c = 0; c < 3; ++c)
+                    texel_entry.delta[c] = .5f * (colors[3 * size_t(other) + c] - colors[3 * t + c]);
+                ++stats.seam_texels;
+            }
+            const uint32_t at = uint32_t(band.size());
+            if (!index.emplace(texel_entry.pixel, at).second)
+                continue;
+            band.push_back(texel_entry);
+        }
+
+        size_t unknowns = 0;
+        for (const auto& entry : band)
+            unknowns += entry.fixed ? 0 : 1;
+        stats.band_texels = unknowns;
+        if (unknowns > 0) {
+            std::vector<std::array<float, 3>> values(band.size());
+            for (size_t i = 0; i < band.size(); ++i)
+                values[i] = band[i].delta;
+            for (int iteration = 0; iteration < kLocalSeamMaxIterations; ++iteration) {
+                float change = 0.f;
+                for (int phase = 0; phase < 2; ++phase)
+                    for (size_t i = 0; i < band.size(); ++i) {
+                        const auto& entry = band[i];
+                        if (entry.fixed)
+                            continue;
+                        const int x = int(entry.pixel % uint32_t(side)), y = int(entry.pixel / uint32_t(side));
+                        if (((x + y) & 1) != phase)
+                            continue;
+                        const int nx[4] = {x - 1, x + 1, x, x}, ny[4] = {y, y, y - 1, y + 1};
+                        std::array<float, 3> sum{};
+                        for (int n = 0; n < 4; ++n) {
+                            if (nx[n] < 0 || nx[n] >= side || ny[n] < 0 || ny[n] >= side)
+                                continue;
+                            const auto it = index.find(uint32_t(ny[n]) * uint32_t(side) + uint32_t(nx[n]));
+                            if (it == index.end())
+                                continue;
+                            const auto& neighbor = band[it->second];
+                            // The other side of the seam is its own band, so it is not a boundary for this one.
+                            if (neighbor.label != entry.label)
+                                continue;
+                            const auto& value = neighbor.fixed ? neighbor.delta : values[it->second];
+                            for (size_t c = 0; c < 3; ++c)
+                                sum[c] += value[c];
+                        }
+                        for (size_t c = 0; c < 3; ++c) {
+                            const float next = values[i][c] + kLocalSeamOverRelaxation * (.25f * sum[c] - values[i][c]);
+                            change = std::max(change, std::abs(next - values[i][c]));
+                            values[i][c] = next;
+                        }
+                    }
+                stats.iterations = iteration + 1;
+                if (change < kLocalSeamTolerance)
+                    break;
+            }
+            for (size_t i = 0; i < band.size(); ++i)
+                if (!band[i].fixed)
+                    band[i].delta = values[i];
+        }
+
+        for (const auto& entry : band)
+            for (size_t c = 0; c < 3; ++c) {
+                colors[3 * size_t(entry.texel) + c] = std::max(colors[3 * size_t(entry.texel) + c] + entry.delta[c], 0.f);
+                stats.max_delta = std::max(stats.max_delta, std::abs(entry.delta[c]));
+            }
+        return stats;
     }
 
     WeldedVertices weld_chart_seams(const SplatMesh& mesh) {

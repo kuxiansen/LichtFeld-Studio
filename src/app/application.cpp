@@ -1336,7 +1336,8 @@ namespace lfs::app {
                 const bool trained = params->resume_project || params->resume_checkpoint;
                 const auto mesh = training::extract_splat_mesh(trainer->get_strategy_mutable().get_model(), cameras, *params->mesh_settings,
                                                                run.stop_token(), std::bind_front(&TerminalProgressBar::report, &bar),
-                                                               trained && trainer->hasPPISP() ? trainer->getPPISP() : nullptr);
+                                                               trained && trainer->hasPPISP() ? trainer->getPPISP() : nullptr,
+                                                               params->mesh_output.parent_path());
                 core::native_fs::create_directories(params->mesh_output.parent_path());
                 training::write_splat_mesh_ply(mesh, params->mesh_output);
                 if (mesh.tiled) {

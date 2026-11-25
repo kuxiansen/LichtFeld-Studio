@@ -21,6 +21,7 @@ SPECS = {
     "full_weight_range": ScrubFieldSpec(0, 1000, .1, "%.3g"),
     "min_views": ScrubFieldSpec(1, 64, 1, "%.0f"),
     "simplify_error": ScrubFieldSpec(0, .05, .001, "%.3g"),
+    "simplify_color_weight": ScrubFieldSpec(0, 2, .05, "%.2g"),
     "trunc_gradient": ScrubFieldSpec(0, 5, .05, "%.2f"),
     "trunc_cap": ScrubFieldSpec(0, 2, .01, "%.2f"),
     "clean_topology": ScrubFieldSpec(0, 1, 1, "%.0f"),
@@ -35,14 +36,15 @@ SPECS = {
     "isolated_component_neighbor_radius": ScrubFieldSpec(0, 50, 1, "%.0f"),
     "max_range": ScrubFieldSpec(0, 1000, 1, "%.3g"),
     "texel_size": ScrubFieldSpec(0, .05, .0005, "%.3g"),
-    "texel_min": ScrubFieldSpec(0, .01, .0005, "%.3g"),
     "texture_size": ScrubFieldSpec(512, 8192, 512, "%.0f"),
     "texture_sharpen": ScrubFieldSpec(0, 2, .05, "%.2g"),
     "lod_levels": ScrubFieldSpec(1, 4, 1, "%.0f"),
 }
 LABELS = {"voxel_size": "main_panel.voxel_size", "view_stride": "mesh.view_stride",
           "full_weight_range": "mesh.full_weight_range", "min_views": "mesh.min_views",
-          "simplify_error": "mesh.simplify_error", "trunc_gradient": "mesh.trunc_gradient",
+          "simplify_error": "mesh.simplify_error",
+          "simplify_color_weight": "mesh.simplify_color_weight",
+          "trunc_gradient": "mesh.trunc_gradient",
           "trunc_cap": "mesh.trunc_cap", "clean_topology": "mesh.clean_topology",
           "clean_non_manifold": "mesh.clean_non_manifold",
           "remove_spikes": "mesh.remove_spikes",
@@ -54,13 +56,11 @@ LABELS = {"voxel_size": "main_panel.voxel_size", "view_stride": "mesh.view_strid
           "isolated_component_max_faces": "mesh.isolated_component_max_faces",
           "isolated_component_neighbor_radius": "mesh.isolated_component_neighbor_radius",
           "max_range": "mesh.max_range", "texel_size": "mesh.texel_size",
-          "texel_min": "mesh.texel_min",
           "texture_size": "mesh.texture_size", "texture_sharpen": "mesh.texture_sharpen",
           "lod_levels": "mesh.lod_levels"}
 # Which container each field goes in. The voxel size also sets how far a photo may see past a surface when baking,
 # so it stays when the surface comes from a file.
 CONTAINERS = {"voxel_size": "mesh-shared-fields", "texel_size": "mesh-texture-fields",
-              "texel_min": "mesh-texture-fields",
               "texture_size": "mesh-texture-fields", "texture_sharpen": "mesh-texture-fields",
               "lod_levels": "mesh-texture-fields"}
 
@@ -69,16 +69,18 @@ CONTAINERS = {"voxel_size": "mesh-shared-fields", "texel_size": "mesh-texture-fi
 class MeshPanel(Panel):
     def __init__(self):
         self.handle = None
-        self.values = dict(voxel_size=.0, view_stride=2, full_weight_range=1., min_views=2, simplify_error=.0,
+        self.values = dict(voxel_size=.0, view_stride=1, full_weight_range=1., min_views=2, simplify_error=.0,
+                           simplify_color_weight=.3,
                            trunc_gradient=1.25, trunc_cap=0., clean_topology=1, clean_non_manifold=1,
                            remove_spikes=1,
                            spurious_edge_factor=30., spurious_component_factor=10., ear_cut_holes=50,
                            fill_hole_perimeter=.0,
                            remove_isolated_small_components=1, isolated_component_max_faces=150,
                            isolated_component_neighbor_radius=8.,
-                           max_range=0., texel_size=0.,
-                           texel_min=.0, texture_mode=0, seam_leveling_mode=0,
+                           max_range=0., texel_size=0., bake_texture=True,
                            texture_size=4096, texture_sharpen=.5, lod_levels=4,
+                           local_seam_leveling=False, own_pixel_sampling=True, cross_view_color=True,
+                           seam_thinning=True, reproject_vertex_colors=True,
                            output_format=PLY, use_file=False, file="", error="")
         self.state = {}
         self.close_when_done = False
@@ -92,13 +94,7 @@ class MeshPanel(Panel):
         invalidate_panel(self.handle, "*")
 
     def textured(self):
-        return self.values["texel_size"] > 0
-
-    def notice(self):
-        """Why the settings cannot run as they are, or empty. A missing file shows on its own row."""
-        if self.values["use_file"] and not self.textured():
-            return lf.ui.tr("mesh.needs_texel")
-        return ""
+        return bool(self.values["bake_texture"])
 
     def output(self):
         fmt = self.values["output_format"]
@@ -114,7 +110,7 @@ class MeshPanel(Panel):
     def ready(self):
         if self.values["use_file"] and not self.values["file"]:
             return False
-        return bool(self.state.get("source_name")) and not self.state.get("active", False) and not self.notice()
+        return bool(self.state.get("source_name")) and not self.state.get("active", False)
 
     def choose_file(self, *_):
         start = str(Path(self.values["file"]).parent) if self.values["file"] else ""
@@ -156,10 +152,14 @@ class MeshPanel(Panel):
                              int(self.values["texture_size"]),
                              self.values["texture_sharpen"],
                              int(self.values["lod_levels"]),
-                             int(self.values["texture_mode"]),
-                             self.values["texel_min"],
-                             int(self.values["seam_leveling_mode"]),
-                             output_format=int(self.values["output_format"]))
+                             output_format=int(self.values["output_format"]),
+                             simplify_color_weight=self.values["simplify_color_weight"],
+                             local_seam_leveling=bool(self.values["local_seam_leveling"]),
+                             own_pixel_sampling=bool(self.values["own_pixel_sampling"]),
+                             cross_view_color=bool(self.values["cross_view_color"]),
+                             simplify_seam_thinning=bool(self.values["seam_thinning"]),
+                             reproject_vertex_colors=bool(self.values["reproject_vertex_colors"]),
+                             bake_texture=bool(self.values["bake_texture"]))
             self.close_when_done = True
         except (RuntimeError, TypeError, ValueError) as exc:
             key = getattr(exc, "message_key", "")
@@ -194,13 +194,20 @@ class MeshPanel(Panel):
         model.bind_func("mesh_file", lambda: self.values["file"])
         model.bind_func("mesh_file_name", lambda: Path(self.values["file"]).name if self.values["file"] else lf.ui.tr("mesh.no_file"))
         model.bind_func("mesh_output", self.output)
-        model.bind_func("mesh_notice", self.notice)
         model.bind_func("mesh_ready", self.ready)
         model.bind("mesh_use_file", lambda: self.values["use_file"], lambda value: self.set_value("use_file", bool(value)))
-        model.bind("mesh_texture_mode", lambda: str(self.values["texture_mode"]),
-                   lambda value: self.set_value("texture_mode", int(value or 0)))
-        model.bind("mesh_seam_leveling", lambda: str(self.values["seam_leveling_mode"]),
-                   lambda value: self.set_value("seam_leveling_mode", int(value or 0)))
+        model.bind("mesh_bake_texture", lambda: self.values["bake_texture"],
+                   lambda value: self.set_value("bake_texture", bool(value)))
+        model.bind("mesh_local_seam_leveling", lambda: self.values["local_seam_leveling"],
+                   lambda value: self.set_value("local_seam_leveling", bool(value)))
+        model.bind("mesh_own_pixel_sampling", lambda: self.values["own_pixel_sampling"],
+                   lambda value: self.set_value("own_pixel_sampling", bool(value)))
+        model.bind("mesh_cross_view_color", lambda: self.values["cross_view_color"],
+                   lambda value: self.set_value("cross_view_color", bool(value)))
+        model.bind("mesh_seam_thinning", lambda: self.values["seam_thinning"],
+                   lambda value: self.set_value("seam_thinning", bool(value)))
+        model.bind("mesh_reproject_vertex_colors", lambda: self.values["reproject_vertex_colors"],
+                   lambda value: self.set_value("reproject_vertex_colors", bool(value)))
         model.bind("mesh_output_format", lambda: str(self.values["output_format"]),
                    lambda value: self.set_value("output_format", int(value or 0)))
         model.bind_event("mesh_choose_file", self.choose_file)

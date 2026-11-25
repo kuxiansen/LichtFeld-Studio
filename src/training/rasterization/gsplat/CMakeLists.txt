@@ -35,7 +35,6 @@ set(GSPLAT_SOURCES
         RelocationCUDA.cu
         SphericalHarmonicsCUDA.cu
         TsdfFusion.cu
-        GofFusion.cu
 )
 
 # lfs suffix avoids conflict with legacy gsplat_backend

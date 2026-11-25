@@ -36,13 +36,10 @@ namespace lfs::training {
         std::vector<int> page_sizes;             // per page, when pages differ; else every page is page_size
         std::vector<float> page_texels;          // per page, when the texels differ; else every page is the level's texel
         std::vector<float> face_error;           // how far each face may lie from the surface, when faces differ
-        std::vector<std::vector<uint8_t>> pages; // RGB, sRGB as in the photos
+        std::vector<std::vector<uint8_t>> pages; // JPEG 95 of the page's RGB, sRGB as in the photos, as the writers embed it
         int page_size = 0;
         [[nodiscard]] int page_side(const size_t page) const { return page_sizes.empty() ? page_size : page_sizes[page]; }
         std::shared_ptr<struct TiledMesh> tiled; // with a texel size: the OSGB model to write, baked
-        // Page p of this mesh is tiled->combined.pages[p]: the finest tile levels, whose pages the OSGB model
-        // already holds, so the viewer and the model share one copy. pages stays empty when this is set.
-        bool pages_in_tiled = false;
 
         // What each stage found, for reports.
         float voxel_size = 0.f; // as resolved when the settings asked for automatic
@@ -79,11 +76,14 @@ namespace lfs::training {
     // the surface with naive surface nets and colors it from the photos, taken back through the
     // model's trained appearance when there is one. Mesh is in model space.
     // Camera image sizes are changed while it runs and restored afterwards.
+    // scratch_dir, when given, holds the depth maps the fusion needs between the render and the
+    // integrate passes: one temp file there instead of several GB in RAM. Empty keeps them in RAM.
     [[nodiscard]] SplatMesh extract_splat_mesh(core::SplatData& model,
                                                std::span<core::Camera* const> cameras,
                                                const core::SplatMeshSettings& settings,
                                                std::stop_token stop = {}, const core::ProgressCallback& progress = {},
-                                               const PPISP* appearance = nullptr);
+                                               const PPISP* appearance = nullptr,
+                                               const std::filesystem::path& scratch_dir = {});
 
     // Sorted sparse voxel keys (21 bits per axis, gsplat_lfs::kTsdfKeyOffset) and their TSDF
     // values. Fills vertices and faces with outward-facing triangles.
@@ -114,9 +114,12 @@ namespace lfs::training {
     // Reduces faces while the surface stays within about max_error scene units, moving the kept
     // vertices to fit and blending their colors. Larger color_weight keeps more faces where the
     // color changes; it is not a distance, and 0 ignores color and leaves kept vertices with their
-    // own colors. Refreshes normals and area. Works in pieces of at most piece_faces and of a size
-    // the simplifier's precision can resolve max_error in, keeping the vertices that pieces share.
-    void simplify_splat_mesh(SplatMesh& mesh, float max_error, float color_weight, size_t piece_faces = 3'000'000);
+    // own colors. Refreshes normals and area. Works in pieces of at most piece_faces and of a size the
+    // simplifier's precision can resolve max_error in, keeping the vertices that pieces share.
+    // seam_thinning then collapses the seam those shared vertices form, which would otherwise keep the
+    // density of the fused mesh next to a surface that lost most of its faces.
+    void simplify_splat_mesh(SplatMesh& mesh, float max_error, float color_weight, size_t piece_faces = 3'000'000,
+                             bool seam_thinning = true);
 
     // Orders mesh.faces so that each returned range is a compact piece of space of at most max_faces faces
     // and max_extent scene units along each axis.
@@ -185,6 +188,20 @@ namespace lfs::training {
     // Unsharp mask on a composed page: out = in + amount * (in - gaussian(in, sigma 1.5)). amount 0 leaves it untouched.
     void sharpen_mesh_page(std::vector<uint8_t>& rgb, int page_size, float amount);
 
+    // OpenMVS's local seam leveling, in page space: along every seam between two view labels the border takes the mean
+    // of both sides, and the correction is diffused over a band of 16 texels on each side. It runs after the global
+    // leveling, so a page's colors already carry its offsets.
+    // colors: 3 per texel, 0 to 1, negative where unobserved; adjusted in place.
+    struct SeamLevelingStats {
+        size_t seam_texels = 0; // border texels that took the mean
+        size_t band_texels = 0; // texels the correction was diffused into
+        int iterations = 0;
+        float max_delta = 0.f;
+    };
+    [[nodiscard]] SeamLevelingStats level_mesh_page_seams(const SplatMesh& mesh, const MeshTexels& texels,
+                                                          std::span<const int32_t> face_views, size_t page,
+                                                          std::vector<float>& colors);
+
     // Undoes the repetition of vertices along chart seams: which merged vertex each vertex is, and one original of each
     // merged vertex. Geometry stays connected across seams, so a viewer that computes its own normals shades it whole.
     struct WeldedVertices {
@@ -214,24 +231,12 @@ namespace lfs::training {
         SplatMesh combined;
         std::vector<TileLevel> levels;
     };
-    // One tile level before it is textured: its geometry and where it sits in the tile grid. The affine path
-    // builds them all first, so that one pass over the photos labels every level's faces and bakes them.
-    struct TiledLevelGeometry {
-        SplatMesh mesh;
-        size_t tile = 0, level = 0; // 0 is the finest
-        std::array<float, 3> center{0.f, 0.f, 0.f};
-        float radius = 0.f;
-        float texel = 0.f; // texel_size doubled on each level
-    };
     // Splits the mesh into tiles of at most tile_faces, whose charts fit a page of max_page, and reduces each to up to
     // max_levels of detail: each allows 4 times the surface deviation of the last and doubles the texel. Vertices that tiles
     // share stay put on every level, so no cracks open between tiles. Reorders base.faces. Unwraps every level; baking remains.
     // vertex_gsd, when given, is per vertex of base what one photo pixel covers there: a tile's texel then follows the
     // tenth of its vertices the photos hold the sharpest, clamped, instead of the size asked for.
     [[nodiscard]] TiledMesh build_tiled_mesh(SplatMesh& base, float texel_size, int max_page, int max_levels, float finest_error, std::stop_token stop = {}, size_t tile_faces = 150'000, std::span<const float> vertex_gsd = {});
-    // The tiles and levels build_tiled_mesh would unwrap, without unwrapping: geometry only, each level's faces
-    // carrying its own error. Reorders base.faces as build_tiled_mesh does.
-    [[nodiscard]] std::vector<TiledLevelGeometry> build_tiled_level_geometry(SplatMesh& base, float texel_size, int max_page, int max_levels, float finest_error, std::stop_token stop = {}, size_t tile_faces = 150'000, std::span<const float> vertex_gsd = {});
     // Writes a model DasViewer opens: folder/metadata.xml and folder/Data/<tile>/<tile>.osgb, the coarsest level of a tile, with
     // the next finer one paged in as the tile fills the screen.
     // A mesh from a PLY file, binary or text; polygons become fans. To bake a mesh made earlier or edited elsewhere.

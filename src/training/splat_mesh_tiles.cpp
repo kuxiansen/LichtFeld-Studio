@@ -278,24 +278,4 @@ namespace lfs::training {
         return tiled;
     }
 
-    std::vector<TiledLevelGeometry> build_tiled_level_geometry(SplatMesh& base, const float texel_size, const int max_page,
-                                                               const int max_levels, const float finest_error, const std::stop_token stop,
-                                                               const size_t tile_faces, const std::span<const float> vertex_gsd) {
-        auto tiles = build_tile_chunks(base, texel_size, max_page, max_levels, finest_error, stop, tile_faces, vertex_gsd,
-                                       [](SplatMesh&, const float, const int, const std::span<const float>) {});
-        std::vector<TiledLevelGeometry> levels;
-        for (size_t t = 0; t < tiles.size(); ++t)
-            for (size_t l = 0; l < tiles[t].levels.size(); ++l) {
-                auto mesh = std::move(tiles[t].levels[l]);
-                mesh.face_error.assign(mesh.faces.size(), tiles[t].errors[l]);
-                levels.push_back({.mesh = std::move(mesh), .tile = t, .level = l, .center = tiles[t].center,
-                                  .radius = tiles[t].radius, .texel = texel_size * float(1u << l)});
-            }
-        size_t faces = 0;
-        for (const auto& level : levels)
-            faces += level.mesh.faces.size();
-        LOG_INFO("Mesh: {} tiles and {} tile levels over {} faces, for the affine texture", tiles.size(), levels.size(), faces);
-        return levels;
-    }
-
 } // namespace lfs::training

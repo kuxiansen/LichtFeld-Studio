@@ -517,7 +517,7 @@ namespace gsplat_lfs {
         }
 
         __global__ void texture_kernel(const float* texels, const uint32_t count, const TsdfView view, const int32_t view_label, const int32_t* labels, const float* depth, const float* photo,
-                                       const float* low_photo, const float* tolerances, const uint32_t* mask,
+                                       const float* low_photo, const float* tolerances, const uint32_t* mask, const bool own_pixel, const bool cross_view_color,
                                        float* low_sum, float* low_weight, float* high, float* best_weight) {
             const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) * kVerticesPerThread;
             if (first >= count)
@@ -553,11 +553,17 @@ namespace gsplat_lfs {
                             clean = false;
                             break;
                         }
+                        const float measured = depth[corner];
+                        if (!own_pixel) {
+                            // The original sampler: every corner of the four must lie on the surface, in front or
+                            // behind, which blanked most thin lettering.
+                            clean = clean && measured > 0.f && fabsf(measured - pixel.range) < tolerances[t];
+                            continue;
+                        }
                         // A hole in the splats is not an occluder. The face-level score already vouched that the
                         // view that owns this texel sees the face, and demanding a depth at every corner of it
                         // blanked most thin lettering, which the blend then washed out. The other views have no
                         // such voucher and keep the strict test, so their detail is not taken from a hole.
-                        const float measured = depth[corner];
                         if (chosen) {
                             // The face's own view was vouched for by the face-level score, seven points of which had
                             // to lie on the surface. A 5 mm texel is finer than the depth map can resolve, so letting
@@ -579,7 +585,7 @@ namespace gsplat_lfs {
                     // finer than one photo pixel, and bilinear then blends the four pixels around it, which is exactly
                     // what washes lettering out; the patch path copies the pixel and stays sharp.
                     float color[3], low[3];
-                    if (chosen) {
+                    if (own_pixel && chosen) {
                         const uint32_t nx = min(static_cast<uint32_t>(max(sx + .5f, 0.f)), width - 1);
                         const uint32_t ny = min(static_cast<uint32_t>(max(sy + .5f, 0.f)), view.height - 1);
                         const uint64_t nearest = static_cast<uint64_t>(ny) * width + nx;
@@ -593,11 +599,13 @@ namespace gsplat_lfs {
                         low_sum[3 * static_cast<uint64_t>(t) + c] += w * low[c];
                     low_weight[t] += w;
                     // The chosen view keeps its whole color, and another view only its detail, over the levels of all.
+                    // Composing across views keeps only its detail as well, so that its low frequencies, where photos
+                    // disagree, come from the mean of all rather than from one face's photo.
                     const float rank = chosen ? INFINITY : w;
                     if (rank > best_weight[t]) {
                         best_weight[t] = rank;
                         for (uint32_t c = 0; c < 3; ++c)
-                            high[3 * static_cast<uint64_t>(t) + c] = chosen ? color[c] : color[c] - low[c];
+                            high[3 * static_cast<uint64_t>(t) + c] = chosen && !cross_view_color ? color[c] : color[c] - low[c];
                     }
                 }
             });
@@ -765,10 +773,10 @@ namespace gsplat_lfs {
     }
 
     void mesh_texture_accumulate(const float* texels, const uint32_t count, const TsdfView& view, const int32_t view_label, const int32_t* labels, const float* depth, const float* photo,
-                                 const float* low_photo, const float* tolerances, const uint32_t* mask, float* low_sum, float* low_weight,
-                                 float* high, float* best_weight, cudaStream_t stream) {
+                                 const float* low_photo, const float* tolerances, const uint32_t* mask, const bool own_pixel, const bool cross_view_color, float* low_sum,
+                                 float* low_weight, float* high, float* best_weight, cudaStream_t stream) {
         const uint64_t threads = (static_cast<uint64_t>(count) + kVerticesPerThread - 1) / kVerticesPerThread;
-        texture_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(texels, count, view, view_label, labels, depth, photo, low_photo, tolerances, mask, low_sum, low_weight, high, best_weight);
+        texture_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(texels, count, view, view_label, labels, depth, photo, low_photo, tolerances, mask, own_pixel, cross_view_color, low_sum, low_weight, high, best_weight);
         LFS_CUDA_LAUNCH_CHECK(stream, "mesh.texture");
     }
 

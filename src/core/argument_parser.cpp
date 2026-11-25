@@ -2671,17 +2671,15 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
   --no-non-manifold-clean    Skip the final lightweight non-manifold pass after the second hole fill
   --max-range <v>            Mesh only surfaces a view saw from closer than this; 0 = no limit (default 0)
   --render-width <n>         Render and photo width limit (default 1600)
-  --texel-size <v>           Bake a texture with texels of this size, and write <output>_osgb beside the PLY: an OSGB
-                             model of tiles with levels of detail; 0 = vertex colors only (default 0)
+  --texel-size <v>           Size of a texture texel on the surface, and write <output>_osgb beside the PLY: an OSGB
+                             model of tiles with levels of detail; 0 = a quarter of the voxel size (default 0, auto)
+  --no-texture               Skip the texture pages and the OSGB model and keep the vertex colors
   --texture-size <n>         Side of a texture page (default 4096)
   --texture-sharpen <v>      Unsharp mask amount applied to every texture page before writing; 0 keeps it off (default 0.5)
   --lod-levels <n>           Levels of detail per OSGB tile, 1 writes the finest level only (default 4)
-  --texture-mode <n>         Texture page layout: 0 = xatlas atlas (default), 1 = affine patches, one photo each
-  --texel-min <v>            Affine patches only: smallest texel allowed where photos are coarser; 0 = 1 mm (default 0)
-  --seam-leveling <n>        Seam color reconciliation: 0 = per-vertex offsets (default), 1 = OpenMVS local seam leveling
   --texture-width <n>        Render and photo width limit when baking; 0 = the photos' own (default 0)
   --all-views                Also fuse the held-out views
-  --from-mesh <mesh.ply>     Bake this mesh, made earlier or edited since, instead of extracting one; needs a texel size.
+  --from-mesh <mesh.ply>     Bake this mesh, made earlier or edited since, instead of extracting one.
                              Voxel size still sets how near the depth a surface must lie
 )";
 
@@ -2754,18 +2752,14 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
                     settings.max_width = std::stoi(value());
                 } else if (flag == "--texel-size") {
                     settings.texel_size = std::stof(value());
+                } else if (flag == "--no-texture") {
+                    settings.bake_texture = false;
                 } else if (flag == "--texture-size") {
                     settings.texture_size = std::stoi(value());
                 } else if (flag == "--texture-sharpen") {
                     settings.texture_sharpen = std::clamp(std::stof(value()), 0.f, 5.f);
                 } else if (flag == "--lod-levels") {
                     settings.lod_levels = std::clamp(std::stoi(value()), 1, 4);
-                } else if (flag == "--texture-mode") {
-                    settings.texture_mode = std::clamp(std::stoi(value()), 0, 1);
-                } else if (flag == "--texel-min") {
-                    settings.texel_min = std::max(std::stof(value()), 0.f);
-                } else if (flag == "--seam-leveling") {
-                    settings.seam_leveling_mode = std::clamp(std::stoi(value()), 0, 1);
                 } else if (flag == "--texture-width") {
                     settings.texture_width = std::stoi(value());
                 } else if (flag == "--osgb") {
@@ -2788,11 +2782,6 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
         const auto output_path = lfs::core::utf8_to_path(output);
         if (output.empty() || lfs::core::path_to_utf8(output_path.extension()) != ".ply") {
             error = "mesh needs -o <mesh.ply>";
-            return std::nullopt;
-        }
-
-        if (!settings.from_mesh.empty() && settings.texel_size <= 0.f) {
-            error = "--from-mesh needs --texel-size";
             return std::nullopt;
         }
 

@@ -9,7 +9,6 @@
 #include <cstring>
 #include <format>
 #include <fstream>
-#include <stb_image_write.h>
 #include <string_view>
 #include <vector>
 #include <zlib.h>
@@ -22,7 +21,6 @@ namespace lfs::training {
     namespace {
         using core::collisionError;
 
-        constexpr int kOsgbJpegQuality = 95;
         constexpr uint32_t kOsgVersion = 161; // OSG 3.6.5
         constexpr uint32_t kSceneFile = 1;
         constexpr uint32_t kBinaryBrackets = 4;
@@ -160,18 +158,6 @@ namespace lfs::training {
             out.f32(0.f);     // LOD bias
         }
 
-        [[nodiscard]] std::vector<char> encode_jpeg(const std::vector<uint8_t>& rgb, const int side, const std::string& name) {
-            std::vector<char> jpeg;
-            const auto append = [](void* context, void* data, const int size) {
-                auto* target = static_cast<std::vector<char>*>(context);
-                const auto* begin = static_cast<const char*>(data);
-                target->insert(target->end(), begin, begin + size);
-            };
-            if (!stbi_write_jpg_to_func(append, &jpeg, side, side, 3, rgb.data(), kOsgbJpegQuality))
-                throw collisionError("mesh.write_failed", "Could not write the mesh texture", ErrorCode::Unavailable, name);
-            return jpeg;
-        }
-
         // The faces of one level, one drawable per page, sharing the level's vertices.
         void write_level_geode(OsgbStream& out, ObjectIds& ids, const SplatMesh& all, const TileLevel& level, const std::string& stem) {
             std::vector<std::array<float, 2>> coordinates(level.vertex_count);
@@ -194,7 +180,9 @@ namespace lfs::training {
             for (size_t p = 0; p < level.page_count; ++p) {
                 const size_t page = level.first_page + p;
                 const auto name = std::format("{}_{}.jpg", stem, p);
-                const auto jpeg = encode_jpeg(all.pages[page], all.page_side(page), name);
+                const auto& jpeg = all.pages[page];
+                if (jpeg.empty())
+                    throw collisionError("mesh.write_failed", "The mesh texture page is incomplete", ErrorCode::Unavailable, name);
 
                 out.text("osg::Geometry");
                 out.open();

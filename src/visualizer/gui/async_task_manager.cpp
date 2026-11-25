@@ -4455,7 +4455,7 @@ namespace lfs::vis::gui {
             views.reserve(cameras.size());
             for (const auto& camera : cameras)
                 views.push_back(camera.get());
-            const auto mesh = training::extract_splat_mesh(*model, views, settings, stop, progress, appearance.get());
+            const auto mesh = training::extract_splat_mesh(*model, views, settings, stop, progress, appearance.get(), path.parent_path());
             // A surface read from a file is already on disk, so baking it writes no second copy: the OSGB goes beside
             // the file the user picked. A surface extracted here still writes its own geometry first.
             const bool from_file = !settings.from_mesh.empty();

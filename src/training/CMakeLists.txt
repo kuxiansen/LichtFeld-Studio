@@ -137,10 +137,6 @@ set(TRAINING_NEW_SOURCES
         progress.cpp
         splat_mesh.cpp
         splat_mesh_texture.cpp
-        splat_mesh_patch.cpp
-        splat_mesh_pack.cpp
-        splat_mesh_bake.cpp
-        splat_mesh_patch_tiles.cpp
         splat_mesh_tiles.cpp
         splat_mesh_osgb.cpp
         splat_mesh_glb.cpp

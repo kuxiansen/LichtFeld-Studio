@@ -1664,11 +1664,12 @@ namespace lfs::python {
             const core::CollisionSettings settings{.voxel_size = size, .opacity = opacity, .max_gaussian_area = max_area,
                                                     .auto_resolution = automatic, .cleanup = cleanup};
             collision_access([&](auto& tasks, auto*) { tasks.startCollision(settings); }); }, nb::arg("voxel_size") = .05f, nb::arg("opacity") = .1f, nb::arg("auto_resolution") = false, nb::arg("cleanup") = true, nb::arg("max_gaussian_area") = 0.f);
-        m.def("generate_mesh", [collision_access](const std::string& path, float voxel_size, int view_stride, float full_weight_range, int min_views, float simplify_error, float max_range, float texel_size, const std::string& from_mesh, float trunc_gradient, float trunc_cap, int clean_topology, int clean_non_manifold, int remove_spikes, int ear_cut_holes, float spurious_edge_factor, float spurious_component_factor, float fill_hole_perimeter, int remove_isolated_small_components, int isolated_component_max_faces, float isolated_component_neighbor_radius, int texture_size, float texture_sharpen, int lod_levels, int texture_mode, float texel_min, int seam_leveling_mode, int output_format) {
+        m.def("generate_mesh", [collision_access](const std::string& path, float voxel_size, int view_stride, float full_weight_range, int min_views, float simplify_error, float max_range, float texel_size, const std::string& from_mesh, float trunc_gradient, float trunc_cap, int clean_topology, int clean_non_manifold, int remove_spikes, int ear_cut_holes, float spurious_edge_factor, float spurious_component_factor, float fill_hole_perimeter, int remove_isolated_small_components, int isolated_component_max_faces, float isolated_component_neighbor_radius, int texture_size, float texture_sharpen, int lod_levels, int output_format, float simplify_color_weight, bool local_seam_leveling, bool own_pixel_sampling, bool cross_view_color, bool seam_thinning, bool reproject_vertex_colors, bool bake_texture) {
             core::SplatMeshSettings settings;
             settings.texel_size = texel_size;
             settings.from_mesh = from_mesh;
             settings.simplify_error = simplify_error;
+            settings.simplify_color_weight = std::max(simplify_color_weight, 0.f);
             settings.max_range = max_range;
             settings.voxel_size = voxel_size;
             settings.view_stride = view_stride;
@@ -1688,15 +1689,19 @@ namespace lfs::python {
             settings.isolated_component_neighbor_radius = std::max(isolated_component_neighbor_radius, 0.f);
             settings.texture_size = std::clamp(texture_size, 64, 16384);
             settings.texture_sharpen = std::clamp(texture_sharpen, 0.f, 5.f);
+            settings.texture_local_seam_leveling = local_seam_leveling;
+            settings.texture_own_pixel_sampling = own_pixel_sampling;
+            settings.texture_cross_view_color = cross_view_color;
+            settings.simplify_seam_thinning = seam_thinning;
+            settings.reproject_vertex_colors = reproject_vertex_colors;
+            settings.bake_texture = bake_texture;
             settings.lod_levels = std::clamp(lod_levels, 1, 4);
-            settings.texture_mode = std::clamp(texture_mode, 0, 1);
-            settings.texel_min = std::max(texel_min, 0.f);
-            settings.seam_leveling_mode = std::clamp(seam_leveling_mode, 0, 1);
             settings.file_format = static_cast<core::MeshFileFormat>(std::clamp(output_format, 0, 2));
-            collision_access([&](auto& tasks, auto*) { tasks.startSplatMesh(settings, core::utf8_to_path(path)); }); }, nb::arg("path"), nb::arg("voxel_size") = .0f, nb::arg("view_stride") = 2, nb::arg("full_weight_range") = 1.f, nb::arg("min_views") = 2, nb::arg("simplify_error") = .0f, nb::arg("max_range") = 0.f, nb::arg("texel_size") = 0.f, nb::arg("from_mesh") = "", nb::arg("trunc_gradient") = 1.25f, nb::arg("trunc_cap") = .0f, nb::arg("clean_topology") = 1, nb::arg("clean_non_manifold") = 1, nb::arg("remove_spikes") = 1, nb::arg("ear_cut_holes") = 50, nb::arg("spurious_edge_factor") = 30.f, nb::arg("spurious_component_factor") = 10.f, nb::arg("fill_hole_perimeter") = 0.f, nb::arg("remove_isolated_small_components") = 1, nb::arg("isolated_component_max_faces") = 150, nb::arg("isolated_component_neighbor_radius") = 8.f, nb::arg("texture_size") = 4096, nb::arg("texture_sharpen") = .5f, nb::arg("lod_levels") = 4,
-              nb::arg("texture_mode") = 0, nb::arg("texel_min") = .0f, nb::arg("seam_leveling_mode") = 0,
-              nb::arg("output_format") = 0,
-              "Mesh the selected splat from the scene's cameras into a geometry file and a new mesh node, and with texel_size also an OSGB model folder beside it, named after the geometry with _osgb. output_format is 0 for a PLY, 1 for a GLB that embeds the texture pages, 2 for both; a .glb path also selects GLB. With from_mesh, bakes that PLY instead of extracting a surface, which needs texel_size. Progress is in get_collision_state, cancel with cancel_collision");
+            collision_access([&](auto& tasks, auto*) { tasks.startSplatMesh(settings, core::utf8_to_path(path)); }); }, nb::arg("path"), nb::arg("voxel_size") = .0f, nb::arg("view_stride") = 1, nb::arg("full_weight_range") = 1.f, nb::arg("min_views") = 2, nb::arg("simplify_error") = .0f, nb::arg("max_range") = 0.f, nb::arg("texel_size") = 0.f, nb::arg("from_mesh") = "", nb::arg("trunc_gradient") = 1.25f, nb::arg("trunc_cap") = .0f, nb::arg("clean_topology") = 1, nb::arg("clean_non_manifold") = 1, nb::arg("remove_spikes") = 1, nb::arg("ear_cut_holes") = 50, nb::arg("spurious_edge_factor") = 30.f, nb::arg("spurious_component_factor") = 10.f, nb::arg("fill_hole_perimeter") = 0.f, nb::arg("remove_isolated_small_components") = 1, nb::arg("isolated_component_max_faces") = 150, nb::arg("isolated_component_neighbor_radius") = 8.f, nb::arg("texture_size") = 4096, nb::arg("texture_sharpen") = .5f, nb::arg("lod_levels") = 4,
+              nb::arg("output_format") = 0, nb::arg("simplify_color_weight") = .3f,
+              nb::arg("local_seam_leveling") = false, nb::arg("own_pixel_sampling") = true, nb::arg("cross_view_color") = true,
+              nb::arg("simplify_seam_thinning") = true, nb::arg("reproject_vertex_colors") = true, nb::arg("bake_texture") = true,
+              "Mesh the selected splat from the scene's cameras into a geometry file and a new mesh node, and with bake_texture also an OSGB model folder beside it, named after the geometry with _osgb; texel_size 0 derives a quarter of the voxel size, and bake_texture False skips the pages and keeps the vertex colors. output_format is 0 for a PLY, 1 for a GLB that embeds the texture pages, 2 for both; a .glb path also selects GLB. own_pixel_sampling takes the view chosen for each face its own pixel instead of a bilinear blend; off reproduces the original bake. cross_view_color takes every texel's broad color from the mean of all views and only its detail from the chosen view, which keeps the exposure and white balance of one photo from becoming a patch per face. simplify_seam_thinning collapses the vertices the simplify's pieces share, which otherwise stay at the fused mesh's density along each cut. reproject_vertex_colors renders the depths again after the simplify and takes the final vertices' colors from the photos, so the exported colors describe the simplified surface; it costs one more render pass over all views. With from_mesh, bakes that PLY instead of extracting a surface. Progress is in get_collision_state, cancel with cancel_collision");
         m.def("export_collision", [collision_access](const std::string& uuid, const std::string& path) {
             const auto parsed = core::Uuid::from_string(uuid);
             if (!parsed)

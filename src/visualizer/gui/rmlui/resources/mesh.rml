@@ -24,30 +24,38 @@
       </div>
       <div id="mesh-shared-fields"></div>
       <div id="mesh-fields" data-if="!mesh_use_file"></div>
+      <div data-if="!mesh_use_file" class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.simplify_seam_thinning">
+        <span class="setting-row__label-col">@tr:mesh.simplify_seam_thinning</span>
+        <label class="setting-row__control-col setting-row__control-col--checkbox"><input type="checkbox" data-checked="mesh_seam_thinning" /></label>
+      </div>
+      <div data-if="!mesh_use_file" class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.reproject_vertex_colors">
+        <span class="setting-row__label-col">@tr:mesh.reproject_vertex_colors</span>
+        <label class="setting-row__control-col setting-row__control-col--checkbox"><input type="checkbox" data-checked="mesh_reproject_vertex_colors" /></label>
+      </div>
     </div>
     <div class="separator"></div>
 
     <div class="ep-section">
       <span class="ep-section-title text-accent">@tr:mesh.section_texture</span>
-      <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.texture_mode">
-        <span class="setting-row__label-col">@tr:mesh.texture_mode</span>
-        <div class="setting-row__control-col setting-row__control-col--fill">
-          <select data-value="mesh_texture_mode">
-            <option value="0">@tr:mesh.texture_mode.xatlas</option>
-            <option value="1">@tr:mesh.texture_mode.affine</option>
-          </select>
-        </div>
+      <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.bake_texture">
+        <span class="setting-row__label-col">@tr:mesh.bake_texture</span>
+        <label class="setting-row__control-col setting-row__control-col--checkbox"><input type="checkbox" data-checked="mesh_bake_texture" /></label>
       </div>
-      <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.seam_leveling">
-        <span class="setting-row__label-col">@tr:mesh.seam_leveling</span>
-        <div class="setting-row__control-col setting-row__control-col--fill">
-          <select data-value="mesh_seam_leveling">
-            <option value="0">@tr:mesh.seam_leveling.vertex</option>
-            <option value="1">@tr:mesh.seam_leveling.local</option>
-          </select>
-        </div>
-      </div>
+      <div data-if="mesh_bake_texture">
       <div id="mesh-texture-fields"></div>
+      <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.texture_local_seam_leveling">
+        <span class="setting-row__label-col">@tr:mesh.texture_local_seam_leveling</span>
+        <label class="setting-row__control-col setting-row__control-col--checkbox"><input type="checkbox" data-checked="mesh_local_seam_leveling" /></label>
+      </div>
+      <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.texture_own_pixel_sampling">
+        <span class="setting-row__label-col">@tr:mesh.texture_own_pixel_sampling</span>
+        <label class="setting-row__control-col setting-row__control-col--checkbox"><input type="checkbox" data-checked="mesh_own_pixel_sampling" /></label>
+      </div>
+      <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.texture_cross_view_color">
+        <span class="setting-row__label-col">@tr:mesh.texture_cross_view_color</span>
+        <label class="setting-row__control-col setting-row__control-col--checkbox"><input type="checkbox" data-checked="mesh_cross_view_color" /></label>
+      </div>
+      </div>
     </div>
     <div class="separator"></div>
 
@@ -66,8 +74,7 @@
     </div>
     <div class="separator"></div>
 
-    <div data-if="mesh_notice == ''" class="text-muted">{{mesh_output}}</div>
-    <div data-if="mesh_notice != ''" class="text-error">{{mesh_notice}}</div>
+    <div class="text-muted">{{mesh_output}}</div>
     <div data-if="mesh_active">
       <progress max="1" data-attr-value="mesh_progress" />
       <span>{{mesh_status}}</span>

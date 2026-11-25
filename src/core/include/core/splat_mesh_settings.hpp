@@ -25,7 +25,7 @@ namespace lfs::core {
         float trunc_gradient = 1.25f;
         float trunc_cap = 0.f;         // 0 derives the cap as 5x the truncation, so it scales with the voxel
         float full_weight_range = 1.f; // views beyond this range count less, by 1/r^2; 0 = equal weights
-        int view_stride = 2;           // fuse every Nth view
+        int view_stride = 1;           // fuse every Nth view
         int color_stride = 2;          // vertex colors from every Nth fused view; a texture uses every photo
         int min_views = 2;             // views a voxel needs to count as observed
         // Closes holes whose rim is shorter than this, in scene units. 0 derives it as 20x the
@@ -42,6 +42,17 @@ namespace lfs::core {
         // fill_hole_perimeter. 0 keeps the fan for every hole.
         int ear_cut_holes = 50;
         float simplify_error = .0f;    // surface deviation allowed when reducing faces; 0 = 0.9 x voxel (auto)
+        // Weight of the color term against the surface error when reducing faces. Colors keep faces where
+        // they change; with a baked texture the vertex colors only fill texels no photo saw, so lowering
+        // this trades their smoothness for fewer faces. 0 ignores color.
+        float simplify_color_weight = .3f;
+        // Collapses the vertices the simplify's pieces share, so that a cut through the surface no longer stays at the
+        // density of the fused mesh next to faces that lost most of theirs. Off keeps the original seam untouched.
+        bool simplify_seam_thinning = true;
+        // Recolors the vertices from the photos of the views that see them once the faces are reduced, so that the
+        // exported colors describe the simplified surface instead of the fused one whose colors the simplify, the
+        // denoise and the seam thinning interpolated and averaged. Costs one more depth render over all views.
+        bool reproject_vertex_colors = true;
         // Drops zero-area and repeated faces, merges vertices at the same position, drops faces that
         // share an edge with more than one other face and splits vertices whose faces form more than
         // one fan. Cheap, and a no-op on a clean mesh. Runs after simplification, and again after the
@@ -60,21 +71,27 @@ namespace lfs::core {
         float isolated_component_neighbor_radius = 8.f;
         float max_range = 0.f;         // surfaces no view saw from closer are not meshed; 0 = no limit
         int max_width = 1600;          // render and photo width limit
-        float texel_size = 0.f;        // size of a texel on the surface, for an OSGB model beside the PLY; 0 = vertex colors only
+        // Bakes the texture pages and writes the OSGB model beside the PLY; off keeps the vertex colors only.
+        // Until this switch existed, a texel size of 0 meant "no texture"; it now asks for the automatic size.
+        bool bake_texture = true;
+        float texel_size = 0.f;        // size of a texel on the surface; 0 derives it as a quarter of the voxel
         int texture_size = 4096;       // side of a texture page
         // Unsharp mask applied to every page before it is written, as OpenMVS does: out = in + amount * (in - blur).
         // It restores the edge contrast that resampling and JPEG give up; 0 writes the pages untouched.
         float texture_sharpen = .5f;
+        // OpenMVS's local seam leveling, as a page-space option beside the global leveling: along every seam between
+        // two views the border takes the mean of both sides, and the correction diffuses over a 16-texel band.
+        bool texture_local_seam_leveling = false;
+        // Takes the view chosen for each face its own pixel, without bilinear and without letting the four depth
+        // corners veto it; the other views only reject what lies in front. Off reproduces the original sampler:
+        // every view is bilinear and all four corners must sit on the surface. Kept to compare the two in one build.
+        bool texture_own_pixel_sampling = true;
+        // Composes every texel as the mean of the blurred photos over all views plus the detail of the view picked
+        // for it, instead of taking the chosen view's photo whole. A photo's exposure, white balance and vignetting
+        // then stop turning into a patch per face, which a few-metre triangle makes visible; the chosen view still
+        // supplies the fine detail. Off is the original composition.
+        bool texture_cross_view_color = true;
         int lod_levels = 4;            // levels of detail per OSGB tile; 1 writes the finest level only
-        // 0 = xatlas charts packed onto pages, as before; 1 = affine patches, each baked from a single
-        // photo at that photo's own pixel density. Both are kept so the two can be compared.
-        int texture_mode = 0;
-        // With affine patches: the smallest texel allowed when the photos are coarser than the requested
-        // texel size, in scene units. 0 = 1 mm.
-        float texel_min = .0f;
-        // How colors are reconciled across seams: 0 = per-vertex offsets, as before; 1 = OpenMVS's local
-        // seam leveling along patch borders.
-        int seam_leveling_mode = 0;
         int texture_width = 0;         // render and photo width limit when baking; 0 = the photos' own
         std::string from_mesh;         // a PLY to bake instead of extracting the surface, UTF-8
         MeshFileFormat file_format = MeshFileFormat::Ply;
