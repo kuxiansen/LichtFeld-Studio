@@ -88,6 +88,12 @@ namespace lfs::io {
         // When true, and splat_tensor_allocator is set, PLY SH-rest is encoded to
         // q16 on the way in (no float32 SplatData.shN GPU workspace).
         bool shN_q16 = false;
+        // When the dataset holds both points3D.ply and points3D.bin, treat the PLY as a
+        // dense (LAS-derived) cloud and the BIN as the COLMAP sparse cloud, then merge
+        // them by voxel: every sparse point is kept and one dense point fills each voxel
+        // cell the sparse cloud leaves empty. Off keeps the normal PLY > BIN priority.
+        bool mix_ply_with_sparse = false;
+        float mix_voxel_size = 0.2f; // metres
     };
 
     class LoadCancelledError : public std::runtime_error {
@@ -117,6 +123,8 @@ namespace lfs::io {
     struct LoadedScene {
         std::vector<std::shared_ptr<lfs::core::Camera>> cameras;
         std::shared_ptr<PointCloud> point_cloud;
+        // Set when mix_ply_with_sparse merged points3D.ply (dense) with points3D.bin (sparse).
+        bool point_cloud_mixed = false;
     };
 
     enum class ImportWorldOriginProvenance : std::uint8_t {

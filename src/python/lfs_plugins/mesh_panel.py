@@ -69,8 +69,9 @@ CONTAINERS = {"voxel_size": "mesh-shared-fields", "texel_size": "mesh-texture-fi
 class MeshPanel(Panel):
     def __init__(self):
         self.handle = None
-        self.values = dict(voxel_size=.0, view_stride=1, full_weight_range=1., min_views=2, simplify_error=.0,
-                           simplify_color_weight=.3,
+        self.values = dict(voxel_size=.0, view_stride=1, full_weight_range=1., min_views=2,
+                           simplify_error=.0,
+                           simplify_color_weight=.2,
                            trunc_gradient=1.25, trunc_cap=0., clean_topology=1, clean_non_manifold=1,
                            remove_spikes=1,
                            spurious_edge_factor=30., spurious_component_factor=10., ear_cut_holes=50,

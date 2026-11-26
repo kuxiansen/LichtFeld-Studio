@@ -16,9 +16,11 @@
 #include "io/filesystem_utils.hpp"
 #include "io/loaders/loader_utils.hpp"
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <system_error>
+#include <unordered_set>
 #include <vector>
 
 namespace lfs::io {
@@ -28,6 +30,101 @@ namespace lfs::io {
     using lfs::core::Device;
     using lfs::core::PointCloud;
     using lfs::core::Tensor;
+
+    namespace {
+        // Voxel coordinate packing: offsets negative coordinates and packs the three
+        // indices into one int64 key, so an occupancy table is a single hash lookup.
+        constexpr int64_t kVoxelHashOffset = 1 << 20;
+
+        int64_t voxelHash(const int ix, const int iy, const int iz) {
+            constexpr int64_t kSpan = kVoxelHashOffset * 2;
+            return int64_t{ix} + kVoxelHashOffset +
+                   (int64_t{iy} + kVoxelHashOffset) * kSpan +
+                   (int64_t{iz} + kVoxelHashOffset) * kSpan * kSpan;
+        }
+
+        int coordToVoxel(const float x, const float voxel) {
+            return x >= 0.0f ? static_cast<int>(x / voxel)
+                             : static_cast<int>((x - voxel + 1e-6f) / voxel);
+        }
+
+        // Merge a dense point cloud (points3D.ply, typically laser-derived) into the
+        // COLMAP sparse one (points3D.bin): every sparse point is kept, and one dense
+        // point fills each voxel the sparse cloud does not occupy. Dense columns adopt
+        // the sparse dtype so the row copy stays byte aligned.
+        PointCloud mixDenseWithSparse(const PointCloud& sparse, const PointCloud& dense, const float voxel_size) {
+            std::unordered_set<int64_t> occupied;
+            occupied.reserve(static_cast<size_t>(sparse.size()));
+            {
+                auto means = sparse.means.cpu().contiguous();
+                auto acc = means.accessor<float, 2>();
+                for (int64_t i = 0; i < sparse.size(); ++i)
+                    occupied.insert(voxelHash(coordToVoxel(acc(i, 0), voxel_size),
+                                              coordToVoxel(acc(i, 1), voxel_size),
+                                              coordToVoxel(acc(i, 2), voxel_size)));
+            }
+
+            std::vector<size_t> picked;
+            picked.reserve(static_cast<size_t>(dense.size()));
+            std::unordered_set<int64_t> picked_voxels;
+            picked_voxels.reserve(occupied.size());
+            {
+                auto means = dense.means.cpu().contiguous();
+                auto acc = means.accessor<float, 2>();
+                for (int64_t i = 0; i < dense.size(); ++i) {
+                    const int64_t key = voxelHash(coordToVoxel(acc(i, 0), voxel_size),
+                                                  coordToVoxel(acc(i, 1), voxel_size),
+                                                  coordToVoxel(acc(i, 2), voxel_size));
+                    if (occupied.find(key) == occupied.end() && picked_voxels.insert(key).second)
+                        picked.push_back(static_cast<size_t>(i));
+                }
+            }
+
+            const size_t sparse_rows = static_cast<size_t>(sparse.size());
+            auto concat_field = [&](const Tensor& sparse_t, const Tensor& dense_t) -> Tensor {
+                const bool sparse_ok = sparse_t.is_valid() && sparse_t.numel() > 0 && sparse_t.ndim() == 2;
+                const bool dense_ok = dense_t.is_valid() && dense_t.numel() > 0 && dense_t.ndim() == 2;
+                if (!sparse_ok && !dense_ok)
+                    return Tensor();
+                const Tensor& ref = sparse_ok ? sparse_t : dense_t;
+                auto dst = Tensor::zeros({sparse_ok ? sparse_rows + picked.size() : picked.size(),
+                                          ref.shape()[1]},
+                                         ref.device(), ref.dtype());
+                const size_t row_bytes = ref.shape()[1] * lfs::core::dtype_size(ref.dtype());
+                uint8_t* dst_ptr = static_cast<uint8_t*>(dst.data_ptr());
+                if (sparse_ok) {
+                    auto src = sparse_t.cpu().contiguous();
+                    std::memcpy(dst_ptr, src.data_ptr(), sparse_rows * row_bytes);
+                    dst_ptr += sparse_rows * row_bytes;
+                }
+                if (dense_ok) {
+                    auto src = dense_t.to(ref.dtype()).cpu().contiguous();
+                    const uint8_t* src_ptr = static_cast<const uint8_t*>(src.data_ptr());
+                    for (const size_t idx : picked) {
+                        std::memcpy(dst_ptr, src_ptr + idx * row_bytes, row_bytes);
+                        dst_ptr += row_bytes;
+                    }
+                }
+                return dst;
+            };
+
+            PointCloud result;
+            result.means = concat_field(sparse.means, dense.means);
+            result.colors = concat_field(sparse.colors, dense.colors);
+            result.normals = concat_field(sparse.normals, dense.normals);
+            result.sh0 = concat_field(sparse.sh0, dense.sh0);
+            result.shN = concat_field(sparse.shN, dense.shN);
+            result.opacity = concat_field(sparse.opacity, dense.opacity);
+            result.scaling = concat_field(sparse.scaling, dense.scaling);
+            result.rotation = concat_field(sparse.rotation, dense.rotation);
+            result.emit_zero_normals = sparse.emit_zero_normals;
+            result.attribute_names = sparse.attribute_names;
+
+            LOG_INFO("Mix init: sparse={} pts in {} voxels; dense={} pts -> pick {} supplementary (voxel={} m)",
+                     sparse.size(), occupied.size(), dense.size(), picked.size(), voxel_size);
+            return result;
+        }
+    } // namespace
 
     Result<LoadResult> ColmapLoader::load(
         const std::filesystem::path& path,
@@ -266,7 +363,34 @@ namespace lfs::io {
             // Track filtering requires COLMAP sparse records, so prefer .bin/.txt when enabled.
             std::shared_ptr<PointCloud> point_cloud;
             const bool use_colmap_track_filter = options.min_track_length > 0;
-            if (has_points_ply && !use_colmap_track_filter) {
+            bool point_cloud_mixed = false;
+
+            // Mix mode: points3D.ply is the dense (e.g. LAS-derived) cloud and points3D.bin
+            // is the COLMAP sparse cloud. It runs only when both exist and the sparse cloud
+            // is read unfiltered, so every sparse point can still be kept.
+            if (options.mix_ply_with_sparse && has_points_ply && has_points && !use_colmap_track_filter) {
+                const float voxel_size = options.mix_voxel_size > 0.f ? options.mix_voxel_size : 0.2f;
+                auto dense = load_ply_point_cloud(points_ply, options);
+                if (dense) {
+                    auto sparse = read_colmap_point_cloud(path, options, &binary_point_records);
+                    if (sparse) {
+                        point_cloud = std::make_shared<PointCloud>(
+                            mixDenseWithSparse(sparse->value, *dense, voxel_size));
+                        point_cloud_mixed = true;
+                        for (auto& diagnostic : sparse->warnings)
+                            warnings.push_back(diagnostic.message);
+                        LOG_INFO("Mix init: {} points from points3D.ply (dense) + {} from points3D.bin (sparse) -> {} mixed",
+                                 dense->size(), sparse->value.size(), point_cloud->size());
+                    } else {
+                        LOG_WARN("Mix init: failed to read points3D.bin ({}); using points3D.ply only",
+                                 sparse.error().format());
+                    }
+                } else {
+                    LOG_WARN("Mix init: failed to read points3D.ply ({}); falling back to the normal load", dense.error());
+                }
+            }
+
+            if (!point_cloud && has_points_ply && !use_colmap_track_filter) {
                 LOG_INFO("Loading custom point cloud from points3D.ply");
                 LOG_TIMER_DEBUG("COLMAP load points3D.ply");
                 auto pc_result = load_ply_point_cloud(points_ply, options);
@@ -393,7 +517,8 @@ namespace lfs::io {
             LoadResult result{
                 .data = LoadedScene{
                     .cameras = std::move(cameras),
-                    .point_cloud = std::move(point_cloud)},
+                    .point_cloud = std::move(point_cloud),
+                    .point_cloud_mixed = point_cloud_mixed},
                 .scene_center = scene_center,
                 .images_have_alpha = images_have_alpha,
                 .loader_used = name(),

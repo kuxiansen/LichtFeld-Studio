@@ -402,6 +402,10 @@ namespace lfs::core {
             float grow_fraction = 0.07f;
             size_t grow_until_iter = 15000;
             float opacity_decay = 0.004f;
+            // Extra opacity floor swept every few thousand steps over the second half of
+            // refinement, so faint splats that survived the 1/255 prune cannot reach the mesh.
+            // 0 disables the sweep.
+            float mrnf_opacity_prune = 0.01f;
             float scale_decay = 0.002f;
             float means_noise_weight = 50.0f;
             float bounds_percentile = 0.8f;
@@ -417,12 +421,12 @@ namespace lfs::core {
             int init_num_pts = 100'000; // Number of random points to initialize
             float init_extent = 3.0f;   // Extent of random point cloud
 
-            // When init_path points at a plain point-cloud PLY (no splat/mesh),
-            // voxel-downsample it and keep only points whose voxel cell contains
-            // no COLMAP sparse point, then merge with the sparse cloud.  This
-            // fills holes in the SfM point cloud while preserving its density.
+            // When a dataset holds both points3D.ply and points3D.bin, treat the PLY
+            // as a dense (LAS-derived) cloud and the BIN as the COLMAP sparse cloud,
+            // then merge them at load time: keep every sparse point and add one dense
+            // point per voxel the sparse cloud leaves empty. Off keeps PLY > BIN.
             bool init_mix_with_sparse = false;
-            float init_mix_voxel_size = 0.02f;  // metres
+            float init_mix_voxel_size = 0.2f;  // metres
 
             // Mesh2Splat raster resolution when the init file is a mesh
             int init_mesh_resolution = Mesh2SplatOptions{}.resolution_target;

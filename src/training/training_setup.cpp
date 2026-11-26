@@ -82,135 +82,7 @@ namespace lfs::training {
             return params.dataset.min_track_length;
         }
 
-        // Voxel hash: packs (ix, iy, iz) into a single int64 key.
-        constexpr int64_t kVoxelHashOffset = 1 << 20;
-        int64_t voxel_hash(int ix, int iy, int iz) {
-            constexpr int64_t M = kVoxelHashOffset * 2;
-            return (int64_t)ix + kVoxelHashOffset +
-                   ((int64_t)iy + kVoxelHashOffset) * M +
-                   ((int64_t)iz + kVoxelHashOffset) * M * M;
-        }
-
-        int coord_to_voxel(float x, float voxel) {
-            if (x >= 0.0f)
-                return static_cast<int>(x / voxel);
-            return static_cast<int>((x - voxel + 1e-6f) / voxel);
-        }
-
         lfs::Error initFileError(std::string message);
-
-        struct PointCloudMergeResult {
-            std::shared_ptr<lfs::core::PointCloud> cloud;
-            size_t sparse_count;
-            size_t dense_added_count;
-        };
-
-        lfs::Result<PointCloudMergeResult> mixInitDenseWithSparse(
-            const std::shared_ptr<lfs::core::PointCloud>& sparse_pc,
-            const std::shared_ptr<lfs::core::PointCloud>& dense_pc,
-            float voxel_size) {
-            if (!sparse_pc || !sparse_pc->means.is_valid() || sparse_pc->size() == 0)
-                return initFileError("mix-with-sparse: COLMAP sparse point cloud is empty");
-            if (!dense_pc || !dense_pc->means.is_valid() || dense_pc->size() == 0)
-                return initFileError("mix-with-sparse: init_path point cloud is empty");
-            if (voxel_size <= 0.0f) {
-                LOG_WARN("init_mix_voxel_size <= 0; falling back to default 0.02 m");
-                voxel_size = 0.02f;
-            }
-
-            // Step 1: build occupied-voxel table from the COLMAP sparse cloud.
-            std::unordered_set<int64_t> occupied;
-            occupied.reserve(sparse_pc->size());
-            {
-                auto means = sparse_pc->means.cpu().contiguous();
-                auto acc = means.accessor<float, 2>();
-                for (size_t i = 0; i < sparse_pc->size(); ++i) {
-                    occupied.insert(voxel_hash(
-                        coord_to_voxel(acc(i, 0), voxel_size),
-                        coord_to_voxel(acc(i, 1), voxel_size),
-                        coord_to_voxel(acc(i, 2), voxel_size)));
-                }
-            }
-
-            // Step 2: pick one dense point per voxel not occupied by sparse.
-            std::vector<size_t> picked_indices;
-            picked_indices.reserve(dense_pc->size());
-            std::unordered_set<int64_t> picked_voxels;
-            picked_voxels.reserve(occupied.size());
-            {
-                auto means = dense_pc->means.cpu().contiguous();
-                auto acc = means.accessor<float, 2>();
-                for (size_t i = 0; i < dense_pc->size(); ++i) {
-                    const int64_t key = voxel_hash(
-                        coord_to_voxel(acc(i, 0), voxel_size),
-                        coord_to_voxel(acc(i, 1), voxel_size),
-                        coord_to_voxel(acc(i, 2), voxel_size));
-                    if (occupied.find(key) == occupied.end() &&
-                        picked_voxels.find(key) == picked_voxels.end()) {
-                        picked_indices.push_back(i);
-                        picked_voxels.insert(key);
-                    }
-                }
-            }
-
-            LOG_INFO("Mix init: sparse={} pts in {} voxels; dense={} pts → pick {} supplementary (voxel={} m)",
-                     sparse_pc->size(), occupied.size(), dense_pc->size(), picked_indices.size(), voxel_size);
-
-            // Step 3: concatenate sparse + picked dense into a new PointCloud.
-            const size_t total = sparse_pc->size() + picked_indices.size();
-            auto concat_field = [&](const lfs::core::Tensor& sparse_t,
-                                    const lfs::core::Tensor& dense_t) -> lfs::core::Tensor {
-                const bool sparse_ok = sparse_t.is_valid() && sparse_t.numel() > 0 && sparse_t.ndim() == 2;
-                const bool dense_ok = dense_t.is_valid() && dense_t.numel() > 0 && dense_t.ndim() == 2;
-                if (!sparse_ok && !dense_ok)
-                    return lfs::core::Tensor();
-                if (!sparse_ok) {
-                    auto dst = lfs::core::Tensor::zeros(
-                        {picked_indices.size(), dense_t.shape()[1]}, dense_t.device(), dense_t.dtype());
-                    const size_t row_bytes = dense_t.shape()[1] * lfs::core::dtype_size(dense_t.dtype());
-                    const auto src_cpu = dense_t.cpu().contiguous();
-                    const uint8_t* src_ptr = static_cast<const uint8_t*>(src_cpu.data_ptr());
-                    uint8_t* dst_ptr = static_cast<uint8_t*>(dst.data_ptr());
-                    for (size_t idx : picked_indices) {
-                        std::memcpy(dst_ptr, src_ptr + idx * row_bytes, row_bytes);
-                        dst_ptr += row_bytes;
-                    }
-                    return dst;
-                }
-                const auto shape = sparse_t.shape();
-                auto dst = lfs::core::Tensor::zeros({total, shape[1]}, sparse_t.device(), sparse_t.dtype());
-                const size_t row_bytes = shape[1] * lfs::core::dtype_size(sparse_t.dtype());
-                std::memcpy(dst.data_ptr(), sparse_t.cpu().contiguous().data_ptr(),
-                            sparse_pc->size() * row_bytes);
-                if (dense_ok) {
-                    auto dense_cpu = dense_t.cpu().contiguous();
-                    uint8_t* dst_ptr = static_cast<uint8_t*>(dst.data_ptr()) + sparse_pc->size() * row_bytes;
-                    const uint8_t* src_ptr = static_cast<const uint8_t*>(dense_cpu.data_ptr());
-                    const size_t d_row_bytes = dense_t.shape()[1] * lfs::core::dtype_size(dense_t.dtype());
-                    for (size_t idx : picked_indices) {
-                        std::memcpy(dst_ptr, src_ptr + idx * d_row_bytes, row_bytes);
-                        dst_ptr += row_bytes;
-                    }
-                }
-                return dst;
-            };
-
-            auto result = std::make_shared<lfs::core::PointCloud>();
-            result->means    = concat_field(sparse_pc->means,    dense_pc->means);
-            result->colors   = concat_field(sparse_pc->colors,   dense_pc->colors);
-            result->normals  = concat_field(sparse_pc->normals,  dense_pc->normals);
-            result->sh0      = concat_field(sparse_pc->sh0,      dense_pc->sh0);
-            result->shN      = concat_field(sparse_pc->shN,      dense_pc->shN);
-            result->opacity  = concat_field(sparse_pc->opacity,  dense_pc->opacity);
-            result->scaling  = concat_field(sparse_pc->scaling,  dense_pc->scaling);
-            result->rotation = concat_field(sparse_pc->rotation, dense_pc->rotation);
-
-            return PointCloudMergeResult{
-                .cloud = std::move(result),
-                .sparse_count = static_cast<size_t>(sparse_pc->size()),
-                .dense_added_count = picked_indices.size(),
-            };
-        }
 
         void randomChoosePointCloud(lfs::core::PointCloud& point_cloud,
                                     const int target_count,
@@ -571,53 +443,19 @@ namespace lfs::training {
 
             const bool use_init_path = params.init_path.has_value() && !params.init_path->empty();
 
-            if (params.optimization.init_mix_with_sparse && !use_init_path) {
-                LOG_WARN("init_mix_with_sparse is enabled but init_path is not set; mix mode has no effect");
-            }
-
-            if (use_init_path) {
+            if (data.point_cloud_mixed) {
+                // The loader already merged points3D.ply (dense) with points3D.bin (sparse)
+                // using the mix switch and voxel size from the training parameters.
+                point_cloud = data.point_cloud;
+                LOG_INFO("Mix init: using {} points merged from points3D.ply and points3D.bin", point_cloud->size());
+            } else if (use_init_path) {
                 const auto init_file = lfs::core::utf8_to_path(*params.init_path);
-                const bool mix_requested = params.optimization.init_mix_with_sparse;
-                const bool mix_eligible = mix_requested && isPlainPointCloudPly(init_file);
-                if (mix_requested && !mix_eligible) {
-                    LOG_WARN("init_mix_with_sparse is enabled but '{}' is not a plain point-cloud PLY "
-                             "(mesh / splat init files are not supported for mixing); falling back to pure init_path",
-                             lfs::core::path_to_utf8(init_file.filename()));
+                auto loaded = loadInitReplacementPointCloud(init_file, true);
+                if (!loaded) {
+                    return lfs::Status::failure(loaded.error());
                 }
-
-                const bool has_sparse = data.point_cloud && data.point_cloud->size() > 0;
-                if (mix_eligible && has_sparse) {
-                    // --------------------------------------------------------
-                    // Mix mode: init_path plain point-cloud PLY fills holes in
-                    // the COLMAP sparse cloud via voxel-level occupancy checks.
-                    // --------------------------------------------------------
-                    auto dense = loadInitReplacementPointCloud(init_file);
-                    if (!dense) return lfs::Status::failure(dense.error());
-                    LOG_INFO("Mix init: sparse={} pts, init_path '{}'={} pts, voxel={} m",
-                             data.point_cloud->size(),
-                             lfs::core::path_to_utf8(init_file.filename()),
-                             dense.value()->size(),
-                             params.optimization.init_mix_voxel_size);
-                    auto mixed = mixInitDenseWithSparse(
-                        data.point_cloud, *dense,
-                        params.optimization.init_mix_voxel_size);
-                    if (!mixed) return lfs::Status::failure(mixed.error());
-                    point_cloud = std::move(mixed->cloud);
-                    centerInitializationMeans(point_cloud->means, scene.getTrainingDataOrigin());
-                    LOG_INFO("Mix init result: {} points total ({} sparse + {} dense-supplemented, voxel={} m)",
-                             point_cloud->size(), mixed->sparse_count, mixed->dense_added_count,
-                             params.optimization.init_mix_voxel_size);
-                } else {
-                    if (mix_eligible) {
-                        LOG_WARN("init_mix_with_sparse: COLMAP sparse point cloud is empty; using init_path as-is");
-                    }
-                    auto loaded = loadInitReplacementPointCloud(init_file, true);
-                    if (!loaded) {
-                        return lfs::Status::failure(loaded.error());
-                    }
-                    point_cloud = std::move(*loaded);
-                    centerInitializationMeans(point_cloud->means, scene.getTrainingDataOrigin());
-                }
+                point_cloud = std::move(*loaded);
+                centerInitializationMeans(point_cloud->means, scene.getTrainingDataOrigin());
             } else if (data.point_cloud && data.point_cloud->size() > 0) {
                 point_cloud = data.point_cloud;
             } else {
@@ -632,7 +470,7 @@ namespace lfs::training {
             // Keep the COLMAP sparse cloud as the initial point cloud when an
             // init_path replaces it, so mix mode can combine both at training start.
             const std::shared_ptr<lfs::core::PointCloud> initial_cloud =
-                (use_init_path && data.point_cloud && data.point_cloud->size() > 0)
+                (!data.point_cloud_mixed && use_init_path && data.point_cloud && data.point_cloud->size() > 0)
                     ? data.point_cloud
                     : point_cloud;
             scene.setInitialPointCloud(initial_cloud);
@@ -1200,7 +1038,9 @@ namespace lfs::training {
                     .progress = percentage,
                     .step = message}
                     .emit();
-            }};
+            },
+            .mix_ply_with_sparse = params.optimization.init_mix_with_sparse,
+            .mix_voxel_size = params.optimization.init_mix_voxel_size};
 
         LOG_INFO("Loading dataset from: {}", lfs::core::path_to_utf8(params.dataset.data_path));
         auto result = data_loader->load(params.dataset.data_path, load_options);
@@ -1363,7 +1203,9 @@ namespace lfs::training {
             .max_width = params.dataset.max_width,
             .images_folder = params.dataset.images,
             .min_track_length = effectiveMinTrackLengthForLoad(params),
-            .centralize = parse_centralize(params.dataset.centralize_dataset)};
+            .centralize = parse_centralize(params.dataset.centralize_dataset),
+            .mix_ply_with_sparse = params.optimization.init_mix_with_sparse,
+            .mix_voxel_size = params.optimization.init_mix_voxel_size};
         const auto data_path = lfs::core::path_to_utf8(params.dataset.data_path);
         auto load_result = lfs::io::Loader::create()->load(params.dataset.data_path, load_options);
         if (!load_result)
@@ -1525,27 +1367,8 @@ namespace lfs::training {
             point_cloud_to_use = *createRandomPointCloud(params);
         }
 
-        // Apply init_path/sparse mixing here (training start) so the option can be
-        // toggled after the dataset was imported, matching the normal UI flow.
-        if (params.optimization.init_mix_with_sparse && point_cloud &&
-            point_cloud->size() > 0 && params.init_path.has_value() &&
-            !params.init_path->empty()) {
-            const auto init_file = lfs::core::utf8_to_path(*params.init_path);
-            const auto sparse = scene.getInitialPointCloud();
-            if (isPlainPointCloudPly(init_file) && sparse && sparse->size() > 0) {
-                const auto dense = std::make_shared<lfs::core::PointCloud>(point_cloud_to_use);
-                auto mixed = mixInitDenseWithSparse(
-                    sparse, dense, params.optimization.init_mix_voxel_size);
-                if (!mixed) {
-                    return std::unexpected(std::string(mixed.error().user_message()));
-                }
-                point_cloud_to_use = *mixed->cloud;
-                LOG_INFO("Mix init (training start): {} points total ({} sparse + {} dense-supplemented, voxel={} m)",
-                         point_cloud_to_use.size(), mixed->sparse_count,
-                         mixed->dense_added_count, params.optimization.init_mix_voxel_size);
-            }
-        }
-
+        // The loader merges points3D.ply with points3D.bin when the mix switch is on,
+        // so the point cloud carried by the dataset node is already final here.
         if (!params.optimization.random && max_cap > 0 &&
             point_cloud_to_use.size() > static_cast<int64_t>(max_cap)) {
             LOG_WARN("Max cap ({}) is less than initial point count ({}), "

@@ -729,6 +729,7 @@
     "init.noise_infill_mesh": "Noise Infill Mesh:",
     "thresholds.min_opacity": "Min Opacity:",
     "thresholds.prune_opacity": "Prune Opacity:",
+    "thresholds.mrnf_opacity_prune": "MRNF Opacity Sweep",
     "value.none": "(none)",
     "value.crop_box": "Crop box",
     "value.mask_folder": "Masks: {}",
@@ -802,6 +803,7 @@
       "bilateral_grid_w": "Controls how many brightness/appearance levels the grid can distinguish. Increase it when dark and bright areas need different corrections; lower it for smoother behavior and less overfitting. Only applies when Bilateral Grid or Exposure Correction is enabled.",
       "bilateral_grid_lr": "Controls how quickly the grid learns color/appearance correction. Increase it if correction is too slow or too weak; decrease it if colors shift too aggressively, flicker, or become unstable. Only applies when Bilateral Grid or Exposure Correction is enabled.",
       "prune_opacity": "IGS+ pruning threshold. Raise to remove weak splats more aggressively; lower to keep faint/detail splats.",
+      "mrnf_opacity_prune": "Opacity floor swept every ten refine intervals over the second half of refinement. Raise to drop faint splats before meshing; 0 disables.",
       "min_opacity": "Controls when faint Gaussians are considered too transparent to keep. Raise it to clean up weak floating splats more aggressively; lower it to preserve faint detail.",
       "opt": {
         "strategy": {
@@ -1728,6 +1730,8 @@
     "min_track_length": "Minimum Track Length",
     "min_track_length_hint": "Keeps sparse points observed in at least this many images. 0 disables filtering.",
     "min_track_length_init_warning": "Ignored while Init PLY is set.",
+    "mix_ply_with_sparse": "Mix Init with Sparse Points",
+    "mix_ply_with_sparse_hint": "When both points3D.ply and points3D.bin exist, keep every COLMAP sparse point and fill the remaining space with points3D.ply at 0.2 m voxels.",
     "apply_auto_crop": "Apply Auto Crop",
     "save_title": "Save Project?",
     "save_message": "Save the current project before loading the new dataset?",

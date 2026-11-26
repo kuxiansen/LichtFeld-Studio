@@ -407,7 +407,7 @@ def clear_scene() -> None:
 def switch_to_edit_mode() -> None:
     """Switch from training to edit mode"""
 
-def load_file(path: str, is_dataset: bool = False, output_path: str = '', init_path: str = '', centralize_dataset: str = 'off', max_width: int | None = None, apply_auto_crop: bool = False, min_track_length: int | None = None, stop_training: bool = False, discard_changes: bool = False, replace: bool = False, images_folder: str = '') -> None:
+def load_file(path: str, is_dataset: bool = False, output_path: str = '', init_path: str = '', centralize_dataset: str = 'off', max_width: int | None = None, apply_auto_crop: bool = False, min_track_length: int | None = None, stop_training: bool = False, discard_changes: bool = False, replace: bool = False, images_folder: str = '', mix_ply_with_sparse: bool = False, mix_voxel_size: float = 0.20000000298023224) -> None:
     """Load a file (PLY, checkpoint) or dataset into the scene."""
 
 def load_files(paths: Sequence[str], stop_training: bool = False, discard_changes: bool = False, replace: bool = False, _user_batch: bool = False) -> None:
@@ -2578,6 +2578,22 @@ class OptimizationParams:
 
     @ppisp_exposure_from_exif.setter
     def ppisp_exposure_from_exif(self, arg: bool, /) -> None: ...
+
+    @property
+    def init_mix_with_sparse(self) -> bool:
+        """
+        Merge points3D.ply (dense) with points3D.bin (sparse) when loading a dataset
+        """
+
+    @init_mix_with_sparse.setter
+    def init_mix_with_sparse(self, arg: bool, /) -> None: ...
+
+    @property
+    def init_mix_voxel_size(self) -> float:
+        """Voxel size in metres used by the dataset-load mix"""
+
+    @init_mix_voxel_size.setter
+    def init_mix_voxel_size(self, arg: float, /) -> None: ...
 
     @property
     def ppisp_use_controller(self) -> bool:

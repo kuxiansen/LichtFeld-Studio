@@ -720,6 +720,7 @@
     "init.noise_infill_mesh": "Maillage de remplissage de bruit :",
     "thresholds.min_opacity": "Opacité min. :",
     "thresholds.prune_opacity": "Élaguer l'opacité :",
+    "thresholds.mrnf_opacity_prune": "Balayage d'opacité MRNF",
     "value.none": "(aucun)",
     "value.crop_box": "Boîte de recadrage",
     "value.mask_folder": "Masques : {}",
@@ -793,6 +794,7 @@
       "bilateral_grid_w": "Contrôle combien de niveaux de luminosité/apparence le grid peut distinguer. Augmentez lorsque zones sombres et claires nécessitent des corrections différentes ; baissez pour un comportement plus lisse et moins de surapprentissage. S'applique seulement lorsque Bilateral Grid ou Exposure Correction est activé.",
       "bilateral_grid_lr": "Contrôle la vitesse à laquelle le grid apprend la correction couleur/apparence. Augmentez si la correction est trop lente ou faible ; baissez si les couleurs changent trop agressivement, scintillent ou deviennent instables. S'applique seulement lorsque Bilateral Grid ou Exposure Correction est activé.",
       "prune_opacity": "Seuil d'élagage IGS+. Augmentez-le pour retirer plus agressivement les splats faibles ; baissez-le pour garder les splats faibles/de détail.",
+      "mrnf_opacity_prune": "Seuil d'opacité appliqué tous les dix intervalles d'affinage sur la seconde moitié; 0 désactive.",
       "min_opacity": "Contrôle quand des Gaussians faibles sont considérés trop transparents pour être conservés. Augmentez-le pour nettoyer plus agressivement les splats flottants faibles ; baissez-le pour préserver les détails subtils.",
       "opt": {
         "strategy": {

@@ -963,6 +963,27 @@ namespace lfs::training {
                           compute_near_zero_rotation_mask(_splat_data->rotation_raw()) |
                           (scale_max < MRNF_LOG_MIN_SCALE_THRESHOLD);
 
+        // Second half of refinement gets a stricter opacity floor every few thousand steps: the
+        // 1/255 prune leaves faint splats that still reach the mesh as floating haze.
+        const float sweep_opacity = std::clamp(_params->mrnf_opacity_prune, 0.f, .999f);
+        const int sweep_start = (static_cast<int>(_params->start_refine) +
+                                 static_cast<int>(_params->stop_refine)) / 2;
+        const int sweep_every = static_cast<int>(_params->refine_every) * 10;
+        if (sweep_opacity > 0.f && sweep_every > 0 && iter >= sweep_start &&
+            iter < static_cast<int>(_params->stop_refine) &&
+            (_last_opacity_sweep_iter < 0 ||
+             iter - _last_opacity_sweep_iter >= sweep_every)) {
+            _last_opacity_sweep_iter = iter;
+            const float sweep_logit = std::log(sweep_opacity / (1.f - sweep_opacity));
+            const auto sweep_mask = raw_opacities < sweep_logit;
+            const int swept = static_cast<int>(
+                sweep_mask.to(DataType::Int32).sum().template item<int>());
+            if (swept > 0)
+                prune_mask = prune_mask | sweep_mask;
+            LOG_INFO("MRNF: opacity sweep below {:.3g} at iter {} drops {} splats",
+                     sweep_opacity, iter, swept);
+        }
+
         if (_free_mask.is_valid() && n > 0) {
             auto active_mask = _free_mask.slice(0, 0, n).logical_not();
             prune_mask = prune_mask.logical_and(active_mask);

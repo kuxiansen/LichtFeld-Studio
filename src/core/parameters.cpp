@@ -1104,6 +1104,7 @@ namespace lfs::core {
                 std::pair{"prune_opacity", prune_opacity},
                 std::pair{"grow_fraction", grow_fraction},
                 std::pair{"opacity_decay", opacity_decay},
+                std::pair{"mrnf_opacity_prune", mrnf_opacity_prune},
                 std::pair{"scale_decay", scale_decay},
                 std::pair{"bounds_percentile", bounds_percentile},
                 std::pair{"normal_start_fraction", normal_start_fraction},

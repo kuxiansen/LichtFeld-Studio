@@ -1376,6 +1376,16 @@ namespace lfs::python {
                 [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.ppisp_exposure_from_exif = v; }); },
                 "Seed per-frame PPISP exposure from image EXIF")
             .def_prop_rw(
+                "init_mix_with_sparse",
+                [](PyOptimizationParams& self) { return self.params().init_mix_with_sparse; },
+                [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.init_mix_with_sparse = v; }); },
+                "Merge points3D.ply (dense) with points3D.bin (sparse) when loading a dataset")
+            .def_prop_rw(
+                "init_mix_voxel_size",
+                [](PyOptimizationParams& self) { return self.params().init_mix_voxel_size; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.init_mix_voxel_size = v; }); },
+                "Voxel size in metres used by the dataset-load mix")
+            .def_prop_rw(
                 "ppisp_use_controller",
                 [](PyOptimizationParams& self) { return self.params().ppisp_use_controller; },
                 [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.ppisp_use_controller = v; }); },

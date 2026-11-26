@@ -720,6 +720,7 @@
     "init.noise_infill_mesh": "噪声填充网格:",
     "thresholds.min_opacity": "最小不透明度:",
     "thresholds.prune_opacity": "不透明度修剪:",
+    "thresholds.mrnf_opacity_prune": "MRNF 不透明度清扫",
     "value.none": "(无)",
     "value.crop_box": "crop box",
     "value.mask_folder": "遮罩: {}",
@@ -793,6 +794,7 @@
       "bilateral_grid_w": "控制 grid 可区分的亮度/appearance 层级数量。暗区和亮区需要不同校正时提高；想要更平滑行为和更少过拟合时降低。仅在 Bilateral Grid 或 Exposure Correction 启用时适用。",
       "bilateral_grid_lr": "控制 grid 学习颜色/appearance 校正的速度。校正太慢或太弱时提高；颜色变化太激进、闪烁或不稳定时降低。仅在 Bilateral Grid 或 Exposure Correction 启用时适用。",
       "prune_opacity": "IGS+ pruning 阈值。提高可更积极地移除弱 splat；降低可保留微弱/细节 splat。",
+      "mrnf_opacity_prune": "细化后半段每十个 refine 间隔清扫一次的不透明度下限。提高可在建 mesh 前移除微弱点；0 表示关闭。",
       "min_opacity": "控制何时认为微弱 Gaussians 透明度过高而不应保留。提高可更积极清理弱浮动 splat；降低可保留微弱细节。",
       "opt": {
         "strategy": {
@@ -1717,6 +1719,8 @@
     "min_track_length": "最小轨迹长度",
     "min_track_length_hint": "保留至少在这么多图像中观测到的 Sparse 点。0 可禁用筛选。",
     "min_track_length_init_warning": "设置初始 PLY 时将被忽略。",
+    "mix_ply_with_sparse": "与稀疏点混合初始化",
+    "mix_ply_with_sparse_hint": "当 points3D.ply 与 points3D.bin 同时存在时，保留全部 COLMAP 稀疏点，并用 points3D.ply 以 0.2 米体素补充其余空间。",
     "apply_auto_crop": "应用自动裁剪",
     "save_title": "保存项目？",
     "save_message": "加载新数据集前要保存当前项目吗？",

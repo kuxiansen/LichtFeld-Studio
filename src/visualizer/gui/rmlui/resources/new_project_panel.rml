@@ -130,6 +130,15 @@
           <span class="impdlg-meta status-warning" data-if="show_min_track_length_warning">@tr:load_dataset_popup.min_track_length_init_warning</span>
         </div>
       </div>
+      <div class="impdlg-control-group" data-if="source_is_dataset">
+        <span class="impdlg-field-label text-muted">@tr:load_dataset_popup.mix_ply_with_sparse</span>
+        <div class="impdlg-control-main">
+          <label class="impdlg-checkbox-label">
+            <input type="checkbox" data-checked="mix_ply_with_sparse" />
+            <span class="text-muted">@tr:load_dataset_popup.mix_ply_with_sparse_hint</span>
+          </label>
+        </div>
+      </div>
     </div>
 
     <div class="impdlg-buttons">

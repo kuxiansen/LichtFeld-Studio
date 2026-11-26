@@ -720,6 +720,7 @@
     "init.noise_infill_mesh": "노이즈 채움 메시:",
     "thresholds.min_opacity": "최소 불투명도:",
     "thresholds.prune_opacity": "불투명도 가지치기:",
+    "thresholds.mrnf_opacity_prune": "MRNF 불투명도 스윕",
     "value.none": "(없음)",
     "value.crop_box": "crop box",
     "value.mask_folder": "마스크: {}",
@@ -793,6 +794,7 @@
       "bilateral_grid_w": "grid가 구분할 수 있는 밝기/appearance 단계 수를 제어합니다. 어두운 영역과 밝은 영역에 다른 보정이 필요하면 올리고, 더 부드러운 동작과 덜한 overfitting을 원하면 낮춥니다. Bilateral Grid 또는 Exposure Correction이 활성화된 경우에만 적용됩니다.",
       "bilateral_grid_lr": "grid가 색상/appearance 보정을 얼마나 빠르게 학습하는지 제어합니다. 보정이 너무 느리거나 약하면 올리고, 색상이 너무 공격적으로 변하거나 깜박이거나 불안정하면 낮춥니다. Bilateral Grid 또는 Exposure Correction이 활성화된 경우에만 적용됩니다.",
       "prune_opacity": "IGS+ pruning 임계값입니다. 약한 splat을 더 적극적으로 제거하려면 올리고, 희미한/디테일 splat을 유지하려면 낮춥니다.",
+      "mrnf_opacity_prune": "정제 후반부에서 리파인 간격 10회마다 적용하는 불투명도 하한. 0이면 비활성화.",
       "min_opacity": "희미한 Gaussians를 유지하기에 너무 투명하다고 볼 시점을 제어합니다. 약한 떠다니는 splat을 더 적극적으로 정리하려면 올리고, 희미한 디테일을 보존하려면 낮춥니다.",
       "opt": {
         "strategy": {

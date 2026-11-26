@@ -720,6 +720,7 @@
     "init.noise_infill_mesh": "Malla de relleno de ruido:",
     "thresholds.min_opacity": "Opacidad mín.:",
     "thresholds.prune_opacity": "Podar opacidad:",
+    "thresholds.mrnf_opacity_prune": "Barrido de opacidad MRNF",
     "value.none": "(ninguno)",
     "value.crop_box": "Caja de recorte",
     "value.mask_folder": "Máscaras: {}",
@@ -793,6 +794,7 @@
       "bilateral_grid_w": "Controla cuántos niveles de brillo/apariencia puede distinguir el grid. Auméntalo cuando zonas oscuras y brillantes necesiten correcciones diferentes; bájalo para un comportamiento más suave y menos sobreajuste. Solo aplica cuando Bilateral Grid o Exposure Correction está activado.",
       "bilateral_grid_lr": "Controla qué tan rápido el grid aprende la corrección de color/apariencia. Auméntalo si la corrección es demasiado lenta o débil; bájalo si los colores cambian demasiado agresivamente, parpadean o se vuelven inestables. Solo aplica cuando Bilateral Grid o Exposure Correction está activado.",
       "prune_opacity": "Umbral de poda de IGS+. Súbelo para eliminar splats débiles con más agresividad; bájalo para conservar splats tenues o de detalle.",
+      "mrnf_opacity_prune": "Límite de opacidad aplicado cada diez intervalos de refinamiento en la segunda mitad; 0 lo desactiva.",
       "min_opacity": "Controla cuándo los Gaussians tenues se consideran demasiado transparentes para conservarse. Súbelo para limpiar splats flotantes débiles más agresivamente; bájalo para preservar detalle tenue.",
       "opt": {
         "strategy": {

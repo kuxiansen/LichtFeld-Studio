@@ -720,6 +720,7 @@
     "init.noise_infill_mesh": "ノイズ充填メッシュ:",
     "thresholds.min_opacity": "最小不透明度:",
     "thresholds.prune_opacity": "不透明度のプルーニング:",
+    "thresholds.mrnf_opacity_prune": "MRNF 不透明度スイープ",
     "value.none": "(なし)",
     "value.crop_box": "crop box",
     "value.mask_folder": "マスク: {}",
@@ -793,6 +794,7 @@
       "bilateral_grid_w": "grid が区別できる明るさ/appearance レベル数を制御します。暗い領域と明るい領域で異なる補正が必要な場合は上げ、より滑らかで overfitting の少ない挙動にするには下げます。Bilateral Grid または Exposure Correction が有効な場合だけ適用されます。",
       "bilateral_grid_lr": "grid が色/appearance 補正を学ぶ速さを制御します。補正が遅すぎる、または弱すぎる場合は上げ、色が強く変わりすぎる、ちらつく、不安定になる場合は下げます。Bilateral Grid または Exposure Correction が有効な場合だけ適用されます。",
       "prune_opacity": "IGS+ の pruning しきい値です。弱い splat をより積極的に取り除くには上げ、淡い/細部の splat を残すには下げます。",
+      "mrnf_opacity_prune": "リファイン後半で10回のリファイン間隔ごとに適用する不透明度の下限。0 で無効。",
       "min_opacity": "淡い Gaussians を保持するには透明すぎると見なすタイミングを制御します。弱い浮遊 splat を積極的に掃除するには上げ、淡いディテールを残すには下げます。",
       "opt": {
         "strategy": {

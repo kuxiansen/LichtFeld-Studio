@@ -2023,7 +2023,9 @@ NB_MODULE(lichtfeld, m) {
            bool stop_training,
            bool discard_changes,
            bool replace,
-           const std::string& images_folder) {
+           const std::string& images_folder,
+           bool mix_ply_with_sparse,
+           float mix_voxel_size) {
             nb::gil_scoped_release release;
             lfs::core::events::cmd::LoadFile command{
                 .path = python_utf8_path(path),
@@ -2037,7 +2039,9 @@ NB_MODULE(lichtfeld, m) {
                 .stop_training = stop_training,
                 .discard_changes = discard_changes,
                 .replace = replace,
-                .images_folder = images_folder};
+                .images_folder = images_folder,
+                .mix_ply_with_sparse = mix_ply_with_sparse,
+                .mix_voxel_size = mix_voxel_size};
             emit_project_cmd_marshaled(
                 "python.load_file",
                 [command = std::move(command)] { command.emit(); });
@@ -2052,6 +2056,8 @@ NB_MODULE(lichtfeld, m) {
         nb::arg("discard_changes") = false,
         nb::arg("replace") = false,
         nb::arg("images_folder") = "",
+        nb::arg("mix_ply_with_sparse") = false,
+        nb::arg("mix_voxel_size") = 0.2f,
         "Load a file (PLY, checkpoint) or dataset into the scene.");
 
     m.def(

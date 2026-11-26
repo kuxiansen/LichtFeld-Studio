@@ -332,6 +332,7 @@ namespace lfs::training {
         lfs::core::Tensor _renders;                                             // [N] steps rendered since birth
         int _retire_first_iter = -1;                                            // first refine at the cap
         size_t _last_retired = 0;                                               // retirees of the current refine
+        int _last_opacity_sweep_iter = -1;                                      // last extra opacity sweep
         float _covered_log_size_floor = std::numeric_limits<float>::infinity(); // log of the keep-covered size floor
 
         DensifyNScratch _densify_n_scratch;

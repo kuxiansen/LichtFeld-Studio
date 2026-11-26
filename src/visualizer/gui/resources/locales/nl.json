@@ -720,6 +720,7 @@
     "init.noise_infill_mesh": "Ruisvulling-mesh:",
     "thresholds.min_opacity": "Min. opaciteit:",
     "thresholds.prune_opacity": "Opaciteit snoeien:",
+    "thresholds.mrnf_opacity_prune": "MRNF-opaciteitssweep",
     "value.none": "(geen)",
     "value.crop_box": "Crop box",
     "value.mask_folder": "Maskers: {}",
@@ -793,6 +794,7 @@
       "bilateral_grid_w": "Bepaalt hoeveel helderheids-/appearance-niveaus het grid kan onderscheiden. Verhoog wanneer donkere en heldere gebieden verschillende correcties nodig hebben; verlaag voor soepeler gedrag en minder overfitting. Geldt alleen wanneer Bilateral Grid of Exposure Correction actief is.",
       "bilateral_grid_lr": "Bepaalt hoe snel het grid kleur-/appearance-correctie leert. Verhoog als correctie te langzaam of zwak is; verlaag als kleuren te agressief verschuiven, flikkeren of instabiel worden. Geldt alleen wanneer Bilateral Grid of Exposure Correction actief is.",
       "prune_opacity": "IGS+-pruningdrempel. Verhoog om zwakke splats agressiever te verwijderen; verlaag om zwakke/detail-splats te behouden.",
+      "mrnf_opacity_prune": "Opaciteitsondergrens elke tien verfijningsintervallen in de tweede helft; 0 schakelt uit.",
       "min_opacity": "Bepaalt wanneer zwakke Gaussians te transparant worden geacht om te behouden. Verhoog om zwakke zwevende splats agressiever op te ruimen; verlaag om subtiel detail te behouden.",
       "opt": {
         "strategy": {

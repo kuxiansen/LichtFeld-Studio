@@ -193,6 +193,7 @@ class NewProjectPanel(_ImportDialogPanel):
         self._min_track_length = 0
         self._min_track_length_str = "0"
         self._apply_auto_crop = False
+        self._mix_ply_with_sparse = False
         self._embed_dataset = False
         self._advanced_expanded = False
         self._last_lang = ""
@@ -241,6 +242,7 @@ class NewProjectPanel(_ImportDialogPanel):
         model.bind("max_width_disabled", lambda: self._max_width == 0, self._set_max_width_disabled)
         model.bind("min_track_length_str", lambda: self._min_track_length_str, self._set_min_track_length_str)
         model.bind("apply_auto_crop", lambda: self._apply_auto_crop, self._set_apply_auto_crop)
+        model.bind("mix_ply_with_sparse", lambda: self._mix_ply_with_sparse, self._set_mix_ply_with_sparse)
         model.bind("embed_dataset", lambda: self._embed_dataset, self._set_embed_dataset)
 
         model.bind_event("browse_destination", self._on_browse_destination)
@@ -291,6 +293,7 @@ class NewProjectPanel(_ImportDialogPanel):
         self._min_track_length = 0
         self._min_track_length_str = "0"
         self._apply_auto_crop = False
+        self._mix_ply_with_sparse = False
         self._embed_dataset = bool(getattr(lf.ui, "get_embed_dataset_by_default", lambda: False)())
         self._advanced_expanded = False
         self._source_generation += 1
@@ -358,6 +361,7 @@ class NewProjectPanel(_ImportDialogPanel):
             "create_hint",
             "min_track_length_str",
             "embed_dataset_visible",
+            "mix_ply_with_sparse",
         )
 
     @staticmethod
@@ -754,6 +758,14 @@ class NewProjectPanel(_ImportDialogPanel):
         self._apply_auto_crop = enabled
         self._dirty_model("apply_auto_crop")
 
+    def _set_mix_ply_with_sparse(self, value):
+        enabled = value if isinstance(value, bool) else str(value).strip().lower() in ("1", "true", "yes", "on")
+        lf.log.info(f"mix_ply_with_sparse setter: value={value!r} enabled={enabled}")
+        if enabled == self._mix_ply_with_sparse:
+            return
+        self._mix_ply_with_sparse = enabled
+        self._dirty_model("mix_ply_with_sparse")
+
     def _set_embed_dataset(self, value):
         value = bool(value)
         if value == self._embed_dataset:
@@ -806,6 +818,8 @@ class NewProjectPanel(_ImportDialogPanel):
         centralize_dataset = self._centralize_dataset
         max_width = self._max_width
         apply_auto_crop = self._apply_auto_crop
+        mix_ply_with_sparse = self._mix_ply_with_sparse
+        lf.log.info(f"mix_ply_with_sparse at create: {mix_ply_with_sparse!r}")
         min_track_length = self._min_track_length
         embed_dataset = self._embed_dataset
         images_folder = ""
@@ -852,6 +866,7 @@ class NewProjectPanel(_ImportDialogPanel):
                 return
             params = lf.optimization_params()
             if params and params.has_params():
+                params.init_mix_with_sparse = bool(mix_ply_with_sparse)
                 params.ppisp_sidecar_path = ppisp_sidecar_path
                 params.ppisp_freeze_from_sidecar = bool(ppisp_sidecar_path)
                 if ppisp_sidecar_path:
@@ -868,6 +883,7 @@ class NewProjectPanel(_ImportDialogPanel):
                     "max_width": max_width,
                     "apply_auto_crop": apply_auto_crop,
                     "min_track_length": min_track_length,
+                    "mix_ply_with_sparse": bool(mix_ply_with_sparse),
                     "discard_changes": True,
                 }
                 if stop_training:

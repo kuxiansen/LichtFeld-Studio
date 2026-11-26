@@ -622,6 +622,15 @@ namespace lfs::core::param {
             .flags(PROP_ADVANCED)
             .strategies({"mrnf"})
             .all_strategies()
+            .float_prop(&OptimizationParameters::mrnf_opacity_prune,
+                        "mrnf_opacity_prune", "MRNF Opacity Sweep", d.mrnf_opacity_prune, 0.0f, 1.0f,
+                        "Opacity floor swept every few thousand steps over the second half of refinement; 0 disables")
+            .locale("training.thresholds.mrnf_opacity_prune")
+            .tooltip("training.tooltip.mrnf_opacity_prune")
+            .precision(4)
+            .ui_step(0.001)
+            .strategies({"mrnf"})
+            .all_strategies()
             .float_prop(&OptimizationParameters::scale_decay,
                         "scale_decay", "Scale Decay", d.scale_decay, 0.0f, 0.1f,
                         "Scale decay rate per refine (MRNF)")
@@ -919,21 +928,6 @@ namespace lfs::core::param {
             .tooltip("training.tooltip.mesh_resolution")
             .precision(0)
             .ui_step(128)
-            .all_strategies()
-            .bool_prop(&OptimizationParameters::init_mix_with_sparse,
-                       "init_mix_with_sparse", "Mix Init with Sparse Points", d.init_mix_with_sparse,
-                       "When init_path points at a plain point-cloud PLY, voxel-downsample it and keep only points whose voxel cell contains no COLMAP sparse point, then merge with the sparse cloud")
-            .locale("training.init.mix_with_sparse")
-            .tooltip("training.tooltip.mix_with_sparse")
-            .flags(PROP_NEEDS_RESTART)
-            .all_strategies()
-            .float_prop(&OptimizationParameters::init_mix_voxel_size,
-                        "init_mix_voxel_size", "Mix Voxel Size (m)", d.init_mix_voxel_size, 0.001f, 0.5f,
-                        "Voxel size in metres used to downsample the init_path dense point cloud before merging with the COLMAP sparse cloud")
-            .locale("training.init.mix_voxel_size")
-            .tooltip("training.tooltip.mix_voxel_size")
-            .precision(3)
-            .ui_step(0.005)
             .all_strategies()
             .string_prop(&OptimizationParameters::noise_infill_mesh,
                          "noise_infill_mesh", "Noise Infill Mesh", d.noise_infill_mesh,

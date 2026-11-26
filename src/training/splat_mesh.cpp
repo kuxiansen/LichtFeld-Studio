@@ -99,7 +99,7 @@ namespace lfs::training {
         constexpr double kRamBytesPerVoxel = 65.;
         // The auto voxel is this fraction of one median splat spacing: slightly finer than the
         // point density so thin structures survive, without paying for sub-spacing voxels.
-        constexpr float kAutoVoxelDetail = .65f;
+        constexpr float kAutoVoxelDetail = .60f;
         // Bounds on the automatic size: below the minimum the voxel grid explodes in memory, above
         // the maximum the surface gets too coarse to be worth fusing.
         constexpr float kAutoVoxelSizeMin = .015f;
@@ -1083,6 +1083,7 @@ namespace lfs::training {
                 all.tsdf[base + i] = host_values[order[i]];
             }
         }
+
     } // namespace
 
     void surface_nets(const std::span<const uint64_t> keys, const std::span<const float> tsdf, const float voxel, SplatMesh& mesh,
@@ -1121,16 +1122,22 @@ namespace lfs::training {
         const auto crossing_start = Clock::now();
         std::vector<uint64_t> cells;
         size_t quad_count = 0;
+        // Reserve from the previous axis's quad count instead of letting the vector double: at 300M
+        // quads a reallocation briefly holds both buffers, which is most of the commit charge above
+        // the working set. The first axis guesses from the voxel count; the later ones are measured.
+        size_t expected_quads = keys.size() / 4;
         for (int axis = 0; axis < 3; ++axis) {
             const auto axis_start = Clock::now();
             uint64_t offsets[4];
             cell_offsets(axis, offsets);
             const size_t before = cells.size();
+            cells.reserve(before + 4 * expected_quads);
             for_each_crossing(axis, [&](const size_t a, float, float) {
                 for (const auto offset : offsets)
                     cells.push_back(keys[a] - offset);
                 ++quad_count;
             });
+            expected_quads = (cells.size() - before) / 4;
             if (cells.size() != before) {
                 std::sort(cells.begin() + std::ptrdiff_t(before), cells.end());
                 std::inplace_merge(cells.begin(), cells.begin() + std::ptrdiff_t(before), cells.end());
@@ -2911,6 +2918,9 @@ namespace lfs::training {
                 out += kept[r];
             }
             mesh.faces.resize(out);
+            // resize keeps the fused mesh's capacity: that buffer is an order of magnitude larger than
+            // the simplified faces and would otherwise stay allocated through the whole texture bake.
+            mesh.faces.shrink_to_fit();
             if (seam_thinning) {
                 LOG_INFO("Simplify pieces: {}, {} vertices on their seams", ranges.size(), std::ranges::count(shared, uint8_t{1}));
                 if (ranges.size() > 1)

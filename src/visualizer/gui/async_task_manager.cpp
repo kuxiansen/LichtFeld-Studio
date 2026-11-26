@@ -2088,6 +2088,8 @@ namespace lfs::vis::gui {
                 params.dataset.max_width = *cmd.max_width;
             if (cmd.min_track_length.has_value() && *cmd.min_track_length >= 0)
                 params.dataset.min_track_length = *cmd.min_track_length;
+            params.optimization.init_mix_with_sparse = cmd.mix_ply_with_sparse;
+            params.optimization.init_mix_voxel_size = cmd.mix_voxel_size;
             if (auto* const param_mgr = viewer_->getParameterManager()) {
                 param_mgr->getDatasetConfig() = params.dataset;
             }
@@ -3490,7 +3492,9 @@ namespace lfs::vis::gui {
                         jobs_.report(
                             job, pct / 100.0F, msg);
                         publishImportOverlayState(); },
-                        .cancel_requested = [&stop_token]() { return stop_token.stop_requested(); }};
+                        .cancel_requested = [&stop_token]() { return stop_token.stop_requested(); },
+                        .mix_ply_with_sparse = local_params.optimization.init_mix_with_sparse,
+                        .mix_voxel_size = local_params.optimization.init_mix_voxel_size};
 
                     auto loader = lfs::io::Loader::create();
                     auto result = loader->load(path, load_options);

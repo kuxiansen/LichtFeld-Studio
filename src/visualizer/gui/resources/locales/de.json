@@ -720,6 +720,7 @@
     "init.noise_infill_mesh": "Mesh für Rauschfüllung:",
     "thresholds.min_opacity": "Min Opazität:",
     "thresholds.prune_opacity": "Opazität beschneiden:",
+    "thresholds.mrnf_opacity_prune": "MRNF-Opazitätsbereinigung",
     "value.none": "(keins)",
     "value.crop_box": "Crop Box",
     "value.mask_folder": "Masken: {}",
@@ -793,6 +794,7 @@
       "bilateral_grid_w": "Steuert, wie viele Helligkeits-/Appearance-Stufen das Grid unterscheiden kann. Erhöhe den Wert, wenn dunkle und helle Bereiche unterschiedliche Korrekturen brauchen; senke ihn für glatteres Verhalten und weniger Overfitting. Gilt nur, wenn Bilateral Grid oder Exposure Correction aktiviert ist.",
       "bilateral_grid_lr": "Steuert, wie schnell das Grid Farb-/Appearance-Korrektur lernt. Erhöhe den Wert, wenn die Korrektur zu langsam oder zu schwach ist; senke ihn, wenn Farben zu aggressiv kippen, flackern oder instabil werden. Gilt nur, wenn Bilateral Grid oder Exposure Correction aktiviert ist.",
       "prune_opacity": "IGS+-Pruning-Schwelle. Erhöhe sie, um schwache Splats aggressiver zu entfernen; senke sie, um schwache/detailreiche Splats zu behalten.",
+      "mrnf_opacity_prune": "Opazitätsgrenze, die in der zweiten Hälfte der Verfeinerung alle zehn Verfeinerungsintervalle angewendet wird; 0 deaktiviert.",
       "min_opacity": "Steuert, wann schwache Gaussians als zu transparent zum Behalten gelten. Erhöhe den Wert, um schwache schwebende Splats aggressiver aufzuräumen; senke ihn, um feine Details zu erhalten.",
       "opt": {
         "strategy": {

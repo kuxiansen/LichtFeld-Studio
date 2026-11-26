@@ -17,7 +17,7 @@ namespace lfs::core {
 
     // Distances are in scene units. The defaults are tuned on metric indoor scans.
     struct SplatMeshSettings {
-        float voxel_size = .0f; // 0 derives the voxel as 0.75x the model's median splat spacing
+        float voxel_size = .0f; // 0 derives the voxel as 0.6x the model's median splat spacing
         int block_voxels = 8;
         float truncation = 0.f;        // band around the surface; narrower than the depth spread opens holes. 0 = automatic
         // Widens the band where neighbouring pixels of a depth map disagree: band = max(trunc,
@@ -45,7 +45,7 @@ namespace lfs::core {
         // Weight of the color term against the surface error when reducing faces. Colors keep faces where
         // they change; with a baked texture the vertex colors only fill texels no photo saw, so lowering
         // this trades their smoothness for fewer faces. 0 ignores color.
-        float simplify_color_weight = .3f;
+        float simplify_color_weight = .2f;
         // Collapses the vertices the simplify's pieces share, so that a cut through the surface no longer stays at the
         // density of the fused mesh next to faces that lost most of theirs. Off keeps the original seam untouched.
         bool simplify_seam_thinning = true;

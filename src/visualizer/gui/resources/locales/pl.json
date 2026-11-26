@@ -720,6 +720,7 @@
     "init.noise_infill_mesh": "Siatka wypełnienia szumem:",
     "thresholds.min_opacity": "Min. nieprzezroczystość:",
     "thresholds.prune_opacity": "Przytnij nieprzezroczystość:",
+    "thresholds.mrnf_opacity_prune": "Przegląd nieprzezroczystości MRNF",
     "value.none": "(brak)",
     "value.crop_box": "Crop box",
     "value.mask_folder": "Maski: {}",
@@ -793,6 +794,7 @@
       "bilateral_grid_w": "Kontroluje, ile poziomów jasności/appearance grid potrafi rozróżnić. Zwiększ, gdy ciemne i jasne obszary potrzebują różnych korekt; zmniejsz dla gładszego zachowania i mniejszego overfittingu. Działa tylko, gdy Bilateral Grid lub Exposure Correction jest włączone.",
       "bilateral_grid_lr": "Kontroluje, jak szybko grid uczy się korekcji koloru/appearance. Zwiększ, jeśli korekcja jest zbyt wolna lub słaba; zmniejsz, jeśli kolory przesuwają się zbyt agresywnie, migoczą lub stają się niestabilne. Działa tylko, gdy Bilateral Grid lub Exposure Correction jest włączone.",
       "prune_opacity": "Próg pruningu IGS+. Zwiększ, aby agresywniej usuwać słabe splaty; zmniejsz, aby zachować subtelne/detaliczne splaty.",
+      "mrnf_opacity_prune": "Dolny próg nieprzezroczystości stosowany co dziesięć interwałów refine w drugiej połowie; 0 wyłącza.",
       "min_opacity": "Kontroluje, kiedy słabe Gaussians są uznawane za zbyt przezroczyste, aby je zachować. Zwiększ, aby agresywniej czyścić słabe pływające splaty; zmniejsz, aby zachować subtelne detale.",
       "opt": {
         "strategy": {
